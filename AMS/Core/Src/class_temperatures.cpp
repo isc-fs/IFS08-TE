@@ -182,14 +182,14 @@ int Temperatures_MOD::query(uint32_t time, char *buffer)
     info(buffer);
   }
 
-/*     if(time > time_lim_sended)
+     if(time > time_lim_sended)
     {
       time_lim_sended += TIME_LIM_SEND;
 
       message_temperatures[0] = 0;
       message_temperatures[1] = MAX_T & 0xFF;
       module_send_message_CAN1(CANIDTEL, 0, 2, message_temperatures);
-    } */
+    }
 
   return error;
 }

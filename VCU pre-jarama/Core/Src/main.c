@@ -1741,7 +1741,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 	{
 		/* Retreive Rx messages from RX FIFO0 */
 
-		if (hfdcan->Instance == FDCAN1)
+		if (hfdcan->Instance == FDCAN1)//BUS INV MOTOR
 		{
 			if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader_Inv,
 									   RxData_Inv) == HAL_OK)
@@ -1812,7 +1812,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 				}
 			}
 		}
-		else if (hfdcan->Instance == FDCAN2)
+		else if (hfdcan->Instance == FDCAN2) //BUS DEL ACCU
 		{
 			if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Acu,
 									   RxData_Acu) == HAL_OK)
@@ -1832,14 +1832,14 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 				}
 			}
 		}
-		else if (hfdcan->Instance == FDCAN3)
+		else if (hfdcan->Instance == FDCAN3) //BUS DRIVER
 		{
 			if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Dash,
 									   RxData_Dash) == HAL_OK)
 			{
 				switch (RxHeader_Dash.Identifier)
 				{
-				case 0x133:
+				case 0x101:
 					s1_aceleracion = ((uint16_t)RxData_Dash[0] << 8) | RxData_Dash[1];
 					s2_aceleracion = ((uint16_t)RxData_Dash[2] << 8) | RxData_Dash[3];
 					/*print("s1");
