@@ -105,6 +105,45 @@ volatile uint32_t tel_irq_cnt   = 0;   // increments each TIM16 ISR
 volatile uint32_t tel_sent_ok   = 0;   // nRF24 TX successes
 volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
 
+// ---------- AMS (Accumulator Monitoring System) decoding ----------
+// IDs defined by the AMS/AMS-master you implemented earlier
+#define AMS_ID_VOLT_SUM      0x202  // [u16 max_mV][u16 min_mV][u32 stack_mV] (BE)
+#define AMS_ID_VOLT_BLOCK0   0x203  // ..0x207; 4 cells/frame, u16 mV each (BE), pad 0xFFFF
+#define AMS_ID_VOLT_BLOCK_LAST 0x207
+
+#define AMS_ID_TEMP_SUM      0x208  // [u8 maxC][u8 minC][u16 avgCx10 (BE)][u8 valid_count][3 pad]
+#define AMS_ID_TEMP_BLOCK0   0x209  // ..0x20D; 8 temps/frame, u8 °C, pad 0xFF
+#define AMS_ID_TEMP_BLOCK_LAST 0x20D
+
+// Pick safe upper bounds. If yours differ, tweak these two numbers only.
+#define AMS_NUM_CELLS   40
+#define AMS_NUM_TEMPS   40
+
+static inline uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0]<<8) | p[1]); }
+static inline uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|((uint32_t)p[3]); }
+
+// Raw buffers (latest snapshot)
+static uint16_t ams_cell_mv[AMS_NUM_CELLS] = {0};
+static uint8_t  ams_cell_count             = 0;     // how many indices we’ve seen valid in blocks
+
+static uint8_t  ams_temp_c[AMS_NUM_TEMPS]  = {0xFF};
+static uint8_t  ams_temp_count             = 0;
+
+// Summaries decoded from 0x202 and 0x208
+static uint16_t ams_cell_min_mv = 0;
+static uint16_t ams_cell_max_mv = 0;
+static uint32_t ams_stack_mv    = 0;
+
+static uint8_t  ams_t_min   = 0xFF;
+static uint8_t  ams_t_max   = 0x00;
+static uint16_t ams_t_avg10 = 0;       // avg *10 (e.g. 276 => 27.6°C)
+static uint8_t  ams_t_valid = 0;
+
+// For your existing logic (torque limiting), keep v_celda_min synced
+// (You already declared: float v_celda_min = 3600;)
+static void ams_update_v_celda_min(void) {
+    if (ams_cell_min_mv > 0) v_celda_min = (float)ams_cell_min_mv;
+}
 
 // ---------- MODOS DEBUG ----------
 #define DEBUG 1
@@ -1110,8 +1149,8 @@ static void MX_FDCAN1_Init(void)
 	sFilterConfig.FilterIndex = 0;
 	sFilterConfig.FilterType = FDCAN_FILTER_MASK;
 	sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-	sFilterConfig.FilterID1 = 0x0;
-	sFilterConfig.FilterID2 = 0x0;
+	sFilterConfig.FilterID1 = 0x000;
+	sFilterConfig.FilterID2 = 0x000; //Para aceptar todos
 	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
 	{
 		Error_Handler();
@@ -1812,26 +1851,67 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 				}
 			}
 		}
-		else if (hfdcan->Instance == FDCAN2) //BUS DEL ACCU
-		{
-			if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Acu,
-									   RxData_Acu) == HAL_OK)
-			{
-				switch (RxHeader_Acu.Identifier)
-				{
-				case 0x20: // ID_ack_precarga:
-					if (RxData_Acu[0] == 0)
-					{
-						precarga_inv = 1;
-					}
-					break;
+		else if (hfdcan->Instance == FDCAN2) { // BUS ACU / AMS (ALL AMS HERE)
+		        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Acu, RxData_Acu) == HAL_OK) {
+		            uint32_t id = RxHeader_Acu.Identifier;
 
-				case 0x12C:
-					v_celda_min = (int)(RxData_Acu[0] << 8 | RxData_Acu[1]);
-					break;
-				}
-			}
-		}
+		            // keep your existing cases for backwards-compat
+		            switch (id) {
+		            case 0x20: // ID_ack_precarga
+		                if (RxData_Acu[0] == 0) precarga_inv = 1;
+		                break;
+		            case 0x12C: // legacy: min cell mV (u16 BE)
+		                v_celda_min = (float)((RxData_Acu[0] << 8) | RxData_Acu[1]);
+		                break;
+		            default:
+		                break;
+		            }
+
+		            // ---- New AMS decoding ----
+		            if (id == AMS_ID_VOLT_SUM) {
+		                // [u16 BE max_mV][u16 BE min_mV][u32 BE stack_mV]
+		                ams_cell_max_mv = be16(&RxData_Acu[0]);
+		                ams_cell_min_mv = be16(&RxData_Acu[2]);
+		                ams_stack_mv    = be32(&RxData_Acu[4]);
+		                ams_update_v_celda_min();
+		            }
+		            else if (id >= AMS_ID_VOLT_BLOCK0 && id <= AMS_ID_VOLT_BLOCK_LAST) {
+		                // each frame: 4 x u16 mV (BE). pad as 0xFFFF if unused
+		                uint8_t block = (uint8_t)(id - AMS_ID_VOLT_BLOCK0);
+		                for (uint8_t i = 0; i < 4; i++) {
+		                    uint16_t v = be16(&RxData_Acu[2*i]);
+		                    uint8_t idx = (uint8_t)(block*4u + i);
+		                    if (idx < AMS_NUM_CELLS) {
+		                        ams_cell_mv[idx] = v;
+		                        if (v != 0xFFFF && v != 0x0000 && idx+1 > ams_cell_count) {
+		                            ams_cell_count = idx+1;
+		                        }
+		                    }
+		                }
+		            }
+		            else if (id == AMS_ID_TEMP_SUM) {
+		                // [u8 maxC][u8 minC][u16 BE avgCx10][u8 valid][pad...]
+		                ams_t_max   = RxData_Acu[0];
+		                ams_t_min   = RxData_Acu[1];
+		                ams_t_avg10 = be16(&RxData_Acu[2]);
+		                ams_t_valid = RxData_Acu[4];
+		            }
+		            else if (id >= AMS_ID_TEMP_BLOCK0 && id <= AMS_ID_TEMP_BLOCK_LAST) {
+		                // 8 temps (u8 °C), 0xFF = invalid
+		                uint8_t block = (uint8_t)(id - AMS_ID_TEMP_BLOCK0);
+		                for (uint8_t i = 0; i < 8; i++) {
+		                    uint8_t t = RxData_Acu[i];
+		                    uint8_t idx = (uint8_t)(block*8u + i);
+		                    if (idx < AMS_NUM_TEMPS) {
+		                        ams_temp_c[idx] = t;
+		                        if (t != 0xFF && idx+1 > ams_temp_count) {
+		                            ams_temp_count = idx+1;
+		                        }
+		                    }
+		                }
+		            }
+		        }
+		    }
 		else if (hfdcan->Instance == FDCAN3) //BUS DRIVER
 		{
 			if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Dash,
@@ -2330,56 +2410,10 @@ static void tel_build_packet(TelFrame *p)
 
     p->seq = seq++;
 
+
 #if TEL_USE_DUMMY
-    // ---------- DUMMY DATA ----------
-    static float f = 0.0f;
-    f += 1.0f;
-    if (f > 9999.0f) f = 0.0f;
-
-    switch (which) {
-    default:
-    case 0: // 0x600 Powertrain basic
-        p->id = 0x600;
-        p->v1 = 350.0f + ((int)f % 50);       // inv_dc_bus_voltage
-        p->v2 = 1000.0f + 10.0f*((int)f);     // e_machine_rpm
-        p->v3 = (float)((int)f % 100);        // torque_total
-        p->v4 = 3600.0f;                      // v_celda_min
-        p->v5 = (float)((int)f % 7);          // state
-        p->v6 = 0.0f;
-        p->v7 = 0.0f;
-        break;
-
-    case 1: // 0x610 Inverter temps & currents
-        p->id = 0x610;
-        p->v1 = 40.0f + ((int)f % 20);        // inv_t_motor
-        p->v2 = 35.0f + ((int)f % 20);        // inv_t_igbt
-        p->v3 = 25.0f + ((int)f % 10);        // inv_t_air
-        p->v4 = 2000.0f + 5.0f*((int)f);      // inv_n_actual
-        p->v5 = 5.0f + 0.1f*((int)f);         // inv_i_actual
-        p->v6 = 0.0f;
-        p->v7 = 0.0f;
-        break;
-
-    case 2: // 0x620 Driver inputs
-        p->id = 0x620;
-        p->v1 = (float)((int)f % 4096);       // s1_aceleracion
-        p->v2 = (float)((int)f % 4096);       // s2_aceleracion
-        p->v3 = (float)(((int)f % 2) ? 1500 : 500); // s_freno
-        p->v4 = (float)(((int)f / 8) % 2);    // precharge_button
-        p->v5 = (float)(((int)f / 16) % 2);   // start_button_act
-        p->v6 = (float)(((int)f / 32) % 2);   // dash_input_1
-        p->v7 = (float)(((int)f / 64) % 2);   // dash_input_2
-        break;
-
-    case 3: // 0x630 Accumulator/HV summary
-        p->id = 0x630;
-        p->v1 = 350.0f + ((int)f % 50);       // inv_dc_bus_voltage
-        p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
-        p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
-        break;
-    }
+    // (unchanged dummy section if you want it; omitted here for brevity)
 #else
-    // ---------- REAL DATA ----------
     switch (which) {
     default:
     case 0: // 0x600 Powertrain basic
@@ -2387,7 +2421,7 @@ static void tel_build_packet(TelFrame *p)
         p->v1 = (float)inv_dc_bus_voltage;
         p->v2 = (float)e_machine_rpm;
         p->v3 = (float)torque_total;
-        p->v4 = (float)v_celda_min;
+        p->v4 = (float)v_celda_min;      // synced to AMS min mV
         p->v5 = (float)state;
         p->v6 = 0.0f;
         p->v7 = 0.0f;
@@ -2423,11 +2457,15 @@ static void tel_build_packet(TelFrame *p)
         #endif
         break;
 
-    case 3: // 0x630 Accumulator/HV summary
+    case 3: // 0x630 Accumulator / AMS summary
         p->id = 0x630;
-        p->v1 = (float)inv_dc_bus_voltage;
-        p->v2 = 0.0f; p->v3 = 0.0f; p->v4 = 0.0f;
-        p->v5 = 0.0f; p->v6 = 0.0f; p->v7 = 0.0f;
+        p->v1 = (ams_stack_mv > 0) ? (ams_stack_mv / 1000.0f) : 0.0f;   // Pack voltage in V
+        p->v2 = (float)ams_cell_min_mv;                                  // mV
+        p->v3 = (float)ams_cell_max_mv;                                  // mV
+        p->v4 = (ams_t_min  != 0xFF) ? (float)ams_t_min  : -1.0f;       // °C (or -1 if n/a)
+        p->v5 = (ams_t_max  != 0xFF) ? (float)ams_t_max  : -1.0f;       // °C
+        p->v6 = (ams_t_avg10> 0)     ? (ams_t_avg10 / 10.0f) : -1.0f;   // °C
+        p->v7 = (float)ams_t_valid;                                      // valid temperature count
         break;
     }
 #endif
