@@ -54,8 +54,8 @@ TIM_HandleTypeDef htim17;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-//hfdcan1 Acumulator
-//hfdcan2 BMS
+// hfdcan1: Accumulator / inverter / legacy bus
+// hfdcan2: BMS / Temps bus (ALL AMS telemetry TX here)
 
 FDCAN_TxHeaderTypeDef TxHeader_acu;
 FDCAN_TxHeaderTypeDef TxHeader_bms;
@@ -81,14 +81,14 @@ static void MX_ADC1_Init(void);
 static void MX_ADC3_Init(void);
 static void MX_TIM17_Init(void);
 /* USER CODE BEGIN PFP */
-
+static inline uint32_t len_to_dlc(uint8_t len);
+static inline uint8_t  dlc_to_len(uint32_t dlc);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 struct CANMsg msg_bms, msg_acu;
-
 
 /* USER CODE END 0 */
 
@@ -98,7 +98,6 @@ struct CANMsg msg_bms, msg_acu;
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -134,28 +133,27 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim17, TIM_CHANNEL_1);
 
-
-
   if (HAL_FDCAN_Start(&hfdcan1) == HAL_OK){
-	  print((char*)"CAN_ACU iniciado");
+    print((char*)"CAN_ACU iniciado");
   }
   if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) == HAL_OK)
   {
-	  print((char*)"CAN_ACU notification");
+    print((char*)"CAN_ACU notification");
   }
 
   if (HAL_FDCAN_Start(&hfdcan2) == HAL_OK){
-	  print((char*)"CAN_BMS iniciado");
+    print((char*)"CAN_BMS iniciado");
+  }
+  if (HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) == HAL_OK)
+  {
+    print((char*)"CAN_BMS notification");
   }
 
   if(HAL_ADC_Start(&hadc3) == HAL_OK){
-	  print((char*)"ADC iniciado");
+    print((char*)"ADC iniciado");
   }
 
-  //HAL_GPIO_WritePin(FANS_GPIO_Port, FANS_Pin, GPIO_PIN_SET);
-  //HAL_GPIO_WritePin(A1_GPIO_Port, A1_Pin, GPIO_PIN_RESET);
-
-  //setup_state_machine();
+  // setup_state_machine(); // (keep if you use it)
 
   /* USER CODE END 2 */
 
@@ -163,27 +161,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  select_state();
+    select_state();
 
-	  /*if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader_acu, RxData) == HAL_OK) {
-		  msg_acu.id = RxHeader_acu.Identifier;
-		  msg_acu.len = RxHeader_acu.DataLength;
-		  for (int i = 0; i < 8; i++) {msg_acu.buf[i] = RxData[i];}
-		  msg_acu.bus = 1;
-		  msg_acu.time = HAL_GetTick();
-		  parse_state(msg_acu);
-	  }*/
+    // NOTE: RX is interrupt-driven; do NOT poll here.
+    // If you keep polling, you may race with ISR or starve other work.
 
-	  if (HAL_FDCAN_GetRxMessage(&hfdcan2, FDCAN_RX_FIFO0, &RxHeader_bms, RxData) == HAL_OK) {
-
-		  msg_bms.id = RxHeader_bms.Identifier;
-		  msg_bms.len = RxHeader_bms.DataLength;
-		  for (int i = 0; i < 8; i++) {msg_bms.buf[i] = RxData[i];}
-		  msg_bms.bus = 2;
-		  msg_bms.time = HAL_GetTick();
-
-		  parse_state(msg_bms);
-	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -522,12 +504,12 @@ static void MX_FDCAN2_Init(void)
   }
   /* USER CODE BEGIN FDCAN2_Init 2 */
   FDCAN_FilterTypeDef sFilterConfig;
-  sFilterConfig.IdType = FDCAN_EXTENDED_ID;
-  sFilterConfig.FilterIndex = 0;
-  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+  sFilterConfig.IdType       = FDCAN_STANDARD_ID;          // 11-bit IDs on CAN2
+  sFilterConfig.FilterIndex  = 0;
+  sFilterConfig.FilterType   = FDCAN_FILTER_MASK;
   sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  sFilterConfig.FilterID1 = 0x10;
-  sFilterConfig.FilterID2 = 0x10;
+  sFilterConfig.FilterID1    = 0x000;                      // accept all
+  sFilterConfig.FilterID2    = 0x000;
   if (HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilterConfig) != HAL_OK)
   {
     Error_Handler();
@@ -707,128 +689,147 @@ static void MX_GPIO_Init(void)
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-	if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)
-	{
-    /* Retreive Rx messages from RX FIFO0 */
-    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_acu, RxData) == HAL_OK)
-    {
-		msg_acu.id = RxHeader_acu.Identifier;
-		msg_acu.len = RxHeader_acu.DataLength;
-		for (int i = 0; i < 8; i++) {msg_acu.buf[i] = RxData[i];}
-		msg_acu.bus = 1;
-		msg_acu.time = HAL_GetTick();
-		parse_state(msg_acu);
+  if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == RESET) return;
 
-    }
+  FDCAN_RxHeaderTypeDef *hdr = (hfdcan == &hfdcan1) ? &RxHeader_acu : &RxHeader_bms;
 
-    if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
-    {
-      /* Notification Error */
-      Error_Handler();
-    }
+  if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, hdr, RxData) == HAL_OK)
+  {
+    struct CANMsg *m = (hfdcan == &hfdcan1) ? &msg_acu : &msg_bms;
+    m->id   = hdr->Identifier;
+    m->len  = dlc_to_len(hdr->DataLength);  // convert DLC → byte length
+    for (int i = 0; i < 8; i++) { m->buf[i] = RxData[i]; }
+    m->bus  = (hfdcan == &hfdcan1) ? 1 : 2;
+    m->time = HAL_GetTick();
+    parse_state(*m);
+  }
+
+  if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)
+  {
+    Error_Handler();
   }
 }
 
-//extended ID
-HAL_StatusTypeDef module_send_message_CAN1(uint32_t id, uint8_t* data, uint8_t length) {
-	TxHeader_acu.Identifier = id;
-	TxHeader_acu.IdType = FDCAN_EXTENDED_ID;
-	TxHeader_acu.DataLength = length;
+// ---- TX helpers -------------------------------------------------------------
 
-	HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_acu, data);
-
-	return status;
+static inline uint32_t len_to_dlc(uint8_t len)
+{
+  switch (len) {
+    case 0: return FDCAN_DLC_BYTES_0;
+    case 1: return FDCAN_DLC_BYTES_1;
+    case 2: return FDCAN_DLC_BYTES_2;
+    case 3: return FDCAN_DLC_BYTES_3;
+    case 4: return FDCAN_DLC_BYTES_4;
+    case 5: return FDCAN_DLC_BYTES_5;
+    case 6: return FDCAN_DLC_BYTES_6;
+    case 7: return FDCAN_DLC_BYTES_7;
+    default: return FDCAN_DLC_BYTES_8;
+  }
 }
 
-//NO extended ID
-HAL_StatusTypeDef module_send_message_NoExtId_CAN1(uint32_t id, uint8_t* data, uint8_t length) {
-	TxHeader_acu.Identifier = id;
-	TxHeader_acu.IdType = FDCAN_STANDARD_ID;
-	TxHeader_acu.DataLength = length;
-
-	HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_acu, data);
-
-	return status;
+static inline uint8_t dlc_to_len(uint32_t dlc_field)
+{
+  // dlc_field is the entire DataLength field; the low nibble encodes DLC
+  uint8_t dlc = (uint8_t)((dlc_field >> 16) & 0xF);
+  static const uint8_t lut[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
+  return (dlc < 16) ? lut[dlc] : 0;
 }
 
-HAL_StatusTypeDef module_send_message_CAN2(uint32_t id, uint8_t* data, uint8_t length) {
-	TxHeader_bms.Identifier = id;
-	TxHeader_bms.IdType = FDCAN_STANDARD_ID;
-	TxHeader_bms.DataLength = length;
+// extended ID on CAN1
+HAL_StatusTypeDef module_send_message_CAN1(uint32_t id, uint8_t* data, uint8_t length)
+{
+  TxHeader_acu.Identifier          = id;
+  TxHeader_acu.IdType              = FDCAN_EXTENDED_ID;
+  TxHeader_acu.TxFrameType         = FDCAN_DATA_FRAME;
+  TxHeader_acu.DataLength          = len_to_dlc(length);
+  TxHeader_acu.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader_acu.BitRateSwitch       = FDCAN_BRS_OFF;
+  TxHeader_acu.FDFormat            = FDCAN_CLASSIC_CAN;  // classic frames
+  TxHeader_acu.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+  TxHeader_acu.MessageMarker       = 0;
 
-	HAL_StatusTypeDef status = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_bms, data);
-
-	return status;
+  return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_acu, data);
 }
+
+// standard ID on CAN1
+HAL_StatusTypeDef module_send_message_NoExtId_CAN1(uint32_t id, uint8_t* data, uint8_t length)
+{
+  TxHeader_acu.Identifier          = id;
+  TxHeader_acu.IdType              = FDCAN_STANDARD_ID;
+  TxHeader_acu.TxFrameType         = FDCAN_DATA_FRAME;
+  TxHeader_acu.DataLength          = len_to_dlc(length);
+  TxHeader_acu.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader_acu.BitRateSwitch       = FDCAN_BRS_OFF;
+  TxHeader_acu.FDFormat            = FDCAN_CLASSIC_CAN;
+  TxHeader_acu.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+  TxHeader_acu.MessageMarker       = 0;
+
+  return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &TxHeader_acu, data);
+}
+
+// standard ID on CAN2  (ALL AMS telemetry uses this one)
+HAL_StatusTypeDef module_send_message_CAN2(uint32_t id, uint8_t* data, uint8_t length)
+{
+  TxHeader_bms.Identifier          = id;
+  TxHeader_bms.IdType              = FDCAN_STANDARD_ID;  // 11-bit IDs
+  TxHeader_bms.TxFrameType         = FDCAN_DATA_FRAME;
+  TxHeader_bms.DataLength          = len_to_dlc(length);
+  TxHeader_bms.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  TxHeader_bms.BitRateSwitch       = FDCAN_BRS_OFF;
+  TxHeader_bms.FDFormat            = FDCAN_CLASSIC_CAN;
+  TxHeader_bms.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+  TxHeader_bms.MessageMarker       = 0;
+
+  return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_bms, data);
+}
+
+// ---- UART + ADC helpers -----------------------------------------------------
 
 void print(char uart_buffer[]){
-	sprintf(uart_msg, "%s \n\r", uart_buffer);
-	HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
+  sprintf(uart_msg, "%s \n\r", uart_buffer);
+  HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
 }
 
 void printnl(char uart_buffer[]){
-	sprintf(uart_msg, "%s", uart_buffer);
-	HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
+  sprintf(uart_msg, "%s", uart_buffer);
+  HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
 }
 
 void printValue(int value){
-	sprintf(uart_msg, "%hu \n\r", value);
-	HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
+  sprintf(uart_msg, "%d \n\r", value);  // signed output
+  HAL_UART_Transmit(&huart2,(uint8_t*)uart_msg,strlen(uart_msg),HAL_MAX_DELAY);
 }
 
 HAL_UART_StateTypeDef getUARTState(){
-	return HAL_UART_GetState(&huart2);
+  return HAL_UART_GetState(&huart2);
 }
 
 float readCurrentValue(void){
-	/*float analogValue;
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
 
-	HAL_ADC_Start(&hadc3);
-	HAL_ADC_PollForConversion(&hadc3, HAL_MAX_DELAY);
-	analogValue = HAL_ADC_GetValue(&hadc3);
-	HAL_ADC_Stop(&hadc3);
-	return analogValue;*/
+  float adc_value;
+  float current;
 
+  adc_value = HAL_ADC_GetValue(&hadc1);
+  // current = ((0.2*adc_value) - 435)*1.15;
+  // current = (0.2 * adc_value - 420.5)*1000;
+  current = 1.42857f * adc_value - 192.857f;
 
-	HAL_ADC_Start(&hadc1);
-	HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-
-	float adc_value;
-	float current;
-
-	adc_value = HAL_ADC_GetValue(&hadc1);
-	//current = ((0.2*adc_value) - 435)*1.15;
-	//current = (0.2 * adc_value - 420.5)*1000;
-	current = 1.42857 * adc_value - 192.857;
-
-	//valor minimo = 2100
-
-	HAL_ADC_Stop(&hadc1);
-	printValue(current);
-	return current;
+  HAL_ADC_Stop(&hadc1);
+  printValue((int)current);
+  return current;
 }
 
 float readAnalogValue(void){
-	/*float analogValue;
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
 
-	HAL_ADC_Start(&hadc3);
-	HAL_ADC_PollForConversion(&hadc3, HAL_MAX_DELAY);
-	analogValue = HAL_ADC_GetValue(&hadc3);
-	HAL_ADC_Stop(&hadc3);
-	return analogValue;*/
+  uint16_t adc_value;
+  adc_value = HAL_ADC_GetValue(&hadc1);
 
-
-	HAL_ADC_Start(&hadc1);
-	HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
-
-	uint16_t adc_value;
-	int current;
-
-	adc_value = HAL_ADC_GetValue(&hadc1);
-	//valor minimo = 2100
-
-	HAL_ADC_Stop(&hadc1);
-	return adc_value;
+  HAL_ADC_Stop(&hadc1);
+  return (float)adc_value;
 }
 /* USER CODE END 4 */
 

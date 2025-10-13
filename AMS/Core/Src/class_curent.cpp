@@ -3,6 +3,8 @@
 // Date         :   17/04/2020
 // Adaptation   :   Juan Mata & Jaime Landa
 // Date         :   03/2024
+// Update		:	10/2025
+// Author		: 	Andrés Sánchez de Ágreda
 // Name         :   class_current.h
 // Description  :
 // * This file is for declaring the functions and variables of the class of the current
@@ -13,7 +15,7 @@
 
 #include "main.h"
 #include "class_current.h"
-
+#include "ams_can_map.h"
 
 // ********************************************************************************************************
 // **Function name:           Current_MOD
@@ -30,120 +32,58 @@ Current_MOD::Current_MOD(uint32_t ID, int _C_MAX)
 // ** Function name:           query
 // ** Descriptions:            Function that transforms the voltage measured by the sensor to its equivalent current
 // **********************************************************************************************************
-int Current_MOD::query(int time, char* buffer)
-{
+int Current_MOD::query(int time, char* buffer) {
     error = Current_OK;
-    /*
-    VoltageADC = readAnalogValue();
 
-    //printValue(VoltagemV);
+    // 7-sample moving average (as you had)
+    int s1 = readAnalogValue();
+    int s2 = readAnalogValue();
+    int s3 = readAnalogValue();
+    int s4 = readAnalogValue();
+    int s5 = readAnalogValue();
+    int s6 = readAnalogValue();
+    int s7 = readAnalogValue();
 
-    if(VoltageADC < 400){
-    	flag_error_current = 1;
-    	flag_current = 1;
-    	error = 1;
-    }
-    else{
-    	flag_error_current = 0;
-    	flag_current = 0;
-    	error = Current_OK;
-    }
-	
-    if(VoltageADC <=  400)
-    {
-     //error=Current_ERROR_Comunication;
-    }
+    Current = (s1+s2+s3+s4+s5+s6+s7)/7;
+    // Calibration: raw ADC → amps (keep your linearization)
+    Current = (int)(0.22727f * Current - 489.455f + 0.5f);
 
-    VoltageV=VoltageADC*3.3/1023; //AnalogRead function reads a value between 0-1023 (1024, 10 bits) here I get the real voltage value based on the value the function gets
-
-    if(VoltageV >= 2.8){
-    	flag_current = 1;
+    // Alerts on CAN2
+    if(Current > C_MAX*0.8 && Current < C_MAX) {
+        uint8_t msg[1] = { (uint8_t)(Current & 0xFF) };
+        (void)module_send_message_CAN2(CAN2_ID_AMS_CUR_WARN, msg, 1);
     }
 
-
-    printnl("mV");
-    printValue(VoltageADC);
-    printnl("V");
-    printValue(VoltageV);
-    
-
-    //printValue(Current);
-    Current=(2.5-VoltageV)/0.0057; //Sensitivity is 5,7 mv/A
-    */
-
-    int Current1,Current2,Current3,Current4,Current5,Current6,Current7;
-    Current1 = readAnalogValue();
-    //HAL_Delay(3);
-    Current2 = readAnalogValue();
-    //HAL_Delay(3);
-    Current3 = readAnalogValue();
-    //HAL_Delay(3);
-    Current4 = readAnalogValue();
-    //HAL_Delay(3);
-    Current5 = readAnalogValue();
-    //HAL_Delay(3);
-    Current6 = readAnalogValue();
-    //HAL_Delay(3);
-    Current7 = readAnalogValue();
-    //HAL_Delay(3);
-
-    Current = (Current1+Current2+Current3+Current4+Current5+Current6+Current7)/7;
-
-    Current = 0.22727 * Current - 489.455 + 0.5;
-
-    //printValue(Current);
-    //printValue(Current);
-
-    if(Current > C_MAX*0.8 && Current < C_MAX)
-    {
-        if(flag_error_current == 0) module_send_message_NoExtId_CAN1(0x500,message,1); //If current between 80 and 100% of maximun, sends alert
-    }
-
-    if (Current > C_MAX)
-    {
+    if (Current > C_MAX) {
         if (flag_error_current == 1) {
-        	module_send_message_NoExtId_CAN1(0x501, message, 2); //If current over maximun, sends alert
+            uint8_t m[2] = { (uint8_t)(Current & 0xFF), (uint8_t)((Current>>8)&0xFF) };
+            (void)module_send_message_CAN2(CAN2_ID_AMS_CUR_FAULT, m, 2);
         }
-
         flag_error_current++;
-
-        if (flag_charger != 1 || flag_charger == 1) //Only cut the AMS if accu not connected to charger, during charging the current control is on charger
-        {
-            if (flag_error_current >= 100) //I need to pass the maximun current for more than 100 times for cutting, maybe it was EMI
-            {
-                //error = Current_ERROR_MAXIMUN_C;
-                //print((char*)"MAXIMA Corriente");
-            }
+        if (flag_error_current >= 100) {
+            // optional: latch or act in AMS
         }
-    }
-    else
-    {
-        if (flag_error_current != 0)
-		for (int i = 0; i < 5; i++)
-		{
-			module_send_message_NoExtId_CAN1(0x502, 0, 2); //If current normal, sends green flag
-		}
+    } else {
+        if (flag_error_current != 0) {
+            uint8_t z[2] = {0};
+            for (int i = 0; i < 3; i++)
+                (void)module_send_message_CAN2(CAN2_ID_AMS_CUR_NORMAL, z, 2);
+        }
         flag_error_current = 0;
     }
 
-
-    if (time > time_lim_sended)
-    {
+    // Periodic TX on CAN2 (value in deci-amps, little-endian)
+    if (time > time_lim_sended) {
         time_lim_sended += TIME_LIM_SEND;
-        message[0] = 0;
-        message[1] = Current & 0xFF;
-        module_send_message_NoExtId_CAN1(CANID, message, 2); //Sends current through CAN each interval of ms
+        int16_t da = (int16_t)(Current * 10);   // 0.1 A per LSB
+        uint8_t payload[2] = { (uint8_t)(da & 0xFF), (uint8_t)((da>>8)&0xFF) };
+        (void)module_send_message_CAN2(CANID, payload, 2);
     }
 
-
-    if (TIME_LIM_PLOT > 0 && time > time_lim_plotted)
-    {
+    if (TIME_LIM_PLOT > 0 && time > time_lim_plotted) {
         time_lim_plotted += TIME_LIM_PLOT;
         info(buffer);
-
     }
-
-    
     return error;
 }
 

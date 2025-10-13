@@ -1,205 +1,142 @@
 // -----------------------------------------------------------------------------
-// Author       :   Luis de la Barba & Javier R. Juliani
-// Date         :   17/04/2020
-// Adaptation   :   Juan Mata & Jaime Landa
-// Date         :   03/2024
-// Name         :   class_temperatures.h
-// Description  :
-// * This file is for declaring the functions and variables of the class of the temperatures
+// class_temperatures.cpp  (AMS temps over CAN2 only)
+// - Requests temps at (baseID+20)
+// - Expects replies at (baseID+21 .. baseID+25), each 8 temps (°C)
+// - Republishes on CAN2:
+//     * Summary: CAN2_ID_AMS_TEMP_SUM
+//     * Raw blocks (8 temps each): CAN2_ID_AMS_TEMP_BLOCK0..4
+//
+// Notes:
+// * DS18B20U MSOP sensors live behind temps boards; those boards quantize to
+//   whole °C bytes already. We treat 0 as "missing/defective" for stats.
+// * Channels come from different battery modules; we just expose a flat array
+//   so the main board stays simple. The block framing is fixed (8/8/8/8/6).
 // -----------------------------------------------------------------------------
 
-#include <stdio.h>
-#include <string.h>
-
-#include "main.h"
 #include "class_temperatures.h"
+#include <string.h>
+#include <stdio.h>
 
+static inline uint8_t pad_or_val(uint8_t v){ return v ? v : 0xFF; }
 
-// ********************************************************************************************************
-// **Function name:           Temperatures_MOD
-// **Descriptions:            Initialization function of teh class
-// **********************************************************************************************************
-Temperatures_MOD::Temperatures_MOD(uint32_t ID, int _T_MAX, int _LAG)
-{
-  MODULEID = ID;
+Temperatures_MOD::Temperatures_MOD(uint32_t MODULEID, int _T_MAX, int _LAG) {
+  baseID = MODULEID;
   LIMIT_MAX_T = _T_MAX;
 
-  time_lim_plotted += _LAG;
-  time_lim_sended += _LAG;
-  time_lim_received += _LAG;
+  time_lim_plotted  = TIME_LIM_PLOT + _LAG;
+  time_lim_sended   = 0u + _LAG;
+  time_lim_received = TIME_LIM_RECV + _LAG;
 }
 
-// ********************************************************************************************************
-// **Function name:           info
-// **Descriptions:            Function for printing the class data
-// **********************************************************************************************************
-void Temperatures_MOD::info(char *buffer)
-{
-  if(getUARTState() == HAL_UART_STATE_READY) //Send the message just if there is a serial por connected
-  {
-	print((char*)"\n***********************");
-	print((char*)"     Temperatures");
-    print((char*)"***********************");
-    sprintf(buffer, " - ERROR:     %i", error);
-    print(buffer);
-    sprintf(buffer, " - CAN ID:    0x%lx", MODULEID);
-    print(buffer);
-    sprintf(buffer, " - MAX T =    %i ºC", MAX_T);
-    print(buffer);
-    sprintf(buffer, " - MIN T =    %i ºC", MIN_T);
-    print(buffer);
-    sprintf(buffer, " - LIM T =    %i ºC", LIMIT_MAX_T);
-    print((char*)"-----------------------");
-    sprintf(buffer, "Temperatures (ºC): [%i", cellTemperature[0]);
-    printnl(buffer);
-    for (int i = 1 ; i < 38; i++)
-    {
-    	sprintf(buffer, ", %i", cellTemperature[i]);
-     	printnl(buffer);
+void Temperatures_MOD::update_min_max_ignore_zero() {
+  int maxT = -128, minT = 127, any = 0;
+  for (int i=0;i<TEMPS_NUM_CHANNELS;i++){
+    int t = cellTemperature[i];
+    if (t==0) continue;         // ignore 0 (bad/missing probe)
+    if (t>maxT) maxT=t;
+    if (t<minT) minT=t;
+    any=1;
+  }
+  MAX_T = any?maxT:0;
+  MIN_T = any?minT:0;
+  error = (MAX_T > LIMIT_MAX_T) ? Temperatures_ERROR_MAXIMUM_T : Temperatures_OK;
+}
+
+void Temperatures_MOD::publish_CAN2() {
+  // Summary: MAX, MIN, AVG*10 (decicelsius), VALID_CNT
+  int sum=0, valid=0;
+  for (int i=0;i<TEMPS_NUM_CHANNELS;i++){
+    uint8_t t = cellTemperature[i];
+    if (t){ sum += t; valid++; }
+  }
+  int avg10 = valid ? (sum*10/valid) : 0;
+
+  uint8_t sumf[8] = {
+    (uint8_t)MAX_T,
+    (uint8_t)MIN_T,
+    (uint8_t)((avg10>>8)&0xFF),
+    (uint8_t)(avg10 & 0xFF),
+    (uint8_t)(valid & 0xFF),
+    0,0,0
+  };
+  (void)module_send_message_CAN2(CAN2_ID_AMS_TEMP_SUM, sumf, 8);
+
+  // Raw temps: 8 per frame => 5 frames cover 38 channels (last frame pads)
+  uint8_t frame[8];
+  for (int blk=0; blk<5; ++blk){
+    int base = blk*8;
+    memset(frame, 0xFF, 8);
+    for (int k=0;k<8;k++){
+      int idx = base + k;
+      if (idx >= TEMPS_NUM_CHANNELS) break;
+      frame[k] = pad_or_val(cellTemperature[idx]);  // 0xFF = unused/missing
     }
-    print((char*)"]");
-
-
+    (void)module_send_message_CAN2((uint32_t)(CAN2_ID_AMS_TEMP_BLOCK0 + blk), frame, 8);
   }
 }
 
+bool Temperatures_MOD::parse(uint32_t id, uint8_t *buf, uint32_t t_ms) {
+  // Temps boards reply on CAN2 at baseID+21..baseID+25 (5 packets * 8 temps)
+  if (id >= baseID+21 && id <= baseID+25) {
+    time_lim_received = t_ms + TIME_LIM_RECV;
 
-// ********************************************************************************************************
-// **Function name:           parse
-// **Descriptions:            Function for parsing the received data via CAN protocl
-// **********************************************************************************************************
-bool Temperatures_MOD::parse(uint32_t id, uint8_t *buf, uint32_t t)
-{
-  if (id > MODULEID && id < MODULEID + 7)
-  {
-	//module_send_message_CAN1(0x530, buf, 8);
-    int m = id % MODULEID;
-    int pos = 0;
-    if (m > 0 && m < 7)
-    {
-      time_lim_received = t + TIME_LIM_RECV;
-
-      if (m < 6)
-      {
-
-        if (flag_charger == 1){
-        	module_send_message_CAN1(id, buf, 8); //Reenviar temperaturas por CAN1 tanto en cargador como en coche
-    	}
-        for (int i = 0; i < 8; i++)
-        {
-          pos = (m - 1) * 8 + i;
-          cellTemperature[pos] = buf[i];
-         // if (cellTemperature[pos] > LIMIT_MAX_T) error = Temperatures_ERROR_MAXIMUM_T;
-
-        }
-      }
-      else if (m == 6)
-      {
-        if (flag_charger == 1){
-        	module_send_message_CAN1(id, buf, 8); //Reenviar temperaturas por CAN1 tanto en cargador como en coche
-        }
-
-        for (int i = 0; i < 3; i++)
-        {
-          pos = (m - 1) * 8 + i;
-         // if (cellTemperature[pos] > LIMIT_MAX_T) error = Temperatures_ERROR_MAXIMUM_T;
-
-        }
-      }
-
-      MAX_T = cellTemperature[0];
-      MIN_T = cellTemperature[0];
-      for (int i = 0; i < 38; i++)
-      {
-        if (cellTemperature[i] > MAX_T)
-          MAX_T = cellTemperature[i];
-        else if (cellTemperature[i] < MIN_T && cellTemperature[i]!=0){
-          MIN_T = cellTemperature[i];
-        }
-
-        if (id!= 0x530){
-        	temp_bckp[i] = cellTemperature[i];
-        }
-
-         else if(id == 0x530){
-        	cellTemperature[i] = temp_bckp[i];
-        }
-      }
-
-      return true;
+    const int pkt = (int)(id - (baseID+21)); // 0..4
+    for (int i=0;i<8;i++){
+      int pos = pkt*8 + i;
+      if (pos >= TEMPS_NUM_CHANNELS) break;
+      // DS18B20 boards already provide whole °C (uint8)
+      cellTemperature[pos] = buf[i];
     }
+    update_min_max_ignore_zero();
+    return true;
   }
-
   return false;
 }
 
-// ** Function name:           query
-/*
-// ********************************************************************************************************
-// **Function name:           return_error
-// **Descriptions:            Function for returning the state of the BMS
-// **********************************************************************************************************
-int BMS_MOD::return_error()
-{
-  return error;
-}
-*/
-// ********************************************************************************************************
-// ** Descriptions:            Function to check if i need to send a mesage new mesage and the received mesajes interval are within the limits
-// **********************************************************************************************************
-int Temperatures_MOD::query(uint32_t time, char *buffer)
-{
-  // Function for performing a correct behaivour
-  if (time > time_lim_sended)
-  { // HERE I HAVE TO SEND THE REQUEST MESSAGE FOR THE TEMPERATURES
+int Temperatures_MOD::query(uint32_t time_ms, char *buffer) {
+  // Periodically request temps from the boards
+  if (time_ms > time_lim_sended) {
     time_lim_sended += TIME_LIM_SEND;
+    (void)module_send_message_CAN2(baseID+20, message_temperatures, 2); // request
 
-    if (module_send_message_CAN2(MODULEID, message_temperatures, 2) != HAL_OK)
-    {
-      error = Temperatures_ERROR_COMMUNICATION; // If the message is not sended then, error
-    }
-    else
-    {
-      /*       Serial.print("Ennvado solicitud a: ");
-            Serial.println(MODULEID,HEX); */
-    }
-
-    for(int i = 0; i<38; i++){
-    	if(cellTemperature[i] > 65){
-    		error = 2;
-    	}
-    }
-
-    // time_lim_sended += TIME_LIM_SEND; //Si actualizas dos veces, el mensaje se envía en la mitad del periodo
+    // Also republish the latest snapshot for the main board on CAN2
+    publish_CAN2();
   }
-  if (time > time_lim_received)
-  {
-    //error = Temperatures_ERROR_COMMUNICATION;
+
+  // Timeout check
+  if (time_ms > time_lim_received) {
+    error = Temperatures_ERROR_COMMUNICATION;
   }
-  if (TIME_LIM_PLOT > 0 && time > time_lim_plotted)
-  {
+
+  // Optional UART dump
+  if (TIME_LIM_PLOT > 0 && time_ms > time_lim_plotted) {
     time_lim_plotted += TIME_LIM_PLOT;
     info(buffer);
   }
-
-     if(time > time_lim_sended)
-    {
-      time_lim_sended += TIME_LIM_SEND;
-
-      message_temperatures[0] = 0;
-      message_temperatures[1] = MAX_T & 0xFF;
-      module_send_message_CAN1(CANIDTEL, 0, 2, message_temperatures);
-    }
-
   return error;
 }
 
+void Temperatures_MOD::info(char *buffer) {
+  if (getUARTState() != HAL_UART_STATE_READY) return;
 
+  // High-level header
+  sprintf(buffer, "\n***********************\n"); print(buffer);
+  sprintf(buffer, "     Temperatures\n"); print(buffer);
+  sprintf(buffer, "***********************\n"); print(buffer);
 
+  // Stats & IDs
+  sprintf(buffer, " - ERR: %d  MAX=%d  MIN=%d  LIM=%d\n", error, MAX_T, MIN_T, LIMIT_MAX_T); print(buffer);
+  sprintf(buffer, " - REQ on CAN2 ID: 0x%lX\n", (unsigned long)(baseID+20)); print(buffer);
+  sprintf(buffer, " - RSP on CAN2 IDs: 0x%lX..0x%lX\n",
+          (unsigned long)(baseID+21), (unsigned long)(baseID+25)); print(buffer);
+  sprintf(buffer, " - PUB summary: 0x%03X, raw blocks: 0x%03X..0x%03X\n",
+          CAN2_ID_AMS_TEMP_SUM, CAN2_ID_AMS_TEMP_BLOCK0, CAN2_ID_AMS_TEMP_BLOCK4); print(buffer);
+  sprintf(buffer, "-----------------------\n"); print(buffer);
 
-
-
-
-
-
-
+  // Print temps compactly (modules flattened)
+  sprintf(buffer, "Temps [0..%d]: [", TEMPS_NUM_CHANNELS-1); printnl(buffer);
+  for (int i=0;i<TEMPS_NUM_CHANNELS;i++){
+    sprintf(buffer, (i==TEMPS_NUM_CHANNELS-1) ? "%d" : "%d,", (int)cellTemperature[i]); printnl(buffer);
+  }
+  print((char*)"]");
+}

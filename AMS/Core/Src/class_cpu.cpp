@@ -3,6 +3,8 @@
 // Date         :   17/04/2020
 // Adaptation   :   Juan Mata & Jaime Landa
 // Date         :   03/2024
+// Update		:	10/2025
+// Author		: 	Andrés Sánchez de Ágreda
 // Name         :   class_cpu.h
 // Description  :
 // * This file is for defining the class of the connection protocols with putside
@@ -13,7 +15,13 @@
 
 #include "main.h"
 #include "class_cpu.h"
+#include "ams_can_map.h"
 
+
+
+extern HAL_StatusTypeDef module_send_message_CAN2(uint32_t id, uint8_t* data, uint8_t length);
+extern HAL_UART_StateTypeDef getUARTState(void);
+extern void print(char *s);
 
 // ********************************************************************************************************
 // **Function name:           CPU_MOD
@@ -65,14 +73,11 @@ bool CPU_MOD::parse(uint32_t id, uint8_t* buf, uint32_t t) {
     if (id == 0x100) {
         error = CPU_OK;
         time_lim_received = t + TIME_LIM_RECV;
-        DC_BUS = (int)((buf[1]<<8)|buf[0]); // This direction sends the voltage in DC_BUS
-        if (DC_BUS > 280) { //(DC_BUS>0.9*voltage_acum)
+        DC_BUS = (int)((buf[1]<<8)|buf[0]);
+        if (DC_BUS > 280) {
             error = CPU_BUS_LINE_OK;
-            if (module_send_message_CAN1(CANID_send, currentState, 1) != HAL_OK){
-                //error = CPU_ERROR_COMMUNICATION;
-                print((char*)"error message");
-            }
-
+            // <<<<<< was CAN1; now CAN2 only
+            (void)module_send_message_CAN2(CANID_send, currentState, 1);
         }
         return true;
     }
@@ -92,16 +97,12 @@ int CPU_MOD::return_error() {
 // ** Descriptions:            Function to check if i need to send a mesage new mesage and the received mesajes interval are within the limits
 // ********************************************************************************************************
 int CPU_MOD::query(uint32_t time, char* buffer) {
-	// Function for performing a correct behaivour
-    if (time > time_lim_sended) { // HERE I HAVE TO SEND THE REQUEST MESSAGE FOR THE BMS
+    if (time > time_lim_sended) {
         time_lim_sended += TIME_LIM_SEND;
     }
-    if (time > time_lim_received)
-        //error = CPU_ERROR_COMMUNICATION; ///////Cheking if everything is alright each time
-
     if (TIME_LIM_PLOT > 0 && time > time_lim_plotted) {
         time_lim_plotted += TIME_LIM_PLOT;
-        //info(buffer);
+        // info(buffer);
     }
     return error;
 }
