@@ -181,6 +181,8 @@ static void heartbeat_pin_init(void);
 static void heartbeat_tick(void);
 static uint8_t nrf24_tx32(const void *buf32);
 static void nrf24_flush_tx(void);
+static void ams_dump_once_uart(void);
+
 
 
 
@@ -842,6 +844,14 @@ for (int i = 0; i < 10; ++i) {
             peek.id, peek.seq, peek.v1, peek.v2, peek.v3, peek.v4, peek.v5, peek.v6, peek.v7);
         if (n > 0) HAL_UART_Transmit(&huart2, (uint8_t*)txl, (uint16_t)n, HAL_MAX_DELAY);
 
+
+        enum { AMS_DUMP_PERIOD_MS = 5000U };      // set 0 to disable periodic dump
+                static uint32_t last_ams_dump = 0;
+                if (AMS_DUMP_PERIOD_MS &&
+                    (HAL_GetTick() - last_ams_dump) >= AMS_DUMP_PERIOD_MS) {
+                    last_ams_dump = HAL_GetTick();
+                    ams_dump_once_uart();                 // one-shot print
+        }
         // (F) Self-heal if radio settings look off (brownout recovery)
         uint8_t cfg_now = nrf24_ReadReg(CONFIG);
         uint8_t ch_now  = nrf24_ReadReg(RF_CH);
@@ -2643,6 +2653,50 @@ static uint8_t nrf24_tx32(const void *buf32)
     // Timeout — clean up
     nrf24_flush_tx();
     return 0;
+}
+
+/* --- One-shot AMS dump over UART (call whenever you want a full snapshot) --- */
+static void ams_dump_once_uart(void)
+{
+    char line[128];
+    int n;
+
+    // Summary
+    float pack_V = (ams_stack_mv > 0) ? (ams_stack_mv / 1000.0f) : 0.0f;
+    int   tmin   = (ams_t_min  != 0xFF) ? (int)ams_t_min  : -1;
+    int   tmax   = (ams_t_max  != 0xFF) ? (int)ams_t_max  : -1;
+    float tavg   = (ams_t_avg10> 0)     ? (ams_t_avg10 / 10.0f) : -1.0f;
+
+    n = snprintf(line, sizeof(line),
+                 "\r\n[AMS] PACK=%.1fV cell[min,max]=%umV,%umV  T[min,max,avg]=%d,%d,%.1f  nT=%u\r\n",
+                 pack_V, ams_cell_min_mv, ams_cell_max_mv, tmin, tmax, tavg, ams_t_valid);
+    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+
+    // Cells
+    n = snprintf(line, sizeof(line), "[AMS] Cells mV:");
+    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+    for (uint8_t i = 0; i < ams_cell_count && i < AMS_NUM_CELLS; ++i) {
+        if (ams_cell_mv[i] != 0 && ams_cell_mv[i] != 0xFFFF) {
+            n = snprintf(line, sizeof(line), " %u", ams_cell_mv[i]);
+        } else {
+            n = snprintf(line, sizeof(line), " --");
+        }
+        HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+
+    // Temps
+    n = snprintf(line, sizeof(line), "[AMS] Temps C:");
+    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+    for (uint8_t i = 0; i < ams_temp_count && i < AMS_NUM_TEMPS; ++i) {
+        if (ams_temp_c[i] != 0xFF) {
+            n = snprintf(line, sizeof(line), " %u", ams_temp_c[i]);
+        } else {
+            n = snprintf(line, sizeof(line), " --");
+        }
+        HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
 }
 
 
