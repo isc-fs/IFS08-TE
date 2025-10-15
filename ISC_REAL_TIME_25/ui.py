@@ -13,6 +13,8 @@ NOVEDADES UI:
 - Muestra acum temp max (0x640 v3) y, si llega 0x645, muestra sondas DS18B20 (t1..t4, avg)
 - Mapea temps de inversor desde 0x610 (motor, IGBT, aire), y rpm/corriente actuales
 - 4 gráficas compactas: Acelerador, Freno, DC Bus Voltage y DS Temp (avg)
+- Panel DINÁMICA: motor RPM y α (rad/s²) calculada en UI; a (m/s²) opcional si backend la publica
+- Botón "Abrir último Excel"
 """
 
 import os
@@ -122,6 +124,20 @@ class TkTextHandler(logging.Handler):
             self.handleError(record)
 
 
+# -------- Small helpers --------
+def _temp_color(val):
+    """Color thresholds for temps."""
+    try:
+        v = float(val)
+    except Exception:
+        return "#FFFFFF"
+    if v > 90:
+        return "#FF0000"
+    if v > 75:
+        return "#FFA500"
+    return "#FFFFFF"
+
+
 class TelemetryUI:
     def __init__(self):
         # Root FIRST
@@ -172,6 +188,10 @@ class TelemetryUI:
         self.vdc_history      = deque(maxlen=self.maxlen_hist)
         self.dsavg_history    = deque(maxlen=self.maxlen_hist)
         self.time_history     = deque(maxlen=self.maxlen_hist)
+
+        # State for DINÁMICA panel (UI-side derivative)
+        self.last_rpm = None
+        self.last_rpm_ts = None
 
         # Listas demo
         self.pilots_list = ["J. Landa", "N. Huertas", "A. Sanchez", "F. Tobar"]
@@ -398,6 +418,14 @@ class TelemetryUI:
         )
         open_logs_btn.pack()
 
+        # NEW: open latest excel quick-action
+        open_last_btn = tk.Button(
+            tools_frame, text="Abrir último Excel", font=("Inter", 11),
+            fg="#FFFFFF", bg="#303030", activebackground="#505050",
+            command=self.open_latest_excel
+        )
+        open_last_btn.pack(pady=(6, 0))
+
     # -------------------- Cuadros de datos --------------------
     def create_data_displays(self):
         # ACUMULADOR
@@ -499,6 +527,24 @@ class TelemetryUI:
         self.accel_scaled_label.pack(pady=2)
         self.accel_clamped_label = tk.Label(accel_frame, text="Clamped: -- %", font=("Inter", 13, "bold"), fg="#FFFFFF", bg="#101010")
         self.accel_clamped_label.pack(pady=2)
+
+        # DINÁMICA (rpm, alpha, accel)
+        dyn_frame = tk.LabelFrame(self.root, text="DINÁMICA",
+                                  font=("Inter", 12, "bold"), fg="#87CEFA",
+                                  bg="#101010", bd=2)
+        dyn_frame.grid(row=4, column=6, columnspan=3, padx=5, pady=4, sticky="nsew")
+
+        self.rpm_label = tk.Label(dyn_frame, text="Motor RPM: --",
+                                  font=("Inter", 14), fg="#FFFFFF", bg="#101010")
+        self.rpm_label.pack(pady=2)
+
+        self.alpha_label = tk.Label(dyn_frame, text="α (rad/s²): --",
+                                    font=("Inter", 14), fg="#FFFFFF", bg="#101010")
+        self.alpha_label.pack(pady=2)
+
+        self.accel_label = tk.Label(dyn_frame, text="a (m/s²): --",
+                                    font=("Inter", 14), fg="#FFFFFF", bg="#101010")
+        self.accel_label.pack(pady=2)
 
         # LOG
         log_frame = tk.LabelFrame(self.root, text="LOG",
@@ -736,6 +782,7 @@ class TelemetryUI:
             self.torque_req_label, self.torque_est_label,
             self.accel_raw1_label, self.accel_raw2_label,
             self.accel_scaled_label, self.accel_clamped_label,
+            self.rpm_label, self.alpha_label, self.accel_label,
         ]
         for lb in labels:
             try:
@@ -768,20 +815,25 @@ class TelemetryUI:
                 if "current_sensor" in accu:
                     self.accu_current_label.config(text=f"Corriente: {accu['current_sensor']:.1f} A")
                 if "cell_min_v" in accu:
-                    # Si tu 0x640 v2 era otra cosa, mantenemos DC Bus desde 0x600 (abajo)
+                    # Nota: DC Bus real lo cogemos de 0x600; aquí mostramos cell_min si llega
                     self.accu_voltage_label.config(text=f"Voltaje Min: {accu['cell_min_v']:.2f} V")
                 if "cell_max_temp" in accu:
                     temp = float(accu["cell_max_temp"])
                     color = "#FF0000" if temp > 50 else "#FFA500" if temp > 40 else "#FFFFFF"
-                    self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C", fg=color if not self.freeze_ui else "#888888")
+                    self.temp_accu_label.config(text=f"Accu Max: {temp:.1f} °C",
+                                                fg=color if not self.freeze_ui else "#888888")
 
             # 0x610 — Inverter temps & currents
             if "0x610" in data:
                 inv = data["0x610"]
                 if "motor_temp" in inv:
-                    self.temp_motor_label.config(text=f"Motor: {inv['motor_temp']:.1f} °C")
+                    tm = float(inv["motor_temp"])
+                    self.temp_motor_label.config(text=f"Motor: {tm:.1f} °C",
+                                                 fg=_temp_color(tm) if not self.freeze_ui else "#888888")
                 if "pwrstg_temp" in inv:
-                    self.temp_inverter_label.config(text=f"Inversor: {inv['pwrstg_temp']:.1f} °C")
+                    ti = float(inv["pwrstg_temp"])
+                    self.temp_inverter_label.config(text=f"Inversor: {ti:.1f} °C",
+                                                    fg=_temp_color(ti) if not self.freeze_ui else "#888888")
                 if "air_temp" in inv:
                     self.temp_air_label.config(text=f"Aire: {inv['air_temp']:.1f} °C")
                 # n_actual / i_actual
@@ -831,6 +883,9 @@ class TelemetryUI:
                     vdc = float(m600["dc_bus_voltage"])
                     self.accu_voltage_label.config(text=f"DC Bus: {vdc:.1f} V")
                     g_vdc = vdc
+                    # Warn color for DC sag
+                    vdc_color = "#FF6666" if vdc < 280 else "#FFFFFF"
+                    self.accu_voltage_label.config(fg=vdc_color if not self.freeze_ui else "#888888")
 
             # 0x645 — detalle DS18B20 (avg preferente)
             if "0x645" in data:
@@ -850,7 +905,41 @@ class TelemetryUI:
                         g_dsavg = sum(vals) / len(vals)
                         self.ds_summary_label.config(text=f"DS avg: {g_dsavg:.1f} °C")
 
-            # Actualiza las 4 gráficas compactas
+            # -------- DINÁMICA panel (UI-side α from RPM) --------
+            # Prefer rpm from 0x610, else 0x600
+            rpm_best = None
+            if "0x610" in data and isinstance(data["0x610"].get("n_actual"), (int, float)):
+                rpm_best = float(data["0x610"]["n_actual"])
+            elif "0x600" in data and isinstance(data["0x600"].get("rpm"), (int, float)):
+                rpm_best = float(data["0x600"]["rpm"])
+
+            alpha = None
+            if rpm_best is not None:
+                self.rpm_label.config(text=f"Motor RPM: {rpm_best:.0f}")
+                now = time.time()
+                if self.last_rpm is not None and self.last_rpm_ts is not None:
+                    dt = max(0.0, now - self.last_rpm_ts)
+                    if dt > 0.0:
+                        rpm_s = (rpm_best - self.last_rpm) / dt
+                        alpha = (rpm_s * 2.0 * np.pi) / 60.0
+                self.last_rpm = rpm_best
+                self.last_rpm_ts = time.time()
+            else:
+                self.rpm_label.config(text="Motor RPM: --")
+
+            if alpha is not None:
+                self.alpha_label.config(text=f"α (rad/s²): {alpha:.2f}")
+            else:
+                self.alpha_label.config(text="α (rad/s²): --")
+
+            # If backend publishes derived accel (optional under "__DERIVED__")
+            derived = data.get("__DERIVED__", {})
+            if isinstance(derived.get("veh_accel_mps2"), (int, float)):
+                self.accel_label.config(text=f"a (m/s²): {float(derived['veh_accel_mps2']):.2f}")
+            else:
+                self.accel_label.config(text="a (m/s²): --")
+
+            # -------- Actualiza las 4 gráficas compactas --------
             self.update_graphs(g_throttle, g_brake, g_vdc, g_dsavg)
 
         except Exception as e:
@@ -864,26 +953,15 @@ class TelemetryUI:
             t_now = time.time()
             self.time_history.append(t_now)
 
-            # Acumula sólo si hay dato nuevo
-            if throttle is not None:
-                self.throttle_history.append(float(throttle))
-            else:
-                self.throttle_history.append(self.throttle_history[-1] if self.throttle_history else 0.0)
-
-            if brake is not None:
-                self.brake_history.append(float(brake))
-            else:
-                self.brake_history.append(self.brake_history[-1] if self.brake_history else 0.0)
-
-            if vdc is not None:
-                self.vdc_history.append(float(vdc))
-            else:
-                self.vdc_history.append(self.vdc_history[-1] if self.vdc_history else 0.0)
-
-            if dsavg is not None:
-                self.dsavg_history.append(float(dsavg))
-            else:
-                self.dsavg_history.append(self.dsavg_history[-1] if self.dsavg_history else 0.0)
+            # Acumula sólo si hay dato nuevo; si no, repite último
+            self.throttle_history.append(float(throttle) if throttle is not None
+                                         else (self.throttle_history[-1] if self.throttle_history else 0.0))
+            self.brake_history.append(float(brake) if brake is not None
+                                      else (self.brake_history[-1] if self.brake_history else 0.0))
+            self.vdc_history.append(float(vdc) if vdc is not None
+                                    else (self.vdc_history[-1] if self.vdc_history else 0.0))
+            self.dsavg_history.append(float(dsavg) if dsavg is not None
+                                      else (self.dsavg_history[-1] if self.dsavg_history else 0.0))
 
             # Eje tiempo relativo
             if len(self.time_history) > 1:
@@ -904,13 +982,13 @@ class TelemetryUI:
             self.ax_brake.set_title("FRENO (%)", color="white", fontsize=10, fontweight="bold")
             self.ax_brake.set_ylim(0, 100)
             self.ax_vdc.set_title("DC BUS (V)", color="white", fontsize=10, fontweight="bold")
-            # auto-ajuste si VDC se sale
+            # auto-ajuste si VDC se sale (escala a múltiplos de 20 V)
             vmax = max(self.vdc_history) if self.vdc_history else 100
-            self.ax_vdc.set_ylim(0, max(60, ((int(vmax/20)+1)*20)))  # múltiplos de 20
+            self.ax_vdc.set_ylim(0, max(60, ((int(vmax/20)+1)*20)))
             self.ax_dsavg.set_title("DS TEMP AVG (°C)", color="white", fontsize=10, fontweight="bold")
             self.ax_dsavg.set_ylim(0, 90)
 
-            # Draw series (sin relleno para mantenerlas pequeñas)
+            # Draw series
             self.ax_throttle.plot(ts, list(self.throttle_history), linewidth=1.5)
             self.ax_brake.plot(ts, list(self.brake_history), linewidth=1.5)
             self.ax_vdc.plot(ts, list(self.vdc_history), linewidth=1.5)
@@ -933,6 +1011,26 @@ class TelemetryUI:
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
             messagebox.showerror("Abrir carpeta", f"No se pudo abrir la carpeta de logs:\n{e}")
+
+    def open_latest_excel(self):
+        try:
+            logs_dir = os.path.abspath("logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            candidates = [os.path.join(logs_dir, f) for f in os.listdir(logs_dir)
+                          if f.lower().endswith(".xlsx") and f.startswith("ISC_")]
+            if not candidates:
+                messagebox.showinfo("Excel", "No hay ficheros Excel en ./logs todavía.")
+                return
+            latest = max(candidates, key=os.path.getmtime)
+            if sys.platform.startswith("win"):
+                os.startfile(latest)  # type: ignore
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", latest])
+            else:
+                subprocess.Popen(["xdg-open", latest])
+            self.log_message(f"Abrir Excel: {latest}")
+        except Exception as e:
+            messagebox.showerror("Excel", f"No se pudo abrir el último Excel:\n{e}")
 
     # -------------------- Log y salida --------------------
     def log_message(self, message: str):

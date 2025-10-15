@@ -1,4 +1,3 @@
-
 """
 Recepción por USB-Serial desde RF-NANO (forward de NRF24L01, 32B LE)
 
@@ -16,12 +15,16 @@ ROBUSTEZ:
   - Detección de patrón TEST (A0..BF y rampas consecutivas) ⇒ ignora
   - Chequeo monotónico de SEQ (uint16) y badge LIVE/STALE/BAD exportado a la UI:
       latest_data_dict["__STATUS__"] = {"badge": "...", "reason": "...", "ts": epoch_ms}
-  - Excel por sesión en ./logs (una fila por frame válido no-TEST)
+  - Excel por sesión en ./logs — **una sola hoja** "telemetry" con columnas semánticas y derivadas
 
 NOVEDADES:
   - Mapeo correcto de 0x610 (temps/corrientes de inversor)
   - 0x640: Accumulator summary (v3 = DS18B20 t_max)
-  - 0x645 (opcional): Detalle DS18B20 (v1..v4 = sondas, v5=avg, v6=max, v7=count)
+  - 0x645 (opcional): Detalle DS18B20 (t1..t4, avg, max, count)
+  - Columnas derivadas:
+      motor_rpm (prefer 0x610.v4 → 0x600.v3)
+      motor_ang_accel_rad_s2 (d/dt RPM)
+      veh_accel_mps2 (si defines GEAR_RATIO, FINAL_DRIVE, WHEEL_RADIUS_M)
 """
 
 from __future__ import annotations
@@ -30,12 +33,14 @@ import time
 import struct
 import logging
 from datetime import datetime
+from typing import Optional, Dict, Any
 
 import serial
 import serial.tools.list_ports
 
 # Excel logging
 import pandas as pd
+import numpy as np
 
 # ================== CONFIG RF (informativo, para log) ==================
 RF_EXPECTED = {
@@ -48,11 +53,17 @@ RF_EXPECTED = {
     "PA":        "PA_MAX",
 }
 
+# ================== CONFIG DERIVADOS (vehículo) ==================
+# Si quieres a_mps2, rellena estos tres valores (ejemplo: GEAR_RATIO=3.5, FINAL_DRIVE=3.9, WHEEL_RADIUS_M=0.285)
+GEAR_RATIO: Optional[float]     = None
+FINAL_DRIVE: Optional[float]    = None
+WHEEL_RADIUS_M: Optional[float] = None
+
 # ================== CONFIG Influx (OPCIONAL) ==================
 INFLUX_CONFIG = {
     "url":   "http://localhost:8086",
-    "token": "TU_TOKEN",
-    "org":   "TU_ORG",
+    "token": "TOKEN",
+    "org":   "TORG",
 }
 INFLUX_ENABLE_DEFAULT = False   # <-- por defecto DESACTIVADO
 
@@ -296,7 +307,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
 
     # ------- Mapeos semánticos -------
     if id_int == 0x600:
-        # Powertrain básico (según tu TX real: ajusta si difiere)
         latest_data_dict[id_hex].update({
             "dc_bus_voltage": v1,   # V
             "dc_bus_power":   v2,   # W (si mapeado)
@@ -308,7 +318,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
         })
 
     elif id_int == 0x610:
-        # Inverter temps & currents (nuevo mapeo correcto)
         latest_data_dict[id_hex].update({
             "motor_temp":   v1,   # °C
             "pwrstg_temp":  v2,   # °C (IGBT)
@@ -318,7 +327,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
         })
 
     elif id_int == 0x620:
-        # Driver inputs (si lo usas para algo adicional)
         latest_data_dict[id_hex].update({
             "s1_raw": v1, "s2_raw": v2,
             "brake_raw": v3,
@@ -327,7 +335,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
         })
 
     elif id_int == 0x630:
-        # Driver “resumen”
         latest_data_dict[id_hex].update({
             "torque_req": v1,
             "torque_est": v2,
@@ -336,7 +343,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
         })
 
     elif id_int == 0x640:
-        # Accumulator/HV summary + t_max de DS18B20
         latest_data_dict[id_hex].update({
             "current_sensor": v1,  # A si lo mandas
             "cell_min_v":     v2,  # V o mV según escale tu TX
@@ -344,7 +350,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
         })
 
     elif id_int == 0x645:
-        # Detalle DS18B20 por sonda
         latest_data_dict[id_hex].update({
             "ds_t1": v1,
             "ds_t2": v2,
@@ -436,9 +441,24 @@ def get_latest_data(data_id: str = None):
         return latest_data_dict.get(data_id, {})
     return latest_data_dict.copy()
 
-# ================== EXCEL LOGGING ==================
+# ================== EXCEL LOGGING (UNA SOLA HOJA) ==================
+_CLAMP_TEMP_MIN = -40.0
+_CLAMP_TEMP_MAX = 200.0
+
+def _clamp_temp(x: Optional[float]) -> Optional[float]:
+    if x is None or np.isnan(x):
+        return x
+    if x < _CLAMP_TEMP_MIN or x > _CLAMP_TEMP_MAX:
+        return np.nan  # inválido → NaN
+    return x
+
 class ExcelSessionLogger:
-    """Crea/actualiza Excel en ./logs con una fila por frame."""
+    """
+    Excel de sesión en ./logs con UNA hoja "telemetry".
+    - Guarda una fila por frame válido (no-TEST)
+    - Añade columnas semánticas y derivadas
+    - Calcula motor_ang_accel_rad_s2 en línea (d/dt del mejor RPM)
+    """
     def __init__(self, piloto: str, circuito: str):
         os.makedirs("logs", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -446,22 +466,152 @@ class ExcelSessionLogger:
         safe_circuito = circuito.replace(" ", "_")
         self.path = os.path.join("logs", f"ISC_{ts}_{safe_piloto}_{safe_circuito}.xlsx")
 
-        if not os.path.exists(self.path):
-            df = pd.DataFrame(columns=["timestamp", "id_hex", "seq", "v1", "v2", "v3", "v4", "v5", "v6", "v7"])
-            with pd.ExcelWriter(self.path, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="telemetry")
+        # Estado para derivados (RPM y a_mps2)
+        self.last_rpm_ts: Optional[float] = None
+        self.last_rpm: Optional[float]    = None
+
+        # Predefinir columnas del Excel (anchas/semánticas)
+        self.columns = [
+            # básicos
+            "timestamp", "epoch_ms", "badge", "badge_reason",
+            "id_hex", "seq",
+            # 0x600
+            "dc_bus_voltage_V", "dc_bus_power_W", "rpm_600", "torque_total", "cell_min_v_600",
+            "throttle_raw1", "throttle_raw2",
+            # 0x610
+            "motor_temp_C", "pwrstg_temp_C", "air_temp_C", "rpm_610", "i_actual_A",
+            # 0x620
+            "s1_raw", "s2_raw", "brake_raw", "precharge_button", "start_button",
+            # 0x630
+            "torque_req", "torque_est", "throttle_pct", "brake_pct",
+            # 0x640
+            "hv_current_A", "cell_min_v_640", "accu_ds_tmax_C",
+            # 0x645
+            "ds_t1_C", "ds_t2_C", "ds_t3_C", "ds_t4_C", "ds_avg_C", "ds_max_C", "ds_count",
+            # 0x680
+            "status_word", "error_word",
+            # derivados (comunes)
+            "motor_rpm", "motor_ang_accel_rad_s2", "veh_accel_mps2",
+            # crudos (por depuración)
+            "v1","v2","v3","v4","v5","v6","v7",
+        ]
+
+        # Crea fichero con cabeceras
+        df = pd.DataFrame(columns=self.columns)
+        with pd.ExcelWriter(self.path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="telemetry")
+
+    def _veh_acc_from_alpha(self, ang_acc_rad_s2: Optional[float]) -> Optional[float]:
+        if ang_acc_rad_s2 is None or np.isnan(ang_acc_rad_s2):
+            return np.nan
+        if not (GEAR_RATIO and FINAL_DRIVE and WHEEL_RADIUS_M):
+            return np.nan
+        # a_vehicle ≈ α_motor * (R / (G*F))
+        try:
+            return float(ang_acc_rad_s2) * (WHEEL_RADIUS_M / (GEAR_RATIO * FINAL_DRIVE))
+        except Exception:
+            return np.nan
+
+    def _best_rpm_from_row(self, row_map: Dict[str, Any]) -> Optional[float]:
+        """Prefiere rpm_610; si NaN, usa rpm_600."""
+        rpm610 = row_map.get("rpm_610")
+        rpm600 = row_map.get("rpm_600")
+        if rpm610 is not None and not np.isnan(rpm610):
+            return float(rpm610)
+        if rpm600 is not None and not np.isnan(rpm600):
+            return float(rpm600)
+        return np.nan
+
+    def _row_from_frame(self, id_hex: str, seq, v1, v2, v3, v4, v5, v6, v7) -> Dict[str, Any]:
+        now = time.time()
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        epoch_ms = int(now * 1000)
+
+        # Base map con NaN en todo
+        r = {c: (np.nan) for c in self.columns}
+        # Básicos
+        r["timestamp"]    = ts_str
+        r["epoch_ms"]     = epoch_ms
+        r["badge"]        = _status.get("badge")
+        r["badge_reason"] = _status.get("reason")
+        r["id_hex"]       = id_hex
+        r["seq"]          = (int(seq) if seq is not None else -1)
+
+        # Guardar crudos
+        r["v1"]=v1; r["v2"]=v2; r["v3"]=v3; r["v4"]=v4; r["v5"]=v5; r["v6"]=v6; r["v7"]=v7
+
+        # Mapeo por ID
+        if id_hex == "0x600":
+            r["dc_bus_voltage_V"] = float(v1)
+            r["dc_bus_power_W"]   = float(v2)
+            r["rpm_600"]          = float(v3)
+            r["torque_total"]     = float(v4)
+            r["cell_min_v_600"]   = float(v5)
+            r["throttle_raw1"]    = float(v6)
+            r["throttle_raw2"]    = float(v7)
+
+        elif id_hex == "0x610":
+            r["motor_temp_C"]  = _clamp_temp(float(v1))
+            r["pwrstg_temp_C"] = _clamp_temp(float(v2))
+            r["air_temp_C"]    = _clamp_temp(float(v3))
+            r["rpm_610"]       = float(v4)
+            r["i_actual_A"]    = float(v5)
+
+        elif id_hex == "0x620":
+            r["s1_raw"]            = float(v1)
+            r["s2_raw"]            = float(v2)
+            r["brake_raw"]         = float(v3)
+            r["precharge_button"]  = float(v4)
+            r["start_button"]      = float(v5)
+
+        elif id_hex == "0x630":
+            r["torque_req"]   = float(v1)
+            r["torque_est"]   = float(v2)
+            r["throttle_pct"] = float(np.clip(v3, 0.0, 100.0))
+            r["brake_pct"]    = float(np.clip(v4, 0.0, 100.0))
+
+        elif id_hex == "0x640":
+            r["hv_current_A"]   = float(v1)
+            r["cell_min_v_640"] = float(v2)
+            r["accu_ds_tmax_C"] = _clamp_temp(float(v3))
+
+        elif id_hex == "0x645":
+            r["ds_t1_C"]   = _clamp_temp(float(v1))
+            r["ds_t2_C"]   = _clamp_temp(float(v2))
+            r["ds_t3_C"]   = _clamp_temp(float(v3))
+            r["ds_t4_C"]   = _clamp_temp(float(v4))
+            r["ds_avg_C"]  = _clamp_temp(float(v5))
+            r["ds_max_C"]  = _clamp_temp(float(v6))
+            r["ds_count"]  = float(v7)
+
+        elif id_hex == "0x680":
+            r["status_word"] = float(v1)
+            r["error_word"]  = float(v2)
+
+        # Derivados — elegir mejor RPM y calcular α y a
+        rpm_best = self._best_rpm_from_row(r)
+        if rpm_best is not None and not np.isnan(rpm_best):
+            r["motor_rpm"] = rpm_best
+            if self.last_rpm is not None and self.last_rpm_ts is not None:
+                dt = max(0.0, now - self.last_rpm_ts)
+                if dt > 0.0:
+                    rpm_s = (rpm_best - self.last_rpm) / dt
+                    ang_acc = (rpm_s * 2.0 * np.pi) / 60.0  # rad/s²
+                    r["motor_ang_accel_rad_s2"] = float(ang_acc)
+                    r["veh_accel_mps2"] = float(self._veh_acc_from_alpha(ang_acc))
+        # actualizar memoria de RPM sólo si este frame aporta rpm_610 o rpm_600
+        if id_hex in ("0x610","0x600") and r.get("motor_rpm", np.nan) is not np.nan:
+            self.last_rpm = float(r["motor_rpm"]) if not np.isnan(r["motor_rpm"]) else self.last_rpm
+            self.last_rpm_ts = now
+
+        return r
 
     def append(self, id_hex: str, seq, v1, v2, v3, v4, v5, v6, v7):
-        row = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            "id_hex": id_hex,
-            "seq": seq if seq is not None else -1,
-            "v1": v1, "v2": v2, "v3": v3, "v4": v4, "v5": v5, "v6": v6, "v7": v7,
-        }
         try:
-            # Simple (no óptimo para sesiones largas): lee, concatena, reescribe
+            row_map = self._row_from_frame(id_hex, seq, v1, v2, v3, v4, v5, v6, v7)
+            # Leemos hoja, añadimos y sobrescribimos (simple y robusto)
             existing = pd.read_excel(self.path, sheet_name="telemetry")
-            newdf = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
+            newdf = pd.concat([existing, pd.DataFrame([row_map], columns=self.columns)], ignore_index=True)
             with pd.ExcelWriter(self.path, engine="openpyxl", mode="w") as writer:
                 newdf.to_excel(writer, index=False, sheet_name="telemetry")
         except Exception as e:
@@ -481,7 +631,7 @@ def receive_data(bucket_id: str,
       - Emite "Radio Checking" cada 500 ms
       - Lee frames, valida, descarta TEST, decodifica, actualiza latest_data_dict + data_str + new_data_flag
       - (Opcional) escribe en Influx
-      - Escribe Excel
+      - Escribe **un único Excel** (hoja 'telemetry') con columnas semánticas y derivadas
       - Muestra [STATS] cada 2 s (nivel DEBUG)
     """
     global new_data_flag, _last_seq, _last_seq_advance_ts
@@ -620,7 +770,7 @@ def receive_data(bucket_id: str,
                 decoded["v5"], decoded["v6"], decoded["v7"]))
             logger.debug("[RX] FLOATS: %s", fline)
 
-            # Excel (solo frames válidos y no-TEST)
+            # Excel (solo frames válidos y no-TEST) — UNA HOJA
             id_hex = _id_hex(decoded["id"])
             try:
                 xlogger.append(
