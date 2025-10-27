@@ -701,7 +701,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     for (int i = 0; i < 8; i++) { m->buf[i] = RxData[i]; }
     m->bus  = (hfdcan == &hfdcan1) ? 1 : 2;
     m->time = HAL_GetTick();
-    parse_state(*m);
+    parse_state(m);
   }
 
   if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)

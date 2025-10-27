@@ -19,6 +19,24 @@ class BMS_MOD;
 
 extern TIM_HandleTypeDef htim17;
 
+#define CHARGE_MIN_CURRENT_ABS  100  // mA - adjust to your needs
+#define CHARGE_FAIL_TIMEOUT_MS  5000 // ms - adjust to your needs
+
+// CPU states
+#define CPU_DISCONNECTED         0
+#define CPU_PRECHARGE           1
+#define CPU_POWER               2
+#define CPU_CHARGING            3
+#define CPU_ERROR               4
+
+// CPU error codes
+#define CPU_OK                  0
+#define CPU_ERROR_COMMUNICATION 1
+
+// Current error codes
+#define Current_OK              0
+#define Current_ERROR_Comunication  1
+
 // -----------------------------------------------------------------------------
 // --- FAN TIMER CONFIG ---------------------------------------------------------
 // -----------------------------------------------------------------------------

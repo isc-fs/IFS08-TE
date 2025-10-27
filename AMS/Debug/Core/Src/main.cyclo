@@ -1,0 +1,23 @@
+../Core/Src/main.cpp:99:5:int main()	6
+../Core/Src/main.cpp:180:6:void SystemClock_Config()	4
+../Core/Src/main.cpp:238:6:void PeriphCommonClock_Config()	2
+../Core/Src/main.cpp:265:13:void MX_ADC1_Init()	4
+../Core/Src/main.cpp:337:13:void MX_ADC3_Init()	3
+../Core/Src/main.cpp:400:13:void MX_FDCAN1_Init()	3
+../Core/Src/main.cpp:463:13:void MX_FDCAN2_Init()	3
+../Core/Src/main.cpp:526:13:void MX_TIM17_Init()	5
+../Core/Src/main.cpp:589:13:void MX_USART2_UART_Init()	5
+../Core/Src/main.cpp:637:13:void MX_GPIO_Init()	1
+../Core/Src/main.cpp:690:6:void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef*, uint32_t)	8
+../Core/Src/main.cpp:715:24:uint32_t len_to_dlc(uint8_t)	9
+../Core/Src/main.cpp:730:23:uint8_t dlc_to_len(uint32_t)	2
+../Core/Src/main.cpp:739:19:HAL_StatusTypeDef module_send_message_CAN1(uint32_t, uint8_t*, uint8_t)	1
+../Core/Src/main.cpp:755:19:HAL_StatusTypeDef module_send_message_NoExtId_CAN1(uint32_t, uint8_t*, uint8_t)	1
+../Core/Src/main.cpp:771:19:HAL_StatusTypeDef module_send_message_CAN2(uint32_t, uint8_t*, uint8_t)	1
+../Core/Src/main.cpp:788:6:void print(char*)	1
+../Core/Src/main.cpp:793:6:void printnl(char*)	1
+../Core/Src/main.cpp:798:6:void printValue(int)	1
+../Core/Src/main.cpp:803:23:HAL_UART_StateTypeDef getUARTState()	1
+../Core/Src/main.cpp:807:7:float readCurrentValue()	1
+../Core/Src/main.cpp:824:7:float readAnalogValue()	1
+../Core/Src/main.cpp:840:6:void Error_Handler()	1

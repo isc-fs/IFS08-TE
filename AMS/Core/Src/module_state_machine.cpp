@@ -241,6 +241,7 @@ void select_state(void) {
             break;
 
         case STATE::charge:
+        	{
             state_air_n = 1;
             state_air_p = 1;
             state_precharge = 0;
@@ -263,6 +264,7 @@ void select_state(void) {
                 state = STATE::start;
                 charge_current_error_counter = 0;
             }
+        	}
             break;
 
         case STATE::error:

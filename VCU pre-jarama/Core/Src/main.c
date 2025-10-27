@@ -105,44 +105,45 @@ volatile uint32_t tel_irq_cnt   = 0;   // increments each TIM16 ISR
 volatile uint32_t tel_sent_ok   = 0;   // nRF24 TX successes
 volatile uint32_t tel_sent_fail = 0;   // nRF24 TX failures
 
-// ---------- AMS (Accumulator Monitoring System) decoding ----------
-// IDs defined by the AMS/AMS-master you implemented earlier
-#define AMS_ID_VOLT_SUM      0x202  // [u16 max_mV][u16 min_mV][u32 stack_mV] (BE)
-#define AMS_ID_VOLT_BLOCK0   0x203  // ..0x207; 4 cells/frame, u16 mV each (BE), pad 0xFFFF
-#define AMS_ID_VOLT_BLOCK_LAST 0x207
+// ---------- AMS (Accumulator Monitoring System) Storage ----------
+// Per-module data (5 modules)
+typedef struct {
+    uint16_t min_cell_mv;           // Minimum cell voltage in this module
+    uint8_t  temps[AMS_TEMPS_PER_MOD];  // 38 temperatures per module
+    uint8_t  temp_valid_count;      // How many valid temps
+    uint8_t  temp_max;              // Max temp in module
+    uint8_t  temp_min;              // Min temp in module
+    uint32_t last_update_ms;        // When last data received
+} AMS_Module_t;
 
-#define AMS_ID_TEMP_SUM      0x208  // [u8 maxC][u8 minC][u16 avgCx10 (BE)][u8 valid_count][3 pad]
-#define AMS_ID_TEMP_BLOCK0   0x209  // ..0x20D; 8 temps/frame, u8 °C, pad 0xFF
-#define AMS_ID_TEMP_BLOCK_LAST 0x20D
+static AMS_Module_t ams_modules[AMS_NUM_MODULES] = {0};
 
-// Pick safe upper bounds. If yours differ, tweak these two numbers only.
-#define AMS_NUM_CELLS   40
-#define AMS_NUM_TEMPS   40
+// Global AMS summary
+static uint16_t ams_global_min_mv = 0;      // Lowest cell across all modules
+static uint16_t ams_global_max_mv = 0;      // Highest cell across all modules
+static uint32_t ams_stack_total_mv = 0;     // Total stack voltage
+static int16_t  ams_current_dA = 0;         // Current in deci-amps (e.g., 123 = 12.3A)
+float v_celda_min = 3600; // Contiene el ultimo valor de tension minima de una celda enviada por el AMS.
 
-static inline uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0]<<8) | p[1]); }
-static inline uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|((uint32_t)p[3]); }
 
-// Raw buffers (latest snapshot)
-static uint16_t ams_cell_mv[AMS_NUM_CELLS] = {0};
-static uint8_t  ams_cell_count             = 0;     // how many indices we’ve seen valid in blocks
+// Temperature array for telemetry (190 temps organized by module)
+static uint8_t ams_all_temps[AMS_TOTAL_TEMPS] = {0xFF};
 
-static uint8_t  ams_temp_c[AMS_NUM_TEMPS]  = {0xFF};
-static uint8_t  ams_temp_count             = 0;
+// Helper functions
+static inline uint16_t be16(const uint8_t *p) {
+    return (uint16_t)((p[0] << 8) | p[1]);
+}
 
-// Summaries decoded from 0x202 and 0x208
-static uint16_t ams_cell_min_mv = 0;
-static uint16_t ams_cell_max_mv = 0;
-static uint32_t ams_stack_mv    = 0;
+static inline uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | ((uint32_t)p[3]);
+}
 
-static uint8_t  ams_t_min   = 0xFF;
-static uint8_t  ams_t_max   = 0x00;
-static uint16_t ams_t_avg10 = 0;       // avg *10 (e.g. 276 => 27.6°C)
-static uint8_t  ams_t_valid = 0;
-
-// For your existing logic (torque limiting), keep v_celda_min synced
-// (You already declared: float v_celda_min = 3600;)
+// Update global min for torque limiting
 static void ams_update_v_celda_min(void) {
-    if (ams_cell_min_mv > 0) v_celda_min = (float)ams_cell_min_mv;
+    if (ams_global_min_mv > 0) {
+        v_celda_min = (float)ams_global_min_mv;
+    }
 }
 
 // ---------- MODOS DEBUG ----------
@@ -181,7 +182,7 @@ static void heartbeat_pin_init(void);
 static void heartbeat_tick(void);
 static uint8_t nrf24_tx32(const void *buf32);
 static void nrf24_flush_tx(void);
-static void ams_dump_once_uart(void);
+static void ams_dump_status(void);
 
 
 
@@ -261,7 +262,6 @@ float s_freno_aux;
 int sdd_suspension; // Lectura del sensor delantero derecho de suspensión
 int sdi_suspension; // Lectura del sensor delantero izquierdo de suspensión
 float aux_velocidad;
-float v_celda_min = 3600; // Contiene el ultimo valor de tension minima de una celda enviada por el AMS.
 
 // ---------- VARIABLES DE CONTROL DEL INVERSOR ----------
 int porcentaje_pedal_acel;
@@ -850,7 +850,7 @@ for (int i = 0; i < 10; ++i) {
                 if (AMS_DUMP_PERIOD_MS &&
                     (HAL_GetTick() - last_ams_dump) >= AMS_DUMP_PERIOD_MS) {
                     last_ams_dump = HAL_GetTick();
-                    ams_dump_once_uart();                 // one-shot print
+                    ams_dump_status();                 // one-shot print
         }
         // (F) Self-heal if radio settings look off (brownout recovery)
         uint8_t cfg_now = nrf24_ReadReg(CONFIG);
@@ -1864,6 +1864,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 		else if (hfdcan->Instance == FDCAN2) { // BUS ACU / AMS (ALL AMS HERE)
 		        if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader_Acu, RxData_Acu) == HAL_OK) {
 		            uint32_t id = RxHeader_Acu.Identifier;
+		            uint32_t now = HAL_GetTick();
 
 		            // keep your existing cases for backwards-compat
 		            switch (id) {
@@ -1871,55 +1872,102 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 		                if (RxData_Acu[0] == 0) precarga_inv = 1;
 		                break;
 		            case 0x12C: // legacy: min cell mV (u16 BE)
-		                v_celda_min = (float)((RxData_Acu[0] << 8) | RxData_Acu[1]);
+		            	v_celda_min = (float)be16(&RxData_Acu[0]);
 		                break;
 		            default:
 		                break;
 		            }
+		            // ---- NEW AMS TELEMETRY PARSING ----
 
-		            // ---- New AMS decoding ----
-		            if (id == AMS_ID_VOLT_SUM) {
-		                // [u16 BE max_mV][u16 BE min_mV][u32 BE stack_mV]
-		                ams_cell_max_mv = be16(&RxData_Acu[0]);
-		                ams_cell_min_mv = be16(&RxData_Acu[2]);
-		                ams_stack_mv    = be32(&RxData_Acu[4]);
-		                ams_update_v_celda_min();
-		            }
-		            else if (id >= AMS_ID_VOLT_BLOCK0 && id <= AMS_ID_VOLT_BLOCK_LAST) {
-		                // each frame: 4 x u16 mV (BE). pad as 0xFFFF if unused
-		                uint8_t block = (uint8_t)(id - AMS_ID_VOLT_BLOCK0);
-		                for (uint8_t i = 0; i < 4; i++) {
-		                    uint16_t v = be16(&RxData_Acu[2*i]);
-		                    uint8_t idx = (uint8_t)(block*4u + i);
-		                    if (idx < AMS_NUM_CELLS) {
-		                        ams_cell_mv[idx] = v;
-		                        if (v != 0xFFFF && v != 0x0000 && idx+1 > ams_cell_count) {
-		                            ams_cell_count = idx+1;
+		                    // Voltage summary (all modules combined)
+		                    if (id == CAN2_ID_AMS_VOLT_SUM) {
+		                        ams_global_max_mv = be16(&RxData_Acu[0]);
+		                        ams_global_min_mv = be16(&RxData_Acu[2]);
+		                        ams_stack_total_mv = be32(&RxData_Acu[4]);
+		                        ams_update_v_celda_min();
+		                    }
+
+		                    // Voltage blocks: extract minimum per module (assumes sequential sending)
+		                    // Each block has 4 cells (8 bytes), module changes every ~5 blocks
+		                    else if (id >= CAN2_ID_AMS_VOLT_BLOCK0 && id <= CAN2_ID_AMS_VOLT_BLOCK4) {
+		                        int block_idx = id - CAN2_ID_AMS_VOLT_BLOCK0;
+		                        int module_idx = block_idx / 5;  // 5 blocks per module
+
+		                        if (module_idx < AMS_NUM_MODULES) {
+		                            // Extract 4 cell voltages from this block
+		                            uint16_t cells[4];
+		                            for (int i = 0; i < 4; i++) {
+		                                cells[i] = be16(&RxData_Acu[i * 2]);
+		                                if (cells[i] != 0xFFFF && cells[i] > 0) {
+		                                    // Update module minimum
+		                                    if (ams_modules[module_idx].min_cell_mv == 0 ||
+		                                        cells[i] < ams_modules[module_idx].min_cell_mv) {
+		                                        ams_modules[module_idx].min_cell_mv = cells[i];
+		                                    }
+		                                }
+		                            }
+		                            ams_modules[module_idx].last_update_ms = now;
 		                        }
 		                    }
-		                }
-		            }
-		            else if (id == AMS_ID_TEMP_SUM) {
-		                // [u8 maxC][u8 minC][u16 BE avgCx10][u8 valid][pad...]
-		                ams_t_max   = RxData_Acu[0];
-		                ams_t_min   = RxData_Acu[1];
-		                ams_t_avg10 = be16(&RxData_Acu[2]);
-		                ams_t_valid = RxData_Acu[4];
-		            }
-		            else if (id >= AMS_ID_TEMP_BLOCK0 && id <= AMS_ID_TEMP_BLOCK_LAST) {
-		                // 8 temps (u8 °C), 0xFF = invalid
-		                uint8_t block = (uint8_t)(id - AMS_ID_TEMP_BLOCK0);
-		                for (uint8_t i = 0; i < 8; i++) {
-		                    uint8_t t = RxData_Acu[i];
-		                    uint8_t idx = (uint8_t)(block*8u + i);
-		                    if (idx < AMS_NUM_TEMPS) {
-		                        ams_temp_c[idx] = t;
-		                        if (t != 0xFF && idx+1 > ams_temp_count) {
-		                            ams_temp_count = idx+1;
+
+		                    // Temperature summary (global across all modules)
+		                    else if (id == CAN2_ID_AMS_TEMP_SUM) {
+		                        // Format: [u8 max][u8 min][u16 avg*10 BE][u8 valid_count][3 pad]
+		                        uint8_t global_max_t = RxData_Acu[0];
+		                        uint8_t global_min_t = RxData_Acu[1];
+		                        uint16_t global_avg_t10 = be16(&RxData_Acu[2]);
+		                        uint8_t valid_count = RxData_Acu[4];
+		                        (void)global_max_t; (void)global_min_t; (void)global_avg_t10; (void)valid_count;
+		                    }
+
+		                    // Temperature blocks: 8 temps per frame, 5 blocks per module
+		                    else if (id >= CAN2_ID_AMS_TEMP_BLOCK0 && id <= CAN2_ID_AMS_TEMP_BLOCK4) {
+		                        int block_idx = id - CAN2_ID_AMS_TEMP_BLOCK0;
+		                        int module_idx = block_idx / 5;  // Which of 5 modules
+		                        int temp_offset = (block_idx % 5) * 8;  // Offset within module's 38 temps
+
+		                        if (module_idx < AMS_NUM_MODULES) {
+		                            uint8_t temp_max = 0, temp_min = 255, valid_cnt = 0;
+
+		                            // Copy 8 temperatures
+		                            for (int i = 0; i < 8 && (temp_offset + i) < AMS_TEMPS_PER_MOD; i++) {
+		                                uint8_t t = RxData_Acu[i];
+		                                ams_modules[module_idx].temps[temp_offset + i] = t;
+
+		                                // Store in global array for telemetry
+		                                int global_idx = module_idx * AMS_TEMPS_PER_MOD + temp_offset + i;
+		                                if (global_idx < AMS_TOTAL_TEMPS) {
+		                                    ams_all_temps[global_idx] = t;
+		                                }
+
+		                                // Calculate module stats (ignore 0xFF padding)
+		                                if (t != 0xFF && t > 0) {
+		                                    if (t > temp_max) temp_max = t;
+		                                    if (t < temp_min) temp_min = t;
+		                                    valid_cnt++;
+		                                }
+		                            }
+
+		                            // Update module stats
+		                            if (valid_cnt > 0) {
+		                                ams_modules[module_idx].temp_max = temp_max;
+		                                ams_modules[module_idx].temp_min = temp_min;
+		                                ams_modules[module_idx].temp_valid_count = valid_cnt;
+		                            }
+		                            ams_modules[module_idx].last_update_ms = now;
 		                        }
 		                    }
-		                }
-		            }
+
+		                    // Current measurement (if AMS sends it)
+		                    else if (id == CAN2_ID_AMS_CURRENT) {
+		                        // Format: int16_t in deci-amps (BE)
+		                        ams_current_dA = (int16_t)be16(&RxData_Acu[0]);
+		                    }
+
+		                    // Re-activate notification
+		                    if (HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
+		                        Error_Handler();
+		                    }
 		        }
 		    }
 		else if (hfdcan->Instance == FDCAN3) //BUS DRIVER
@@ -2413,75 +2461,65 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 
 // Packs 8 floats (32 bytes). f[0] is the "frame ID".
-static void tel_build_packet(TelFrame *p)
-{
-    static uint16_t seq   = 0;
-    static uint8_t  which = 0;  // 0:0x600, 1:0x610, 2:0x620, 3:0x630
+static void tel_build_packet(TelFrame *p) {
+    static uint16_t seq = 0;
 
-    p->seq = seq++;
+    // Rotate through different telemetry IDs
+    static uint8_t tel_rotation = 0;
+    tel_rotation = (tel_rotation + 1) % 4;  // 4 different packet types
 
-
-#if TEL_USE_DUMMY
-    // (unchanged dummy section if you want it; omitted here for brevity)
-#else
-    switch (which) {
-    default:
-    case 0: // 0x600 Powertrain basic
-        p->id = 0x600;
-        p->v1 = (float)inv_dc_bus_voltage;
-        p->v2 = (float)e_machine_rpm;
-        p->v3 = (float)torque_total;
-        p->v4 = (float)v_celda_min;      // synced to AMS min mV
-        p->v5 = (float)state;
-        p->v6 = 0.0f;
-        p->v7 = 0.0f;
+    switch (tel_rotation) {
+    case 0:  // TEL_ACCUM - Battery data
+        p->id = TEL_ACCUM;
+        p->seq = seq++;
+        p->v1 = (float)inv_dc_bus_voltage;          // DC bus voltage
+        p->v2 = (float)ams_global_min_mv;           // Min cell voltage (mV)
+        p->v3 = (float)ams_global_max_mv;           // Max cell voltage (mV)
+        p->v4 = (float)ams_stack_total_mv / 1000.0f; // Stack voltage (V)
+        p->v5 = (float)ams_current_dA / 10.0f;      // Current (A)
+        p->v6 = v_celda_min;                        // Min cell for torque limit
+        p->v7 = (float)precarga_inv;                // Precharge status
         break;
 
-    case 1: // 0x610 Inverter temps & currents
-        p->id = 0x610;
-        p->v1 = (float)inv_t_motor;
-        p->v2 = (float)inv_t_igbt;
-        p->v3 = (float)inv_t_air;
-        p->v4 = (float)inv_n_actual;
-        p->v5 = (float)inv_i_actual;
-        p->v6 = 0.0f;
-        p->v7 = 0.0f;
+    case 1:  // TEL_INVERTER - Motor data
+        p->id = TEL_INVERTER;
+        p->seq = seq++;
+        p->v1 = (float)e_machine_rpm;
+        p->v2 = (float)state;
+        p->v3 = (float)inv_dc_bus_voltage;
+        p->v4 = (float)inv_i_actual;
+        p->v5 = (float)real_torque;
+        p->v6 = (float)torque_total;
+        p->v7 = (float)config_inv_lectura_v;
         break;
 
-    case 2: // 0x620 Driver inputs
-        p->id = 0x620;
+    case 2:  // TEL_DRIVER - Pedals/sensors
+        p->id = TEL_DRIVER;
+        p->seq = seq++;
         p->v1 = (float)s1_aceleracion;
         p->v2 = (float)s2_aceleracion;
         p->v3 = (float)s_freno;
-        p->v4 = (float)precharge_button;
-        p->v5 = (float)start_button_act;
-        #ifdef DINPUT1_GPIO_Port
-            p->v6 = (float)HAL_GPIO_ReadPin(DINPUT1_GPIO_Port, DINPUT1_Pin);
-        #else
-            p->v6 = 0.0f;
-        #endif
-        #ifdef DINPUT2_GPIO_Port
-            p->v7 = (float)HAL_GPIO_ReadPin(DINPUT2_GPIO_Port, DINPUT2_Pin);
-        #else
-            p->v7 = 0.0f;
-        #endif
+        p->v4 = (float)porcentaje_pedal_acel;
+        p->v5 = (float)media_s_acel;
+        p->v6 = (float)boton_arranque;
+        p->v7 = (float)flag_r2d;
         break;
 
-    case 3: // 0x630 Accumulator / AMS summary
-        p->id = 0x630;
-        p->v1 = (ams_stack_mv > 0) ? (ams_stack_mv / 1000.0f) : 0.0f;   // Pack voltage in V
-        p->v2 = (float)ams_cell_min_mv;                                  // mV
-        p->v3 = (float)ams_cell_max_mv;                                  // mV
-        p->v4 = (ams_t_min  != 0xFF) ? (float)ams_t_min  : -1.0f;       // °C (or -1 if n/a)
-        p->v5 = (ams_t_max  != 0xFF) ? (float)ams_t_max  : -1.0f;       // °C
-        p->v6 = (ams_t_avg10> 0)     ? (ams_t_avg10 / 10.0f) : -1.0f;   // °C
-        p->v7 = (float)ams_t_valid;                                      // valid temperature count
+    case 3:  // TEL_INV_TEMPS - Temperatures
+        p->id = TEL_INV_TEMPS;
+        p->seq = seq++;
+        p->v1 = (float)inv_t_motor;
+        p->v2 = (float)inv_t_igbt;
+        p->v3 = (float)inv_t_air;
+        // Add module temps (example: module 0, 1, 2)
+        p->v4 = (float)ams_modules[0].temp_max;
+        p->v5 = (float)ams_modules[1].temp_max;
+        p->v6 = (float)ams_modules[2].temp_max;
+        p->v7 = (float)ams_modules[0].min_cell_mv;
         break;
     }
-#endif
-
-    if (++which > 3) which = 0;
 }
+
 
 
 
@@ -2656,47 +2694,26 @@ static uint8_t nrf24_tx32(const void *buf32)
 }
 
 /* --- One-shot AMS dump over UART (call whenever you want a full snapshot) --- */
-static void ams_dump_once_uart(void)
-{
-    char line[128];
-    int n;
+static void ams_dump_status(void) {
+    char buf[200];
 
-    // Summary
-    float pack_V = (ams_stack_mv > 0) ? (ams_stack_mv / 1000.0f) : 0.0f;
-    int   tmin   = (ams_t_min  != 0xFF) ? (int)ams_t_min  : -1;
-    int   tmax   = (ams_t_max  != 0xFF) ? (int)ams_t_max  : -1;
-    float tavg   = (ams_t_avg10> 0)     ? (ams_t_avg10 / 10.0f) : -1.0f;
+    // Global summary
+    snprintf(buf, sizeof(buf),
+             "[AMS] Global: MinCell=%u mV, MaxCell=%u mV, Stack=%.1fV, I=%.1fA\r\n",
+             ams_global_min_mv, ams_global_max_mv,
+             ams_stack_total_mv / 1000.0f, ams_current_dA / 10.0f);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
 
-    n = snprintf(line, sizeof(line),
-                 "\r\n[AMS] PACK=%.1fV cell[min,max]=%umV,%umV  T[min,max,avg]=%d,%d,%.1f  nT=%u\r\n",
-                 pack_V, ams_cell_min_mv, ams_cell_max_mv, tmin, tmax, tavg, ams_t_valid);
-    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
-
-    // Cells
-    n = snprintf(line, sizeof(line), "[AMS] Cells mV:");
-    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
-    for (uint8_t i = 0; i < ams_cell_count && i < AMS_NUM_CELLS; ++i) {
-        if (ams_cell_mv[i] != 0 && ams_cell_mv[i] != 0xFFFF) {
-            n = snprintf(line, sizeof(line), " %u", ams_cell_mv[i]);
-        } else {
-            n = snprintf(line, sizeof(line), " --");
-        }
-        HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
+    // Per-module summary
+    for (int i = 0; i < AMS_NUM_MODULES; i++) {
+        snprintf(buf, sizeof(buf),
+                 "[AMS] Mod%d: MinV=%u mV, Tmax=%u°C, Tmin=%u°C, ValidTemps=%u, Age=%lums\r\n",
+                 i, ams_modules[i].min_cell_mv,
+                 ams_modules[i].temp_max, ams_modules[i].temp_min,
+                 ams_modules[i].temp_valid_count,
+                 (unsigned long)(HAL_GetTick() - ams_modules[i].last_update_ms));
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, strlen(buf), HAL_MAX_DELAY);
     }
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
-
-    // Temps
-    n = snprintf(line, sizeof(line), "[AMS] Temps C:");
-    HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
-    for (uint8_t i = 0; i < ams_temp_count && i < AMS_NUM_TEMPS; ++i) {
-        if (ams_temp_c[i] != 0xFF) {
-            n = snprintf(line, sizeof(line), " %u", ams_temp_c[i]);
-        } else {
-            n = snprintf(line, sizeof(line), " --");
-        }
-        HAL_UART_Transmit(&huart2, (uint8_t*)line, (uint16_t)n, HAL_MAX_DELAY);
-    }
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
 }
 
 
