@@ -35,13 +35,13 @@ Idx Name          Size      VMA       LMA       File off  Algn
                   CONTENTS, READONLY, DEBUGGING, OCTETS
  15 .debug_line   0002af51  00000000  00000000  000880d9  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 16 .debug_str    0017eff5  00000000  00000000  000b302a  2**0
+ 16 .debug_str    0017eff2  00000000  00000000  000b302a  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 17 .comment      00000043  00000000  00000000  0023201f  2**0
+ 17 .comment      00000043  00000000  00000000  0023201c  2**0
                   CONTENTS, READONLY
- 18 .debug_frame  0000a658  00000000  00000000  00232064  2**2
+ 18 .debug_frame  0000a658  00000000  00000000  00232060  2**2
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 19 .debug_line_str 00000084  00000000  00000000  0023c6bc  2**0
+ 19 .debug_line_str 00000081  00000000  00000000  0023c6b8  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
 
 Disassembly of section .text:
@@ -4409,7 +4409,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 	{
 		/* Retreive Rx messages from RX FIFO0 */
 
-		if (hfdcan->Instance == FDCAN1)
+		if (hfdcan->Instance == FDCAN1)//BUS INV MOTOR
  80021ea:	687b      	ldr	r3, [r7, #4]
  80021ec:	681b      	ldr	r3, [r3, #0]
  80021ee:	4a83      	ldr	r2, [pc, #524]	@ (80023fc <HAL_FDCAN_RxFifo0Callback+0x228>)
@@ -4613,7 +4613,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 				}
 			}
 		}
-		else if (hfdcan->Instance == FDCAN2)
+		else if (hfdcan->Instance == FDCAN2) //BUS DEL ACCU
  8002326:	687b      	ldr	r3, [r7, #4]
  8002328:	681b      	ldr	r3, [r3, #0]
  800232a:	4a43      	ldr	r2, [pc, #268]	@ (8002438 <HAL_FDCAN_RxFifo0Callback+0x264>)
@@ -4669,7 +4669,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
  8002378:	edc3 7a00 	vstr	s15, [r3]
 					break;
  800237c:	e039      	b.n	80023f2 <HAL_FDCAN_RxFifo0Callback+0x21e>
-		else if (hfdcan->Instance == FDCAN3)
+		else if (hfdcan->Instance == FDCAN3) //BUS DRIVER
  800237e:	687b      	ldr	r3, [r7, #4]
  8002380:	681b      	ldr	r3, [r3, #0]
  8002382:	4a32      	ldr	r2, [pc, #200]	@ (800244c <HAL_FDCAN_RxFifo0Callback+0x278>)
@@ -4687,7 +4687,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 				switch (RxHeader_Dash.Identifier)
  800239a:	4b2e      	ldr	r3, [pc, #184]	@ (8002454 <HAL_FDCAN_RxFifo0Callback+0x280>)
  800239c:	681b      	ldr	r3, [r3, #0]
- 800239e:	f240 1233 	movw	r2, #307	@ 0x133
+ 800239e:	f240 1201 	movw	r2, #257	@ 0x101
  80023a2:	4293      	cmp	r3, r2
  80023a4:	d125      	bne.n	80023f2 <HAL_FDCAN_RxFifo0Callback+0x21e>
 					s1_aceleracion = ((uint16_t)RxData_Dash[0] << 8) | RxData_Dash[1];
