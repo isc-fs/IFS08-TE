@@ -1,11 +1,5 @@
 """
-ISC RTT Serial - Enhanced for 5-module AMS with full temperature arrays
-
-NUEVAS CARACTERÍSTICAS:
-- Parse completo de 5 módulos BMS (19 celdas + 38 temps cada uno)
-- Array de 190 temperaturas organizadas por módulo
-- Mapeo extendido para 0x202-0x20D (voltajes y temps del AMS)
-- Soporte para heatmaps (exporta temps por módulo)
+ISC RTT Serial - Enhanced with comprehensive Excel logging
 """
 
 from __future__ import annotations
@@ -15,6 +9,7 @@ import struct
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 
 import serial
 import serial.tools.list_ports
@@ -38,6 +33,10 @@ NUM_MODULES = 5
 CELLS_PER_MODULE = 19
 TEMPS_PER_MODULE = 38
 TOTAL_TEMPS = NUM_MODULES * TEMPS_PER_MODULE  # 190
+
+# ================== EXCEL LOGGING ==================
+EXCEL_SESSIONS_DIR = Path("logs")
+EXCEL_SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ================== CONFIG DERIVADOS ==================
 GEAR_RATIO: Optional[float]     = None
@@ -124,6 +123,180 @@ ams_global_max_mv = 0
 ams_stack_total_mv = 0
 ams_current_dA = 0
 
+# ================== EXCEL SESSION LOGGER ==================
+class ExcelSessionLogger:
+    """Comprehensive Excel logger for telemetry sessions"""
+    def __init__(self, bucket_id: str, piloto: str, circuito: str):
+        self.bucket_id = bucket_id
+        self.piloto = piloto
+        self.circuito = circuito
+        self.session_start = datetime.now()
+        
+        # Create session filename in logs folder
+        self.filename = EXCEL_SESSIONS_DIR / f"{bucket_id}.xlsx"
+        
+        # Data buffers for each sheet
+        self.data_buffers = {
+            'Main': [],
+            'Motor_Inverter': [],
+            'AMS_Summary': [],
+            'AMS_Modules': [],
+            'Driver': [],
+            'Temperatures': []
+        }
+        
+        self.last_write = time.time()
+        self.write_interval = 5.0  # Write to Excel every 5 seconds
+        
+        logger.info(f"Excel logger initialized: {self.filename}")
+    
+    def log_data(self, data_dict: dict):
+        """Log data from latest_data_dict"""
+        timestamp = datetime.now()
+        
+        # Main sheet - Overview data
+        main_row = {
+            'timestamp': timestamp,
+            'piloto': self.piloto,
+            'circuito': self.circuito,
+        }
+        
+        # Extract data from 0x600
+        data_600 = data_dict.get('0x600', {})
+        main_row.update({
+            'dc_bus_voltage': data_600.get('dc_bus_voltage', 0),
+            'rpm': data_600.get('rpm', 0),
+            'torque_total': data_600.get('torque_total', 0),
+            'cell_min_v': data_600.get('cell_min_v', 0),
+            'throttle_raw1': data_600.get('throttle_raw1', 0),
+            'throttle_raw2': data_600.get('throttle_raw2', 0),
+        })
+        self.data_buffers['Main'].append(main_row)
+        
+        # Motor/Inverter sheet - 0x610
+        data_610 = data_dict.get('0x610', {})
+        motor_row = {
+            'timestamp': timestamp,
+            'motor_temp': data_610.get('motor_temp', 0),
+            'pwrstg_temp': data_610.get('pwrstg_temp', 0),
+            'air_temp': data_610.get('air_temp', 0),
+            'n_actual': data_610.get('n_actual', 0),
+            'i_actual': data_610.get('i_actual', 0),
+        }
+        self.data_buffers['Motor_Inverter'].append(motor_row)
+        
+        # Driver sheet - 0x620 and 0x630
+        data_620 = data_dict.get('0x620', {})
+        data_630 = data_dict.get('0x630', {})
+        driver_row = {
+            'timestamp': timestamp,
+            's1_raw': data_620.get('s1_raw', 0),
+            's2_raw': data_620.get('s2_raw', 0),
+            'brake_raw': data_620.get('brake_raw', 0),
+            'throttle_pct': data_630.get('throttle', 0),
+            'brake_pct': data_630.get('brake', 0),
+            'torque_req': data_630.get('torque_req', 0),
+            'torque_est': data_630.get('torque_est', 0),
+            'start_button': data_620.get('start_button', 0),
+            'precharge_button': data_620.get('precharge_button', 0),
+        }
+        self.data_buffers['Driver'].append(driver_row)
+        
+        # AMS Summary sheet
+        ams_summary = data_dict.get('ams_summary', {})
+        ams_temp_summary = data_dict.get('ams_temp_summary', {})
+        ams_row = {
+            'timestamp': timestamp,
+            'global_min_mv': ams_global_min_mv,
+            'global_max_mv': ams_global_max_mv,
+            'stack_mv': ams_stack_total_mv,
+            'current_A': ams_current_dA / 10.0,
+            'max_temp_c': ams_temp_summary.get('max_temp_c', 0),
+            'min_temp_c': ams_temp_summary.get('min_temp_c', 0),
+            'avg_temp_c': ams_temp_summary.get('avg_temp_c', 0),
+        }
+        self.data_buffers['AMS_Summary'].append(ams_row)
+        
+        # AMS Modules sheet - detailed per-module data
+        for i in range(NUM_MODULES):
+            mod = ams_modules[i]
+            module_row = {
+                'timestamp': timestamp,
+                'module_id': i,
+                'min_cell_mv': mod.min_cell_mv,
+                'max_cell_mv': mod.max_cell_mv,
+                'min_temp_c': mod.min_temp_c,
+                'max_temp_c': mod.max_temp_c,
+            }
+            self.data_buffers['AMS_Modules'].append(module_row)
+        
+        # Temperatures sheet - all 190 temperatures
+        temp_row = {'timestamp': timestamp}
+        all_temps = get_all_temps_array()
+        for i in range(min(len(all_temps), TOTAL_TEMPS)):
+            module_id = i // TEMPS_PER_MODULE
+            sensor_id = i % TEMPS_PER_MODULE
+            temp_row[f'M{module_id}_T{sensor_id}'] = all_temps[i]
+        self.data_buffers['Temperatures'].append(temp_row)
+        
+        # Write to Excel periodically
+        if time.time() - self.last_write > self.write_interval:
+            self.write_to_excel()
+            self.last_write = time.time()
+    
+    def write_to_excel(self):
+        """Write all buffered data to Excel file"""
+        if not any(len(buf) > 0 for buf in self.data_buffers.values()):
+            return
+        
+        try:
+            with pd.ExcelWriter(self.filename, engine='openpyxl', mode='a' if self.filename.exists() else 'w') as writer:
+                for sheet_name, data_list in self.data_buffers.items():
+                    if len(data_list) > 0:
+                        df = pd.DataFrame(data_list)
+                        
+                        # If file exists, append to existing sheet
+                        if self.filename.exists() and sheet_name in pd.ExcelFile(self.filename).sheet_names:
+                            existing_df = pd.read_excel(self.filename, sheet_name=sheet_name)
+                            df = pd.concat([existing_df, df], ignore_index=True)
+                        
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            # Clear buffers after successful write
+            for key in self.data_buffers:
+                self.data_buffers[key] = []
+            
+            logger.info(f"Data written to Excel: {self.filename}")
+        
+        except Exception as e:
+            logger.error(f"Error writing to Excel: {e}")
+    
+    def finalize(self):
+        """Final write and close"""
+        self.write_to_excel()
+        
+        # Write session metadata sheet
+        try:
+            metadata = {
+                'Session ID': [self.bucket_id],
+                'Piloto': [self.piloto],
+                'Circuito': [self.circuito],
+                'Start Time': [self.session_start],
+                'End Time': [datetime.now()],
+                'Duration (min)': [(datetime.now() - self.session_start).total_seconds() / 60],
+            }
+            df_meta = pd.DataFrame(metadata)
+            
+            with pd.ExcelWriter(self.filename, engine='openpyxl', mode='a') as writer:
+                df_meta.to_excel(writer, sheet_name='Metadata', index=False)
+            
+            logger.info(f"Session finalized: {self.filename}")
+        except Exception as e:
+            logger.error(f"Error writing metadata: {e}")
+
+# Global logger instance
+_excel_logger: Optional[ExcelSessionLogger] = None
+
 # ================== UTILIDADES ==================
 def _dump_hex(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
@@ -133,6 +306,27 @@ def list_serial_ports():
     for p in serial.tools.list_ports.comports():
         out.append((p.device, p.description))
     return out
+
+def list_excel_sessions():
+    """List all available Excel session files"""
+    sessions = []
+    if EXCEL_SESSIONS_DIR.exists():
+        for file in EXCEL_SESSIONS_DIR.glob("*.xlsx"):
+            if not file.name.startswith('~'):  # Skip temp files
+                sessions.append(file)
+    return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
+
+def load_excel_session(filepath: Path) -> Dict[str, pd.DataFrame]:
+    """Load all sheets from an Excel session file"""
+    try:
+        excel_file = pd.ExcelFile(filepath)
+        sheets = {}
+        for sheet_name in excel_file.sheet_names:
+            sheets[sheet_name] = pd.read_excel(filepath, sheet_name=sheet_name)
+        return sheets
+    except Exception as e:
+        logger.error(f"Error loading Excel session: {e}")
+        return {}
 
 def _auto_detect_port():
     ports = list(serial.tools.list_ports.comports())
@@ -250,20 +444,13 @@ def _decode_payload(payload: bytes):
 def _id_hex(id_int: int) -> str:
     return f"0x{id_int:X}"
 
-def _be16(p: bytes, offset: int) -> int:
-    return (p[offset] << 8) | p[offset+1]
-
 def parse_ams_extended(id_int: int, frame_dict: dict):
-    """
-    Parse específico para IDs del AMS (0x202-0x20D)
-    Organiza datos por módulo
-    """
+    """Parse específico para IDs del AMS (0x202-0x20D)"""
     global ams_global_min_mv, ams_global_max_mv, ams_stack_total_mv, ams_current_dA
     
     v1, v2, v3, v4, v5, v6, v7 = (frame_dict["v1"], frame_dict["v2"], frame_dict["v3"],
                                    frame_dict["v4"], frame_dict["v5"], frame_dict["v6"], frame_dict["v7"])
     
-    # 0x202: Voltage summary (all modules)
     if id_int == 0x202:
         ams_global_max_mv = int(v1)
         ams_global_min_mv = int(v2)
@@ -274,7 +461,6 @@ def parse_ams_extended(id_int: int, frame_dict: dict):
             "stack_mv": ams_stack_total_mv,
         }
     
-    # 0x203-0x207: Voltage blocks (per module, 4 cells per frame)
     elif 0x203 <= id_int <= 0x207:
         block_idx = id_int - 0x203
         module_idx = block_idx // 5
@@ -286,16 +472,13 @@ def parse_ams_extended(id_int: int, frame_dict: dict):
                 if cell_offset + i < CELLS_PER_MODULE and cell_mv > 0:
                     ams_modules[module_idx].cell_voltages_mv[cell_offset + i] = cell_mv
             
-            # Update module stats
             valid_cells = [c for c in ams_modules[module_idx].cell_voltages_mv if c > 0]
             if valid_cells:
                 ams_modules[module_idx].min_cell_mv = min(valid_cells)
                 ams_modules[module_idx].max_cell_mv = max(valid_cells)
             ams_modules[module_idx].last_update_ts = time.time()
     
-    # 0x208: Temperature summary
     elif id_int == 0x208:
-        # Format: max_t, min_t, avg_t*10, valid_count
         latest_data_dict["ams_temp_summary"] = {
             "max_temp_c": int(v1),
             "min_temp_c": int(v2),
@@ -303,28 +486,24 @@ def parse_ams_extended(id_int: int, frame_dict: dict):
             "valid_count": int(v4),
         }
     
-    # 0x209-0x20D: Temperature blocks (8 temps per frame, per module)
     elif 0x209 <= id_int <= 0x20D:
         block_idx = id_int - 0x209
         module_idx = block_idx // 5
         temp_offset = (block_idx % 5) * 8
         
         if module_idx < NUM_MODULES:
-            temps = [v1, v2, v3, v4, v5, v6, v7, 0]  # v8 not used in 7-float frame
+            temps = [v1, v2, v3, v4, v5, v6, v7, 0]
             for i, temp_c in enumerate(temps[:8]):
                 if temp_offset + i < TEMPS_PER_MODULE:
-                    # Filter invalid readings
                     if 0 < temp_c < 150:
                         ams_modules[module_idx].temps_c[temp_offset + i] = float(temp_c)
             
-            # Update module temp stats
             valid_temps = [t for t in ams_modules[module_idx].temps_c if not np.isnan(t) and t > 0]
             if valid_temps:
                 ams_modules[module_idx].min_temp_c = min(valid_temps)
                 ams_modules[module_idx].max_temp_c = max(valid_temps)
             ams_modules[module_idx].last_update_ts = time.time()
     
-    # 0x201: Current (if sent)
     elif id_int == 0x201:
         ams_current_dA = int(v1)
         latest_data_dict["ams_current"] = {"current_A": float(ams_current_dA) / 10.0}
@@ -399,18 +578,6 @@ def parse_telemetry_data_frame(frame_dict: dict):
             "cell_max_temp":  v3,
         })
 
-    elif id_int == 0x645:
-        latest_data_dict[id_hex].update({
-            "ds_t1": v1, "ds_t2": v2, "ds_t3": v3, "ds_t4": v4,
-            "ds_avg": v5, "ds_max": v6, "ds_count": v7,
-        })
-
-    elif id_int == 0x680:
-        latest_data_dict[id_hex].update({
-            "status": v1,
-            "errors": v2,
-        })
-
     try:
         from influxdb_client import Point
         pt = (
@@ -455,7 +622,6 @@ def create_bucket(piloto: str, circuito: str, use_influx: bool = INFLUX_ENABLE_D
 
     if use_influx:
         _init_influx()
-        # bucket creation logic if needed
 
     return bucket_name
 
@@ -463,9 +629,6 @@ def get_latest_data(data_id: str = None):
     if data_id:
         return latest_data_dict.get(data_id, {})
     return latest_data_dict.copy()
-
-# ================== EXCEL LOGGING ==================
-# (Keep your existing ExcelSessionLogger class but add module columns)
 
 # ================== RECEPCIÓN PRINCIPAL ==================
 def receive_data(bucket_id: str,
@@ -475,7 +638,7 @@ def receive_data(bucket_id: str,
                  baud: int = DEFAULT_BAUD,
                  use_influx: bool = INFLUX_ENABLE_DEFAULT,
                  debug: bool = False):
-    global new_data_flag, _last_seq, _last_seq_advance_ts
+    global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger
 
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.info("Recepción USB-Serial iniciada con soporte para 5 módulos AMS")
@@ -484,6 +647,9 @@ def receive_data(bucket_id: str,
     if use_influx:
         _init_influx()
         write_api = _get_write_api()
+
+    # Initialize Excel logger
+    _excel_logger = ExcelSessionLogger(bucket_id, piloto, circuito)
 
     if port is None:
         port = _auto_detect_port()
@@ -495,10 +661,12 @@ def receive_data(bucket_id: str,
     logger.info("[CONFIG] Serial: port=%s, baud=%d", port, baud)
     logger.info("[CONFIG] AMS: %d módulos, %d celdas/mod, %d temps/mod", 
                 NUM_MODULES, CELLS_PER_MODULE, TEMPS_PER_MODULE)
+    logger.info("[CONFIG] Excel: %s", _excel_logger.filename)
 
     counters = {"rx": 0, "decode": 0, "timeout": 0, "len": 0, "short": 0, "chk": 0, "decode_fail": 0, "test": 0}
     last_check_t = time.time()
     last_stats_t = last_check_t
+    last_excel_log = last_check_t
 
     _set_badge("STALE", "esperando primer frame")
 
@@ -507,9 +675,6 @@ def receive_data(bucket_id: str,
     try:
         while new_data_flag != -1:
             now = time.time()
-            if now - last_check_t >= 0.5:
-                logger.info("Radio Checking")
-                last_check_t = now
 
             payload, err = _read_frame(ser, counters=counters)
 
@@ -569,6 +734,12 @@ def receive_data(bucket_id: str,
                 except Exception as e:
                     logger.warning("Error escribiendo en Influx: %s", e)
 
+            # Log to Excel every second
+            if now - last_excel_log >= 1.0:
+                if _excel_logger:
+                    _excel_logger.log_data(latest_data_dict)
+                last_excel_log = now
+
             new_data_flag = 1
 
             if now - last_stats_t >= 2.0:
@@ -581,4 +752,9 @@ def receive_data(bucket_id: str,
             ser.close()
         except Exception:
             pass
+        
+        # Finalize Excel logger
+        if _excel_logger:
+            _excel_logger.finalize()
+        
         logger.info("Recepción USB-Serial finalizada.")
