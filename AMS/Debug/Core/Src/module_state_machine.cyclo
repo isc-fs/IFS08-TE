@@ -1,4 +1,4 @@
-C:\ST\STM32CubeIDE_1.17.0\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\tools\bin/../lib/gcc/arm-none-eabi/13.3.1/../../../../arm-none-eabi/include/c++/13.3.1/bits/std_abs.h:56:3:long int std::abs(long int)	1
+C:\ST\STM32CubeIDE_1.14.0\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\tools\bin/../lib/gcc/arm-none-eabi/13.3.1/../../../../arm-none-eabi/include/c++/13.3.1/bits/std_abs.h:56:3:long int std::abs(long int)	1
 ../Core/Src/module_state_machine.cpp:61:6:void setup_state_machine()	1
 ../Core/Src/module_state_machine.cpp:72:7:STATE get_state()	1
 ../Core/Src/module_state_machine.cpp:80:6:void select_state()	44
