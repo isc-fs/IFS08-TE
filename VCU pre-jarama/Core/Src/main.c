@@ -98,6 +98,8 @@ static void MX_SPI1_Init(void);
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
+
+static uint8_t tel_send_falg = 0; //flags para interrupciones
 static uint32_t tel_tick = 0;  // ms accumulator to 500
 
 /* ---- Telemetry debug counters ---- */
@@ -192,6 +194,7 @@ static void ams_dump_status(void);
 #endif
 #ifndef FLUSH_TX
 #define FLUSH_TX      0xE1
+#define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
 #endif
 
 
@@ -614,7 +617,7 @@ for (int i = 0; i < 10; ++i) {
 			if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu) == HAL_OK)
 			{
 	#if DEBUG
-				//print("CAN_ACU: DC_BUS_VOLTAGE enviado a AMS");
+				print("CAN_ACU: DC_BUS_VOLTAGE enviado a AMS");
 	#endif
 			}
 		}
@@ -2196,6 +2199,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		/* --- Telemetry tick: 10ms base --- */
 		    tel_irq_cnt++;                // <--- ADD
 		    tel_tick += 10;
+
+	        if (teltick >= TEL_PERIOD_MS) {
+	            teltick = 0;
+	            tel_send_flag = 1;  // ← Setea flag (1µs)
 
 		    (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu);
 

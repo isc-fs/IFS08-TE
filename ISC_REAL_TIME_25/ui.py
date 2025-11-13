@@ -81,20 +81,17 @@ class MainWindow(QMainWindow):
         self.rx_thread: Optional[threading.Thread] = None
         self.is_receiving = False
         
-        # Sub-windows
-        self.motor_window: Optional[MotorInverterWindow] = None
-        self.accu_window: Optional[AccumulatorWindow] = None
-        self.driver_window: Optional[DriverWindow] = None
+        # Sub-windows (only for logs and sessions)
         self.log_viewer: Optional[LogViewerWindow] = None
         self.session_viewer: Optional[SessionViewerWindow] = None
         
         # Build UI
         self.init_ui()
         
-        # Update timer
+        # Update timer - 0.5 seconds as requested
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_displays)
-        self.timer.start(100)  # 10 Hz refresh
+        self.timer.start(500)  # 0.5s = 2 Hz refresh
         
         # Connect signals
         signaler.log_message.connect(self.append_log)
@@ -124,11 +121,11 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(3)
         main_layout.setContentsMargins(5, 5, 5, 5)
         
-        # === COMPACT TOP SECTION: Logo, ISCmetrics, Status, and Controls in ONE ROW ===
+        # === COMPACT TOP SECTION ===
         top_section = self.create_compact_top_section()
         main_layout.addWidget(top_section)
         
-        # === MIDDLE: Tab widget (MORE SPACE) ===
+        # === MIDDLE: Tab widget with ALL panels (MORE SPACE) ===
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(f"""
             QTabWidget::pane {{
@@ -151,11 +148,23 @@ class MainWindow(QMainWindow):
         
         # Tab 1: Overview Dashboard
         self.overview_tab = self.create_overview_tab()
-        self.tabs.addTab(self.overview_tab, "📊 Overview")
+        self.tabs.addTab(self.overview_tab, "Overview")
         
         # Tab 2: AMS Module Details
         self.ams_tab = self.create_ams_tab()
-        self.tabs.addTab(self.ams_tab, "🔋 AMS Modules")
+        self.tabs.addTab(self.ams_tab, "AMS Modules")
+        
+        # Tab 3: Motor & Inverter (INTEGRATED)
+        self.motor_tab = self.create_motor_tab()
+        self.tabs.addTab(self.motor_tab, "Motor")
+        
+        # Tab 4: Driver Data (INTEGRATED)
+        self.driver_tab = self.create_driver_tab()
+        self.tabs.addTab(self.driver_tab, "Driver")
+        
+        # Tab 5: Accumulator (INTEGRATED)
+        self.accu_tab = self.create_accu_tab()
+        self.tabs.addTab(self.accu_tab, "Accumulator")
         
         main_layout.addWidget(self.tabs, stretch=8)
         
@@ -170,7 +179,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(attribution)
     
     def create_compact_top_section(self):
-        """Create super compact top section with everything in one row"""
+        """Create super compact top section"""
         container = QFrame()
         container.setStyleSheet(f"""
             QFrame {{
@@ -185,12 +194,12 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 1. Logo + ISCmetrics (very compact)
+        # 1. Logo + ISCmetrics
         logo_section = self.create_logo_section_compact()
         main_layout.addWidget(logo_section)
         
-        # 2. Status indicator (minimal)
-        self.status_label = QLabel("⚪ IDLE")
+        # 2. Status indicator
+        self.status_label = QLabel("IDLE")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet(f"""
             background: {BLACK_BG};
@@ -204,11 +213,11 @@ class MainWindow(QMainWindow):
         self.status_label.setMaximumWidth(80)
         main_layout.addWidget(self.status_label)
         
-        # 3. Config controls (super compact grid)
+        # 3. Config controls
         config_section = self.create_config_section_compact()
         main_layout.addWidget(config_section, stretch=2)
         
-        # 4. Action buttons (vertical compact)
+        # 4. Action buttons
         buttons_section = self.create_buttons_section_compact()
         main_layout.addWidget(buttons_section)
         
@@ -332,7 +341,7 @@ class MainWindow(QMainWindow):
         return frame
     
     def create_buttons_section_compact(self):
-        """Compact buttons section"""
+        """Compact buttons section - ONLY essential buttons"""
         frame = QFrame()
         layout = QGridLayout()
         layout.setSpacing(2)
@@ -370,60 +379,44 @@ class MainWindow(QMainWindow):
             }}
         """
         
-        self.btn_refresh = QPushButton("🔄")
+        # Row 1: Control buttons
+        self.btn_refresh = QPushButton("Refresh")
         self.btn_refresh.setMaximumHeight(22)
         self.btn_refresh.setStyleSheet(btn_style)
         self.btn_refresh.clicked.connect(self.refresh_ports)
         layout.addWidget(self.btn_refresh, 0, 0)
         
-        self.btn_start = QPushButton("▶ Start")
+        self.btn_start = QPushButton("Start")
         self.btn_start.setMaximumHeight(22)
         self.btn_start.setStyleSheet(btn_accent_style)
         self.btn_start.clicked.connect(self.start_reception)
         layout.addWidget(self.btn_start, 0, 1)
         
-        self.btn_stop = QPushButton("⏹ Stop")
+        self.btn_stop = QPushButton("Stop")
         self.btn_stop.setMaximumHeight(22)
         self.btn_stop.setStyleSheet(btn_style)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_reception)
         layout.addWidget(self.btn_stop, 0, 2)
         
-        btn_motor = QPushButton("🔧 Motor")
-        btn_motor.setMaximumHeight(22)
-        btn_motor.setStyleSheet(btn_style)
-        btn_motor.clicked.connect(self.open_motor_window)
-        layout.addWidget(btn_motor, 1, 0)
-        
-        btn_accu = QPushButton("🔋 Accu")
-        btn_accu.setMaximumHeight(22)
-        btn_accu.setStyleSheet(btn_style)
-        btn_accu.clicked.connect(self.open_accu_window)
-        layout.addWidget(btn_accu, 1, 1)
-        
-        btn_driver = QPushButton("🏎️ Driver")
-        btn_driver.setMaximumHeight(22)
-        btn_driver.setStyleSheet(btn_style)
-        btn_driver.clicked.connect(self.open_driver_window)
-        layout.addWidget(btn_driver, 1, 2)
-        
-        btn_logs = QPushButton("📄 Logs")
+        # Row 2: Utility buttons
+        btn_logs = QPushButton("Logs")
         btn_logs.setMaximumHeight(22)
         btn_logs.setStyleSheet(btn_style)
         btn_logs.clicked.connect(self.open_log_viewer)
-        layout.addWidget(btn_logs, 2, 0)
+        layout.addWidget(btn_logs, 1, 0)
         
-        btn_sessions = QPushButton("📊 Sessions")
+        btn_sessions = QPushButton("Sessions")
         btn_sessions.setMaximumHeight(22)
         btn_sessions.setStyleSheet(btn_accent_style)
         btn_sessions.clicked.connect(self.open_session_viewer)
-        layout.addWidget(btn_sessions, 2, 1)
+        layout.addWidget(btn_sessions, 1, 1)
         
-        btn_export = QPushButton("💾 Export")
+        btn_export = QPushButton("Export")
         btn_export.setMaximumHeight(22)
         btn_export.setStyleSheet(btn_style)
         btn_export.clicked.connect(self.export_current_session)
-        layout.addWidget(btn_export, 2, 2)
+        layout.addWidget(btn_export, 1, 2)
         
         frame.setLayout(layout)
         return frame
@@ -535,6 +528,122 @@ class MainWindow(QMainWindow):
         
         global_stats.setLayout(global_layout)
         layout.addWidget(global_stats)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def create_motor_tab(self):
+        """Create motor & inverter panel (INTEGRATED)"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("Motor & Inverter")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {MATRIX_GREEN}; padding: 5px;")
+        layout.addWidget(title)
+        
+        # Metrics grid
+        metrics_grid = QGridLayout()
+        metrics_grid.setSpacing(4)
+        
+        self.motor_lbl_rpm = self.create_metric_label("RPM", "---", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.motor_lbl_rpm, 0, 0)
+        
+        self.motor_lbl_torque = self.create_metric_label("Torque Req", "--- Nm", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.motor_lbl_torque, 0, 1)
+        
+        self.motor_lbl_current = self.create_metric_label("Current", "--- A", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.motor_lbl_current, 1, 0)
+        
+        self.motor_lbl_temp = self.create_metric_label("Motor Temp", "--- °C", WARNING_COLOR, compact=True)
+        metrics_grid.addWidget(self.motor_lbl_temp, 1, 1)
+        
+        layout.addLayout(metrics_grid)
+        
+        # Plots
+        plot_layout = QHBoxLayout()
+        self.motor_plot_torque = MplCanvas(title="Torque", compact=True)
+        self.motor_plot_current = MplCanvas(title="Current", compact=True)
+        plot_layout.addWidget(self.motor_plot_torque)
+        plot_layout.addWidget(self.motor_plot_current)
+        layout.addLayout(plot_layout)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def create_driver_tab(self):
+        """Create driver data panel (INTEGRATED)"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("Driver Data")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {MATRIX_GREEN}; padding: 5px;")
+        layout.addWidget(title)
+        
+        # Metrics grid
+        metrics_grid = QGridLayout()
+        metrics_grid.setSpacing(4)
+        
+        self.driver_lbl_throttle = self.create_metric_label("Throttle", "--- %", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.driver_lbl_throttle, 0, 0)
+        
+        self.driver_lbl_brake = self.create_metric_label("Brake", "--- %", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.driver_lbl_brake, 0, 1)
+        
+        self.driver_lbl_s1 = self.create_metric_label("Sensor 1", "---", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.driver_lbl_s1, 1, 0)
+        
+        self.driver_lbl_s2 = self.create_metric_label("Sensor 2", "---", MATRIX_GREEN, compact=True)
+        metrics_grid.addWidget(self.driver_lbl_s2, 1, 1)
+        
+        layout.addLayout(metrics_grid)
+        
+        # Plots
+        plot_layout = QHBoxLayout()
+        self.driver_plot_throttle = MplCanvas(title="Throttle %", compact=True)
+        self.driver_plot_brake = MplCanvas(title="Brake %", compact=True)
+        plot_layout.addWidget(self.driver_plot_throttle)
+        plot_layout.addWidget(self.driver_plot_brake)
+        layout.addLayout(plot_layout)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def create_accu_tab(self):
+        """Create accumulator panel with heatmaps (INTEGRATED)"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("Accumulator - Temperature Heatmaps")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {MATRIX_GREEN}; padding: 5px;")
+        layout.addWidget(title)
+        
+        # Stats
+        stats_layout = QHBoxLayout()
+        self.accu_lbl_stack = self.create_metric_label("Stack", "--- V", MATRIX_GREEN, compact=True)
+        self.accu_lbl_current = self.create_metric_label("Current", "--- A", MATRIX_GREEN, compact=True)
+        self.accu_lbl_min_cell = self.create_metric_label("Min Cell", "--- mV", WARNING_COLOR, compact=True)
+        self.accu_lbl_max_temp = self.create_metric_label("Max Temp", "--- °C", WARNING_COLOR, compact=True)
+        
+        stats_layout.addWidget(self.accu_lbl_stack)
+        stats_layout.addWidget(self.accu_lbl_current)
+        stats_layout.addWidget(self.accu_lbl_min_cell)
+        stats_layout.addWidget(self.accu_lbl_max_temp)
+        layout.addLayout(stats_layout)
+        
+        # Heatmaps
+        heatmap_layout = QGridLayout()
+        self.accu_heatmaps = []
+        for i in range(NUM_MODULES):
+            heatmap = HeatmapCanvas(title=f"Module {i}")
+            heatmap_layout.addWidget(heatmap, i // 3, i % 3)
+            self.accu_heatmaps.append(heatmap)
+        layout.addLayout(heatmap_layout)
         
         widget.setLayout(layout)
         return widget
@@ -723,7 +832,7 @@ class MainWindow(QMainWindow):
         badge = status_info.get("badge", "STALE")
         
         if badge == "LIVE":
-            self.status_label.setText(f"🟢 LIVE")
+            self.status_label.setText("LIVE")
             self.status_label.setStyleSheet(f"""
                 background: {BLACK_BG};
                 color: {MATRIX_GREEN};
@@ -734,7 +843,7 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             """)
         elif badge == "STALE":
-            self.status_label.setText(f"🟡 STALE")
+            self.status_label.setText("STALE")
             self.status_label.setStyleSheet(f"""
                 background: {BLACK_BG};
                 color: {WARNING_COLOR};
@@ -745,7 +854,7 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             """)
         else:
-            self.status_label.setText(f"🔴 BAD")
+            self.status_label.setText("BAD")
             self.status_label.setStyleSheet(f"""
                 background: {BLACK_BG};
                 color: {ERROR_COLOR};
@@ -756,7 +865,7 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             """)
         
-        # Update metrics
+        # Update Overview tab metrics
         data_600 = data.get("0x600", {})
         rpm = data_600.get('rpm', 0)
         dc_bus = data_600.get('dc_bus_voltage', 0)
@@ -767,10 +876,13 @@ class MainWindow(QMainWindow):
         self.lbl_min_cell.value_label.setText(f"{data_600.get('cell_min_v', 0):.0f} mV")
         
         data_630 = data.get("0x630", {})
-        self.lbl_throttle.value_label.setText(f"{data_630.get('throttle', 0):.1f} %")
+        throttle = data_630.get('throttle', 0)
+        
+        self.lbl_throttle.value_label.setText(f"{throttle:.1f} %")
         
         data_610 = data.get("0x610", {})
-        self.lbl_current.value_label.setText(f"{data_610.get('i_actual', 0):.1f} A")
+        current = data_610.get('i_actual', 0)
+        self.lbl_current.value_label.setText(f"{current:.1f} A")
         
         # Update AMS data
         ams_summary = data.get("ams_summary", {})
@@ -805,10 +917,45 @@ class MainWindow(QMainWindow):
                 age = now - mod.last_update_ts
                 card.lbl_age.setText(f"Age: {age:.1f}s")
         
-        # Update plots
+        # Update overview plots
         self.plot_rpm.update_plot(rpm)
         self.plot_voltage.update_plot(data_600.get('cell_min_v', 0))
         self.plot_temp.update_plot(max_temp)
+        
+        # Update Motor tab
+        data_620 = data.get("0x620", {})
+        
+        self.motor_lbl_rpm.value_label.setText(f"{rpm:.0f}")
+        self.motor_lbl_torque.value_label.setText(f"{data_630.get('torque_req', 0):.1f} Nm")
+        self.motor_lbl_current.value_label.setText(f"{current:.1f} A")
+        self.motor_lbl_temp.value_label.setText(f"{data_610.get('motor_temp', 0):.0f} °C")
+        
+        self.motor_plot_torque.update_plot(data_600.get('torque_total', 0))
+        self.motor_plot_current.update_plot(current)
+        
+        # Update Driver tab
+        brake = data_630.get('brake', 0)
+        s1 = data_620.get('s1_raw', 0)
+        s2 = data_620.get('s2_raw', 0)
+        
+        self.driver_lbl_throttle.value_label.setText(f"{throttle:.1f} %")
+        self.driver_lbl_brake.value_label.setText(f"{brake:.1f} %")
+        self.driver_lbl_s1.value_label.setText(f"{s1:.0f}")
+        self.driver_lbl_s2.value_label.setText(f"{s2:.0f}")
+        
+        self.driver_plot_throttle.update_plot(throttle)
+        self.driver_plot_brake.update_plot(brake)
+        
+        # Update Accumulator tab
+        self.accu_lbl_stack.value_label.setText(f"{stack_mv / 1000:.1f} V")
+        self.accu_lbl_current.value_label.setText(f"{rtt.ams_current_dA / 10:.1f} A")
+        self.accu_lbl_min_cell.value_label.setText(f"{rtt.ams_global_min_mv} mV")
+        self.accu_lbl_max_temp.value_label.setText(f"{max_temp:.0f} °C")
+        
+        for i, heatmap in enumerate(self.accu_heatmaps):
+            mod = rtt.get_ams_module_data(i)
+            if mod:
+                heatmap.update_heatmap(mod.temps_c)
     
     def append_log(self, msg: str):
         """Append message to log window"""
@@ -824,21 +971,6 @@ class MainWindow(QMainWindow):
             cursor.removeSelectedText()
             cursor.deleteChar()
     
-    def open_motor_window(self):
-        if self.motor_window is None or not self.motor_window.isVisible():
-            self.motor_window = MotorInverterWindow()
-            self.motor_window.show()
-    
-    def open_accu_window(self):
-        if self.accu_window is None or not self.accu_window.isVisible():
-            self.accu_window = AccumulatorWindow()
-            self.accu_window.show()
-    
-    def open_driver_window(self):
-        if self.driver_window is None or not self.driver_window.isVisible():
-            self.driver_window = DriverWindow()
-            self.driver_window.show()
-    
     def open_log_viewer(self):
         if self.log_viewer is None or not self.log_viewer.isVisible():
             self.log_viewer = LogViewerWindow()
@@ -850,7 +982,7 @@ class MainWindow(QMainWindow):
             self.session_viewer.show()
     
     def export_current_session(self):
-        QMessageBox.information(self, "Export", "Todavía no está, pero se vienen cositas 😉")
+        QMessageBox.information(self, "Export", "Export feature coming soon!")
     
     def closeEvent(self, event):
         if self.is_receiving:
@@ -867,8 +999,7 @@ class SessionViewerWindow(QWidget):
         self.setGeometry(150, 150, 1400, 800)
         self.current_session_data = {}
         
-        # Set window icon
-        icon_path = Path("isc_logo.png")
+        icon_path = Path("isc_logo.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         
@@ -881,7 +1012,7 @@ class SessionViewerWindow(QWidget):
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         
-        title = QLabel("📊 Sessions")
+        title = QLabel("Sessions")
         title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {MATRIX_GREEN}; padding: 8px;")
         left_layout.addWidget(title)
         
@@ -890,7 +1021,7 @@ class SessionViewerWindow(QWidget):
         self.session_list.itemClicked.connect(self.load_session)
         left_layout.addWidget(self.session_list)
         
-        btn_refresh = QPushButton("🔄 Refresh")
+        btn_refresh = QPushButton("Refresh")
         btn_refresh.setStyleSheet(f"background: {ISC_DARK_GREEN}; color: {MATRIX_GREEN}; border: 1px solid {MATRIX_GREEN}; padding: 4px;")
         btn_refresh.clicked.connect(self.refresh_session_list)
         left_layout.addWidget(btn_refresh)
@@ -955,13 +1086,13 @@ class SessionViewerWindow(QWidget):
             self.current_session_data = rtt.load_excel_session(session_file)
             
             if not self.current_session_data:
-                self.session_info_label.setText(f"❌ Error loading")
+                self.session_info_label.setText(f"Error loading")
                 return
             
             if 'Metadata' in self.current_session_data:
                 meta = self.current_session_data['Metadata']
                 if len(meta) > 0:
-                    info_text = f"✅ {meta['Piloto'].iloc[0]} @ {meta['Circuito'].iloc[0]} ({meta['Duration (min)'].iloc[0]:.1f} min)"
+                    info_text = f"{meta['Piloto'].iloc} @ {meta['Circuito'].iloc} ({meta['Duration (min)'].iloc:.1f} min)"
                     self.session_info_label.setText(info_text)
             
             self.data_tabs.clear()
@@ -973,7 +1104,7 @@ class SessionViewerWindow(QWidget):
                 self.data_tabs.addTab(tab, sheet_name)
         
         except Exception as e:
-            self.session_info_label.setText(f"❌ Error: {str(e)}")
+            self.session_info_label.setText(f"Error: {str(e)}")
     
     def create_data_tab(self, sheet_name, df):
         widget = QWidget()
@@ -1067,7 +1198,6 @@ class LogViewerWindow(QWidget):
         self.setWindowTitle("System Logs")
         self.setGeometry(200, 200, 900, 600)
         
-        # Set window icon
         icon_path = Path("isc_logo.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -1078,7 +1208,7 @@ class LogViewerWindow(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
         
-        title = QLabel("📄 System Logs")
+        title = QLabel("System Logs")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {MATRIX_GREEN}; padding: 8px;")
         layout.addWidget(title)
@@ -1090,12 +1220,12 @@ class LogViewerWindow(QWidget):
         
         btn_layout = QHBoxLayout()
         
-        btn_clear = QPushButton("🗑️ Clear")
+        btn_clear = QPushButton("Clear")
         btn_clear.setStyleSheet(f"background: {ISC_DARK_GREEN}; color: {MATRIX_GREEN}; border: 1px solid {MATRIX_GREEN}; padding: 4px;")
         btn_clear.clicked.connect(self.log_text.clear)
         btn_layout.addWidget(btn_clear)
         
-        btn_save = QPushButton("💾 Save")
+        btn_save = QPushButton("Save")
         btn_save.setStyleSheet(f"background: {ISC_DARK_GREEN}; color: {MATRIX_GREEN}; border: 1px solid {MATRIX_GREEN}; padding: 4px;")
         btn_save.clicked.connect(self.save_logs)
         btn_layout.addWidget(btn_save)
@@ -1150,118 +1280,6 @@ class MplCanvas(FigureCanvas):
         self.ax.autoscale_view()
         self.draw()
 
-# ============== MOTOR WINDOW ==============
-class MotorInverterWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Motor & Inverter")
-        self.setGeometry(150, 150, 900, 600)
-        
-        # Set window icon
-        icon_path = Path("isc_logo.ico")
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
-        
-        self.init_ui()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_data)
-        self.timer.start(100)
-    
-    def init_ui(self):
-        layout = QVBoxLayout()
-        title = QLabel("🔧 Motor & Inverter")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {MATRIX_GREEN}; padding: 8px;")
-        layout.addWidget(title)
-        
-        grid = QGridLayout()
-        self.lbl_rpm = QLabel("RPM: ---")
-        self.lbl_rpm.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        self.lbl_torque_req = QLabel("Torque Req: ---")
-        self.lbl_torque_req.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        self.lbl_i_actual = QLabel("Current: ---")
-        self.lbl_i_actual.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        self.lbl_motor_temp = QLabel("Motor Temp: ---")
-        self.lbl_motor_temp.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        
-        grid.addWidget(self.lbl_rpm, 0, 0)
-        grid.addWidget(self.lbl_torque_req, 0, 1)
-        grid.addWidget(self.lbl_i_actual, 1, 0)
-        grid.addWidget(self.lbl_motor_temp, 1, 1)
-        layout.addLayout(grid)
-        
-        plot_layout = QHBoxLayout()
-        self.plot_torque = MplCanvas(title="Torque")
-        self.plot_current = MplCanvas(title="Current")
-        plot_layout.addWidget(self.plot_torque)
-        plot_layout.addWidget(self.plot_current)
-        layout.addLayout(plot_layout)
-        self.setLayout(layout)
-    
-    def update_data(self):
-        data = rtt.get_latest_data()
-        data_600 = data.get("0x600", {})
-        data_610 = data.get("0x610", {})
-        data_630 = data.get("0x630", {})
-        
-        self.lbl_rpm.setText(f"RPM: {data_600.get('rpm', 0):.0f}")
-        self.lbl_torque_req.setText(f"Torque: {data_630.get('torque_req', 0):.1f} Nm")
-        self.lbl_i_actual.setText(f"Current: {data_610.get('i_actual', 0):.1f} A")
-        self.lbl_motor_temp.setText(f"Motor Temp: {data_610.get('motor_temp', 0):.0f} °C")
-        
-        self.plot_torque.update_plot(data_600.get('torque_total', 0))
-        self.plot_current.update_plot(data_610.get('i_actual', 0))
-
-# ============== ACCUMULATOR WINDOW ==============
-class AccumulatorWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Accumulator")
-        self.setGeometry(150, 150, 1400, 800)
-        
-        # Set window icon
-        icon_path = Path("isc_logo.ico")
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
-        
-        self.init_ui()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_data)
-        self.timer.start(500)
-    
-    def init_ui(self):
-        layout = QVBoxLayout()
-        title = QLabel("🔋 Accumulator")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {MATRIX_GREEN}; padding: 8px;")
-        layout.addWidget(title)
-        
-        stats_layout = QHBoxLayout()
-        self.lbl_stack_v = QLabel("Stack: ---")
-        self.lbl_stack_v.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        self.lbl_current = QLabel("Current: ---")
-        self.lbl_current.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        stats_layout.addWidget(self.lbl_stack_v)
-        stats_layout.addWidget(self.lbl_current)
-        layout.addLayout(stats_layout)
-        
-        heatmap_layout = QGridLayout()
-        self.heatmaps = []
-        for i in range(NUM_MODULES):
-            heatmap = HeatmapCanvas(title=f"Module {i}")
-            heatmap_layout.addWidget(heatmap, i // 3, i % 3)
-            self.heatmaps.append(heatmap)
-        layout.addLayout(heatmap_layout)
-        self.setLayout(layout)
-    
-    def update_data(self):
-        self.lbl_stack_v.setText(f"Stack: {rtt.ams_stack_total_mv / 1000:.1f} V")
-        self.lbl_current.setText(f"Current: {rtt.ams_current_dA / 10:.1f} A")
-        for i, heatmap in enumerate(self.heatmaps):
-            mod = rtt.get_ams_module_data(i)
-            if mod:
-                heatmap.update_heatmap(mod.temps_c)
-
 # ============== HEATMAP CANVAS ==============
 class HeatmapCanvas(FigureCanvas):
     def __init__(self, title="Heatmap"):
@@ -1288,57 +1306,6 @@ class HeatmapCanvas(FigureCanvas):
         self.im.set_data(grid)
         self.im.set_clim(vmin=max(20, grid.min()), vmax=min(60, grid.max()))
         self.draw()
-
-# ============== DRIVER WINDOW ==============
-class DriverWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Driver Data")
-        self.setGeometry(150, 150, 800, 500)
-        
-        # Set window icon
-        icon_path = Path("isc_logo.ico")
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
-        
-        self.init_ui()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_data)
-        self.timer.start(100)
-    
-    def init_ui(self):
-        layout = QVBoxLayout()
-        title = QLabel("🏎️ Driver")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {MATRIX_GREEN}; padding: 8px;")
-        layout.addWidget(title)
-        
-        grid = QGridLayout()
-        self.lbl_throttle_pct = QLabel("Throttle: ---")
-        self.lbl_throttle_pct.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        self.lbl_brake_pct = QLabel("Brake: ---")
-        self.lbl_brake_pct.setStyleSheet(f"color: {MATRIX_GREEN}; font-size: 11px;")
-        grid.addWidget(self.lbl_throttle_pct, 0, 0)
-        grid.addWidget(self.lbl_brake_pct, 0, 1)
-        layout.addLayout(grid)
-        
-        plot_layout = QHBoxLayout()
-        self.plot_throttle = MplCanvas(title="Throttle %")
-        self.plot_brake = MplCanvas(title="Brake %")
-        plot_layout.addWidget(self.plot_throttle)
-        plot_layout.addWidget(self.plot_brake)
-        layout.addLayout(plot_layout)
-        self.setLayout(layout)
-    
-    def update_data(self):
-        data = rtt.get_latest_data()
-        data_630 = data.get("0x630", {})
-        throttle = data_630.get('throttle', 0)
-        brake = data_630.get('brake', 0)
-        self.lbl_throttle_pct.setText(f"Throttle: {throttle:.1f} %")
-        self.lbl_brake_pct.setText(f"Brake: {brake:.1f} %")
-        self.plot_throttle.update_plot(throttle)
-        self.plot_brake.update_plot(brake)
 
 # ============== MAIN ==============
 def main():
