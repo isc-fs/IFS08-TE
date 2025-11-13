@@ -195,6 +195,7 @@ static void ams_dump_status(void);
 #ifndef FLUSH_TX
 #define FLUSH_TX      0xE1
 #define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
+#define TEL_USE_DUMMY_AMS 0 // Set 1 to generate fake AMS data
 #endif
 
 
@@ -436,6 +437,51 @@ for (int i = 0; i < 10; ++i) {
     pkt[2] = 1234.0f;
     NRF24_Transmit((uint8_t*)pkt);
     HAL_Delay(100);
+}
+
+//Dummy AMS data para pruebas
+if (TEL_USE_DUMMY_AMS) {
+    print("[DUMMY] Generating fake AMS data");
+    ams_generate_dummy_data();
+
+    // Test envío de temperaturas
+    print("[DUMMY] Testing AMS temperature TX...");
+    tel_send_ams_all_temps();
+    print("[DUMMY] AMS test complete");
+}
+#endif
+
+// ============== DUMMY AMS DATA GENERATOR ==============
+#if TEL_USE_DUMMY_AMS
+static void ams_generate_dummy_data(void) {
+static uint32_t dummy_cycle = 0;
+dummy_cycle++;
+
+text
+// Generate fake voltages
+ams_global_min_mv = 3200 + (dummy_cycle % 100);
+ams_global_max_mv = 3800 + (dummy_cycle % 50);
+ams_stack_total_mv = 355000 + (dummy_cycle % 1000);
+ams_current_dA = 150 + (dummy_cycle % 50);  // 15A nominal
+
+// Generate fake module data
+for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
+    ams_modules[mod].min_cell_mv = 3300 + (dummy_cycle % 80) + mod * 10;
+    ams_modules[mod].temp_max = 35 + (dummy_cycle % 10) + mod * 2;
+    ams_modules[mod].temp_min = 25 + (dummy_cycle % 5);
+    ams_modules[mod].temp_valid_count = 38;
+    ams_modules[mod].last_update_ms = HAL_GetTick();
+
+    // Generate 38 fake temperatures per module
+    for (int t = 0; t < AMS_TEMPS_PER_MOD; t++) {
+        uint8_t temp = 28 + (t % 8) + (dummy_cycle % 5);
+        ams_modules[mod].temps[t] = temp;
+
+        // Store in global array
+        int global_idx = mod * AMS_TEMPS_PER_MOD + t;
+        ams_all_temps[global_idx] = temp;
+    }
+}
 }
 #endif
 
@@ -803,10 +849,23 @@ for (int i = 0; i < 10; ++i) {
 
 		}
 
-		if (tel_tick >= 500) {
-		        tel_tick = 0;          // consume the tick
-		        tel_send_now();        // SPI + UART OK here (foreground)
-		    }
+		//Generar datos dummy si está habilitado
+		#if TEL_USE_DUMMY_AMS
+		ams_generate_dummy_data();
+		#endif
+
+		//Enviar telemetría principal (cuando flag se setea)
+		if (tel_send_flag) {
+		tel_send_flag = 0; // Clear flag
+		tel_send_now(); // Envía frame principal
+		}
+
+		//Enviar temperaturas AMS cada 5 segundos
+		static uint32_t last_ams_tx = 0;
+		if (HAL_GetTick() - last_ams_tx >= 5000) {
+		last_ams_tx = HAL_GetTick();
+		tel_send_ams_all_temps(); // Envía 25 frames (5 módulos × 5 bloques)
+		}
         // (A) Core counters + a few key signals
         char hb[180];
         snprintf(hb, sizeof(hb), // @suppress("Float formatting support")
@@ -2556,6 +2615,40 @@ static void tel_send_now(void)
 #endif
 
     if (ok) tel_sent_ok++; else tel_sent_fail++;
+}
+
+// ============== SEND ALL AMS TEMPERATURES ==============
+static void tel_send_ams_all_temps(void) {
+    static uint16_t ams_seq = 2000;  // Secuencia separada para AMS
+
+    // Para cada módulo (0-4)
+    for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
+
+        // Para cada bloque de temperaturas (5 bloques por módulo)
+        for (int block = 0; block < 5; block++) {
+
+            TelFrame pkt;
+            pkt.id = 0x209 + block;  // 0x209, 0x20A, 0x20B, 0x20C, 0x20D
+            pkt.seq = ams_seq++;
+
+            // Empaquetar 7 temperaturas en v1-v7
+            int offset = block * 8;
+            for (int i = 0; i < 7; i++) {
+                int idx = mod * AMS_TEMPS_PER_MOD + offset + i;
+                if (idx < AMS_TOTAL_TEMPS && (offset + i) < AMS_TEMPS_PER_MOD) {
+                    (&pkt.v1)[i] = (float)ams_all_temps[idx];
+                } else {
+                    (&pkt.v1)[i] = 0.0f;  // Padding
+                }
+            }
+
+            // Transmitir
+            uint8_t ok = nrf24_tx32(&pkt);
+            if (ok) tel_sent_ok++; else tel_sent_fail++;
+
+            HAL_Delay(5);  // Pequeño delay entre frames
+        }
+    }
 }
 
 
