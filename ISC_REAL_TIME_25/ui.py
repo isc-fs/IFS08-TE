@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ISCmetrics - Formula Student Telemetry")
         self.setGeometry(100, 100, 1800, 950)
+
+        # --- CREATE LOG WIDGET FIRST!
+        self.log_text = None  # placeholder
+        self.init_ui()
         
         # Set window icon
         icon_path = Path("isc_logo.ico")
@@ -120,6 +124,9 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(3)
         main_layout.setContentsMargins(5, 5, 5, 5)
+        # BOTTOM: Create log first
+        log_frame = self.create_mini_log_frame()
+        main_layout.addWidget(log_frame)
         
         # === COMPACT TOP SECTION ===
         top_section = self.create_compact_top_section()
