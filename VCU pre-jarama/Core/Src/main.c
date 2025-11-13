@@ -94,12 +94,14 @@ static void MX_SPI1_Init(void);
 
 // ---------- TEL Testing ----------
 #define TEL_USE_DUMMY   0   // set 1 to test without CAN, 0 for real can data
+#define TEL_USE_DUMMY_AMS 0 // Set 1 to generate fake AMS data
+#define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
 #define DEGUB 0 //Para todos los debuggers
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
 
-static uint8_t tel_send_falg = 0; //flags para interrupciones
+static uint8_t tel_send_flag = 0; //flags para interrupciones
 static uint32_t tel_tick = 0;  // ms accumulator to 500
 
 /* ---- Telemetry debug counters ---- */
@@ -173,6 +175,7 @@ typedef struct __attribute__((packed)) {
 // forward decls
 static void tel_build_packet(TelFrame *p);
 static void tel_send_now(void);
+static void tel_send_ams_all_temps(void);
 /* --- Telemetry / diag helpers (prototypes) --- */
 static void     gpio_dump_once(void);
 static void     nrf24_diag_once(void);
@@ -194,8 +197,6 @@ static void ams_dump_status(void);
 #endif
 #ifndef FLUSH_TX
 #define FLUSH_TX      0xE1
-#define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
-#define TEL_USE_DUMMY_AMS 0 // Set 1 to generate fake AMS data
 #endif
 
 
@@ -934,8 +935,7 @@ for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
     /* USER CODE BEGIN 3 */
 	}
   /* USER CODE END 3 */
-}
-
+	}
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -2259,9 +2259,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 		    tel_irq_cnt++;                // <--- ADD
 		    tel_tick += 10;
 
-	        if (teltick >= TEL_PERIOD_MS) {
-	            teltick = 0;
+	        if (tel_tick >= TEL_PERIOD_MS) {
+	            tel_tick = 0;
 	            tel_send_flag = 1;  // ← Setea flag (1µs)
+	        }
 
 		    (void)HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &TxHeader_Acu, TxData_Acu);
 
