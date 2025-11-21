@@ -88,12 +88,14 @@ void setup() {
 
 void loop() {
   if (!radio.available()) {
+    
     return; // nothing to read
   }
 
   // Drain RX FIFO to keep up at higher rates
   while (radio.available()) {
     radio.read(buf, PAYLOAD);
+    Serial.println(F("RadioChecking"));
 
 #if SEND_ACCEL_SWEEP
     // (kept for reference; MUST stay disabled in production)

@@ -20,36 +20,40 @@ import numpy as np
 # ================== CONFIG RF ==================
 RF_EXPECTED = {
     "PIPE_ADDR": "0xE7E7E7E7E7",
-    "CHANNEL":   76,
-    "PAYLOAD":   32,
+    "CHANNEL": 76,
+    "PAYLOAD": 32,
     "DATA_RATE": "1Mbps",
-    "AUTO_ACK":  False,
-    "CRC":       "CRC_16",
-    "PA":        "PA_MAX",
+    "AUTO_ACK": False,
+    "CRC": "CRC_16",
+    "PA": "PA_MAX",
 }
 
 # ================== AMS CONSTANTS ==================
 NUM_MODULES = 5
 CELLS_PER_MODULE = 19
 TEMPS_PER_MODULE = 38
-TOTAL_TEMPS = NUM_MODULES * TEMPS_PER_MODULE  # 190
+TOTAL_TEMPS = NUM_MODULES * TEMPS_PER_MODULE # 190
 
 # ================== EXCEL LOGGING ==================
 EXCEL_SESSIONS_DIR = Path("logs")
 EXCEL_SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ================== CONFIG DERIVADOS ==================
-GEAR_RATIO: Optional[float]     = None
-FINAL_DRIVE: Optional[float]    = None
+GEAR_RATIO: Optional[float] = None
+FINAL_DRIVE: Optional[float] = None
 WHEEL_RADIUS_M: Optional[float] = None
 
 # ================== INFLUX (OPCIONAL) ==================
 INFLUX_CONFIG = {
-    "url":   "http://localhost:8086",
+    "url": "http://localhost:8086",
     "token": "TOKEN",
-    "org":   "TORG",
+    "org": "TORG",
 }
+# Make default settings globally accessible for UI config
 INFLUX_ENABLE_DEFAULT = False
+DEBUG_ENABLE_DEFAULT = False # New state variable added for debug toggle
+DEFAULT_BAUD = 115200
+DEFAULT_PORT = None
 
 _client = None
 _influx_ok = False
@@ -82,8 +86,6 @@ def _get_write_api():
 SOF1 = 0xAA
 SOF2 = 0x55
 PAYLOAD_LEN = 32
-DEFAULT_BAUD = 115200
-DEFAULT_PORT = None
 
 # ================== ESTADO PARA LA UI ==================
 data_str = ""
@@ -101,7 +103,9 @@ _last_seq_advance_ts = 0.0
 _STALE_T = 0.20
 
 logger = logging.getLogger("ISC_RTT_USB")
+# Configure basicConfig so logger messages go to the UI via the proxy in the UI file
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 # ================== PER-MODULE AMS DATA ==================
 class AMSModule:
@@ -146,7 +150,7 @@ class ExcelSessionLogger:
         }
         
         self.last_write = time.time()
-        self.write_interval = 5.0  # Write to Excel every 5 seconds
+        self.write_interval = 5.0 # Write to Excel every 5 seconds
         
         logger.info(f"Excel logger initialized: {self.filename}")
     
@@ -312,7 +316,7 @@ def list_excel_sessions():
     sessions = []
     if EXCEL_SESSIONS_DIR.exists():
         for file in EXCEL_SESSIONS_DIR.glob("*.xlsx"):
-            if not file.name.startswith('~'):  # Skip temp files
+            if not file.name.startswith('~'): # Skip temp files
                 sessions.append(file)
     return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
 
@@ -449,7 +453,7 @@ def parse_ams_extended(id_int: int, frame_dict: dict):
     global ams_global_min_mv, ams_global_max_mv, ams_stack_total_mv, ams_current_dA
     
     v1, v2, v3, v4, v5, v6, v7 = (frame_dict["v1"], frame_dict["v2"], frame_dict["v3"],
-                                   frame_dict["v4"], frame_dict["v5"], frame_dict["v6"], frame_dict["v7"])
+                                  frame_dict["v4"], frame_dict["v5"], frame_dict["v6"], frame_dict["v7"])
     
     if id_int == 0x202:
         ams_global_max_mv = int(v1)
@@ -518,12 +522,16 @@ def parse_telemetry_data_frame(frame_dict: dict):
     id_hex = _id_hex(id_int)
     seq    = frame_dict["seq"]
     v1, v2, v3, v4, v5, v6, v7 = (frame_dict["v1"], frame_dict["v2"], frame_dict["v3"],
-                                   frame_dict["v4"], frame_dict["v5"], frame_dict["v6"], frame_dict["v7"])
+                                  frame_dict["v4"], frame_dict["v5"], frame_dict["v6"], frame_dict["v7"])
 
+    # Consolidated Log String for UI
+    status_badge = _status.get('badge', '?')
     if seq is not None:
-        data_str = f"[RX] ID={id_hex} SEQ={seq} badge={_status.get('badge','?')}\n[RX] {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
+        # Changed formatting to a single line for the single log box
+        data_str = f"[{status_badge}] ID={id_hex} SEQ={seq} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
     else:
-        data_str = f"[RX] ID={id_hex} badge={_status.get('badge','?')}\n[RX] {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
+        # Changed formatting to a single line for the single log box
+        data_str = f"[{status_badge}] ID={id_hex} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
 
     latest_data_dict[id_hex] = {
         "id": id_int, "seq": seq,
@@ -538,21 +546,21 @@ def parse_telemetry_data_frame(frame_dict: dict):
     if id_int == 0x600:
         latest_data_dict[id_hex].update({
             "dc_bus_voltage": v1,
-            "dc_bus_power":   v2,
-            "rpm":            v3,
-            "torque_total":   v4,
-            "cell_min_v":     v5,
-            "throttle_raw1":  v6,
-            "throttle_raw2":  v7,
+            "dc_bus_power": v2,
+            "rpm": v3,
+            "torque_total": v4,
+            "cell_min_v": v5,
+            "throttle_raw1": v6,
+            "throttle_raw2": v7,
         })
 
     elif id_int == 0x610:
         latest_data_dict[id_hex].update({
-            "motor_temp":   v1,
-            "pwrstg_temp":  v2,
-            "air_temp":     v3,
-            "n_actual":     v4,
-            "i_actual":     v5,
+            "motor_temp": v1,
+            "pwrstg_temp": v2,
+            "air_temp": v3,
+            "n_actual": v4,
+            "i_actual": v5,
         })
 
     elif id_int == 0x620:
@@ -567,15 +575,15 @@ def parse_telemetry_data_frame(frame_dict: dict):
         latest_data_dict[id_hex].update({
             "torque_req": v1,
             "torque_est": v2,
-            "throttle":   max(0.0, min(100.0, v3)),
-            "brake":      max(0.0, min(100.0, v4)),
+            "throttle": max(0.0, min(100.0, v3)),
+            "brake": max(0.0, min(100.0, v4)),
         })
 
     elif id_int == 0x640:
         latest_data_dict[id_hex].update({
             "current_sensor": v1,
-            "cell_min_v":     v2,
-            "cell_max_temp":  v3,
+            "cell_min_v": v2,
+            "cell_max_temp": v3,
         })
 
     try:
@@ -638,7 +646,10 @@ def receive_data(bucket_id: str,
                  baud: int = DEFAULT_BAUD,
                  use_influx: bool = INFLUX_ENABLE_DEFAULT,
                  debug: bool = False):
-    global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger
+    global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT
+    
+    # Update global variable for debugging state, used by logger.setLevel
+    DEBUG_ENABLE_DEFAULT = debug
 
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.info("Recepción USB-Serial iniciada con soporte para 5 módulos AMS")
@@ -659,7 +670,7 @@ def receive_data(bucket_id: str,
     ser = _open_serial(port, baud)
 
     logger.info("[CONFIG] Serial: port=%s, baud=%d", port, baud)
-    logger.info("[CONFIG] AMS: %d módulos, %d celdas/mod, %d temps/mod", 
+    logger.info("[CONFIG] AMS: %d módulos, %d celdas/mod, %d temps/mod",
                 NUM_MODULES, CELLS_PER_MODULE, TEMPS_PER_MODULE)
     logger.info("[CONFIG] Excel: %s", _excel_logger.filename)
 
@@ -681,7 +692,7 @@ def receive_data(bucket_id: str,
             if err == "timeout":
                 if _last_seq is not None and (now - _last_seq_advance_ts) > _STALE_T:
                     _set_badge("STALE", "sin avance de SEQ")
-                if now - last_stats_t >= 2.0:
+                if debug and now - last_stats_t >= 2.0:
                     logger.debug("[STATS] rx=%d decode=%d chk=%d test=%d",
                                  counters["rx"], counters["decode"], counters["chk"], counters["test"])
                     last_stats_t = now
@@ -742,9 +753,9 @@ def receive_data(bucket_id: str,
 
             new_data_flag = 1
 
-            if now - last_stats_t >= 2.0:
+            if debug and now - last_stats_t >= 2.0:
                 logger.debug("[STATS] rx=%d decode=%d",
-                             counters["rx"], counters["decode"])
+                              counters["rx"], counters["decode"])
                 last_stats_t = now
 
     finally:
