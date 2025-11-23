@@ -92,10 +92,7 @@ void Error_Handler(void);
 #define USART1_RX_GPS_Pin GPIO_PIN_10
 #define USART1_RX_GPS_GPIO_Port GPIOA
 
-#define NRF24_CSN_PORT GPIOG
-#define NRF24_CSN_PIN  GPIO_PIN_3
-#define NRF24_CE_PORT  GPIOC
-#define NRF24_CE_PIN   GPIO_PIN_6
+
 
 
 /* USER CODE BEGIN Private defines */

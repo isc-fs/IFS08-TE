@@ -100,6 +100,15 @@ static void MX_SPI1_Init(void);
 #define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
 #define DEGUB 1 //Para todos los debuggers
 #define TEL_CHAN        76
+#define NRF24_REG_STATUS STATUS
+#define TX_DS 5    // Transmit Data Sent interrupt flag bit position
+#define MAX_RT 4   // Max Retransmit interrupt flag bit position
+#define CSN_LOW()  HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_RESET)
+#define CSN_HIGH() HAL_GPIO_WritePin(NRF24_CSN_PORT, NRF24_CSN_PIN, GPIO_PIN_SET)
+
+
+
+
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
 
@@ -393,8 +402,7 @@ int main(void)
   uint8_t r_cfg[2] = { 0x00, 0xFF };                   // R_REGISTER|CONFIG, dummy
   uint8_t rxw[2] = {0}, rxr[2] = {0};
 
-  CSN_LOW();  HAL_SPI_TransmitReceive(&hspi1, w_cfg, rxw, 2, 100);  CSN_HIGH();
-  CSN_LOW();  HAL_SPI_TransmitReceive(&hspi1, r_cfg, rxr, 2, 100);  CSN_HIGH();
+
 
   char dbg[96];
   snprintf(dbg, sizeof dbg, "[POST-ACTIVATE] status_w=%02X cfg=%02X\r\n", rxw[0], rxr[1]);
@@ -454,6 +462,11 @@ if (TEL_USE_DUMMY_AMS) {
     print("[DUMMY] AMS test complete");
 }
 #endif
+
+// Set CE pin low to standby
+HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_RESET);
+
+
 
 
 
@@ -2605,9 +2618,9 @@ static void tel_send_ams_all_temps(void) {
             // Empaquetar 7 temperaturas en v1-v7
             int offset = block * 8;
             for (int i = 0; i < 7; i++) {
-            	int idx = mod * AMSTEMPSPERMOD + offset + i;
-            	               if (idx < AMSTOTALTEMPS)
-            	                   ((float*)&pkt.v1)[i] = (float)amsalltemps[idx];
+            	int idx = mod * AMS_TEMPS_PER_MOD + offset + i;
+            	               if (idx < AMS_TOTAL_TEMPS)
+            	                   ((float*)&pkt.v1)[i] = (float)ams_all_temps[idx];
             	               else
             	                   ((float*)&pkt.v1)[i] = 0.0f;  // padding
             }
@@ -2643,10 +2656,10 @@ for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
     ams_modules[mod].last_update_ms = HAL_GetTick();
 
     // Generate 38 fake temperatures per module
-    for (int t = 0; t < AMSTEMPSPERMOD; t++) {
-                int globalidx = mod * AMSTEMPSPERMOD + t;
-                if (globalidx < AMSTOTALTEMPS) {
-                    amsalltemps[globalidx] = 28 + (t % 8) + (dummycycle % 5);
+    for (int t = 0; t < AMS_TEMPS_PER_MOD; t++) {
+                int globalidx = mod * AMS_TEMPS_PER_MOD + t;
+                if (globalidx < AMS_TOTAL_TEMPS) {
+                    ams_all_temps[globalidx] = 28 + (t % 8) + (dummy_cycle % 5);
                 }
             }
 }
@@ -2755,37 +2768,37 @@ static void nrf24_flush_tx(void)
 
 
 // Write a 32B payload and transmit, waiting for TX_DS or MAX_RT
-static uint8_t nrf24tx32(const void *buf32) {
+static uint8_t nrf24_tx32(const void *buf32) {
     // Clear IRQ bits
-    nrf24WriteReg(NRF24_REG_STATUS, 0x70);
+    nrf24_WriteReg(NRF24_REG_STATUS, 0x70);
 
-    CSNLOW;
+    CSN_LOW();
     uint8_t cmd = W_TX_PAYLOAD;
     HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
     HAL_SPI_Transmit(&hspi1, (uint8_t *)buf32, 32, 100);
-    CSNHIGH;
+    CSN_HIGH();
 
     // Pulse CE to start TX
-    HAL_GPIO_WritePin(NRF24CEPORT, NRF24CEPIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_SET);
     HAL_Delay(1);
-    HAL_GPIO_WritePin(NRF24CEPORT, NRF24CEPIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_RESET);
 
     uint32_t t0 = HAL_GetTick();
     while (HAL_GetTick() - t0 < 5) {
-        uint8_t st = nrf24ReadReg(NRF24_REG_STATUS);
+        uint8_t st = nrf24_ReadReg(NRF24_REG_STATUS);
         if (st & (1 << TX_DS)) {
             // Clear TX_DS
-            nrf24WriteReg(NRF24_REG_STATUS, (1 << TX_DS));
+            nrf24_WriteReg(NRF24_REG_STATUS, (1 << TX_DS));
             return 1; // success
         }
         if (st & (1 << MAX_RT)) {
             // Clear MAX_RT and flush TX FIFO
-            nrf24WriteReg(NRF24_REG_STATUS, (1 << MAX_RT));
-            nrf24FlushTx();
+            nrf24_WriteReg(NRF24_REG_STATUS, (1 << MAX_RT));
+            nrf24_flush_tx();
             return 0; // failure
         }
     }
-    nrf24FlushTx();
+    nrf24_flush_tx();
     return 0; // timeout failure
 }
 
