@@ -66,6 +66,8 @@ TIM_HandleTypeDef htim16;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
+
+
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -93,10 +95,10 @@ static void MX_SPI1_Init(void);
 /* USER CODE BEGIN 0 */
 
 // ---------- TEL Testing ----------
-#define TEL_USE_DUMMY   0   // set 1 to test without CAN, 0 for real can data
-#define TEL_USE_DUMMY_AMS 0 // Set 1 to generate fake AMS data
+#define TEL_USE_DUMMY   1   // set 1 to test without CAN, 0 for real can data
+#define TEL_USE_DUMMY_AMS 1 // Set 1 to generate fake AMS data
 #define TEL_PERIOD_MS 50  // 20Hz (puedes cambiar: 100→10Hz, 20→50Hz)
-#define DEGUB 0 //Para todos los debuggers
+#define DEGUB 1 //Para todos los debuggers
 #define TEL_CHAN        76
 static uint8_t rf_addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
 
@@ -188,6 +190,7 @@ static void heartbeat_tick(void);
 static uint8_t nrf24_tx32(const void *buf32);
 static void nrf24_flush_tx(void);
 static void ams_dump_status(void);
+static void ams_generate_dummy_data();
 
 
 
@@ -452,39 +455,6 @@ if (TEL_USE_DUMMY_AMS) {
 }
 #endif
 
-// ============== DUMMY AMS DATA GENERATOR ==============
-#if TEL_USE_DUMMY_AMS
-static void ams_generate_dummy_data(void) {
-static uint32_t dummy_cycle = 0;
-dummy_cycle++;
-
-text
-// Generate fake voltages
-ams_global_min_mv = 3200 + (dummy_cycle % 100);
-ams_global_max_mv = 3800 + (dummy_cycle % 50);
-ams_stack_total_mv = 355000 + (dummy_cycle % 1000);
-ams_current_dA = 150 + (dummy_cycle % 50);  // 15A nominal
-
-// Generate fake module data
-for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
-    ams_modules[mod].min_cell_mv = 3300 + (dummy_cycle % 80) + mod * 10;
-    ams_modules[mod].temp_max = 35 + (dummy_cycle % 10) + mod * 2;
-    ams_modules[mod].temp_min = 25 + (dummy_cycle % 5);
-    ams_modules[mod].temp_valid_count = 38;
-    ams_modules[mod].last_update_ms = HAL_GetTick();
-
-    // Generate 38 fake temperatures per module
-    for (int t = 0; t < AMS_TEMPS_PER_MOD; t++) {
-        uint8_t temp = 28 + (t % 8) + (dummy_cycle % 5);
-        ams_modules[mod].temps[t] = temp;
-
-        // Store in global array
-        int global_idx = mod * AMS_TEMPS_PER_MOD + t;
-        ams_all_temps[global_idx] = temp;
-    }
-}
-}
-#endif
 
 
 
@@ -2635,12 +2605,11 @@ static void tel_send_ams_all_temps(void) {
             // Empaquetar 7 temperaturas en v1-v7
             int offset = block * 8;
             for (int i = 0; i < 7; i++) {
-                int idx = mod * AMS_TEMPS_PER_MOD + offset + i;
-                if (idx < AMS_TOTAL_TEMPS && (offset + i) < AMS_TEMPS_PER_MOD) {
-                    (&pkt.v1)[i] = (float)ams_all_temps[idx];
-                } else {
-                    (&pkt.v1)[i] = 0.0f;  // Padding
-                }
+            	int idx = mod * AMSTEMPSPERMOD + offset + i;
+            	               if (idx < AMSTOTALTEMPS)
+            	                   ((float*)&pkt.v1)[i] = (float)amsalltemps[idx];
+            	               else
+            	                   ((float*)&pkt.v1)[i] = 0.0f;  // padding
             }
 
             // Transmitir
@@ -2652,6 +2621,36 @@ static void tel_send_ams_all_temps(void) {
     }
 }
 
+
+// ============== DUMMY AMS DATA GENERATOR ==============
+static void ams_generate_dummy_data(void) {
+static uint32_t dummy_cycle = 0;
+dummy_cycle++;
+
+
+// Generate fake voltages
+ams_global_min_mv = 3200 + (dummy_cycle % 100);
+ams_global_max_mv = 3800 + (dummy_cycle % 50);
+ams_stack_total_mv = 355000 + (dummy_cycle % 1000);
+ams_current_dA = 150 + (dummy_cycle % 50);  // 15A nominal
+
+// Generate fake module data
+for (int mod = 0; mod < AMS_NUM_MODULES; mod++) {
+    ams_modules[mod].min_cell_mv = 3300 + (dummy_cycle % 80) + mod * 10;
+    ams_modules[mod].temp_max = 35 + (dummy_cycle % 10) + mod * 2;
+    ams_modules[mod].temp_min = 25 + (dummy_cycle % 5);
+    ams_modules[mod].temp_valid_count = 38;
+    ams_modules[mod].last_update_ms = HAL_GetTick();
+
+    // Generate 38 fake temperatures per module
+    for (int t = 0; t < AMSTEMPSPERMOD; t++) {
+                int globalidx = mod * AMSTEMPSPERMOD + t;
+                if (globalidx < AMSTOTALTEMPS) {
+                    amsalltemps[globalidx] = 28 + (t % 8) + (dummycycle % 5);
+                }
+            }
+}
+}
 
 //----- Debugging Telemetry con LVB
 static void gpio_dump_once(void) {
@@ -2756,42 +2755,38 @@ static void nrf24_flush_tx(void)
 
 
 // Write a 32B payload and transmit, waiting for TX_DS or MAX_RT
-static uint8_t nrf24_tx32(const void *buf32)
-{
-    // Clear IRQs: RX_DR | TX_DS | MAX_RT
-    nrf24_WriteReg(STATUS, (1u<<6)|(1u<<5)|(1u<<4));
+static uint8_t nrf24tx32(const void *buf32) {
+    // Clear IRQ bits
+    nrf24WriteReg(NRF24_REG_STATUS, 0x70);
 
-    // Load payload
-    CSN_LOW();
-    uint8_t cmd = 0xA0; // W_TX_PAYLOAD
+    CSNLOW;
+    uint8_t cmd = W_TX_PAYLOAD;
     HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
-    HAL_SPI_Transmit(&hspi1, (uint8_t*)buf32, 32, 100);
-    CSN_HIGH();
+    HAL_SPI_Transmit(&hspi1, (uint8_t *)buf32, 32, 100);
+    CSNHIGH;
 
-    // Pulse CE to start the transmit. Spec says >10 µs; 1 ms is fine here.
-    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_SET);
+    // Pulse CE to start TX
+    HAL_GPIO_WritePin(NRF24CEPORT, NRF24CEPIN, GPIO_PIN_SET);
     HAL_Delay(1);
-    HAL_GPIO_WritePin(NRF24_CE_PORT, NRF24_CE_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(NRF24CEPORT, NRF24CEPIN, GPIO_PIN_RESET);
 
-    // Wait up to ~5 ms for completion
     uint32_t t0 = HAL_GetTick();
-    while ((HAL_GetTick() - t0) < 5) {
-        uint8_t st = nrf24_ReadReg(STATUS);
-
-        if (st & (1u<<5)) {                 // TX_DS set
-            nrf24_WriteReg(STATUS, (1u<<5));
-            return 1;
+    while (HAL_GetTick() - t0 < 5) {
+        uint8_t st = nrf24ReadReg(NRF24_REG_STATUS);
+        if (st & (1 << TX_DS)) {
+            // Clear TX_DS
+            nrf24WriteReg(NRF24_REG_STATUS, (1 << TX_DS));
+            return 1; // success
         }
-        if (st & (1u<<4)) {                 // MAX_RT set
-            nrf24_WriteReg(STATUS, (1u<<4));
-            nrf24_flush_tx();               // use our local flush
-            return 0;
+        if (st & (1 << MAX_RT)) {
+            // Clear MAX_RT and flush TX FIFO
+            nrf24WriteReg(NRF24_REG_STATUS, (1 << MAX_RT));
+            nrf24FlushTx();
+            return 0; // failure
         }
     }
-
-    // Timeout — clean up
-    nrf24_flush_tx();
-    return 0;
+    nrf24FlushTx();
+    return 0; // timeout failure
 }
 
 /* --- One-shot AMS dump over UART (call whenever you want a full snapshot) --- */

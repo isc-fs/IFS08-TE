@@ -19,7 +19,7 @@ static const uint8_t PIN_CE  = 10;
 static const uint8_t PIN_CSN = 9;
 RF24 radio(PIN_CE, PIN_CSN);
 
-static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7ULL; // 5-byte address
+static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7; // 5-byte address
 static const uint8_t  CHANNEL   = 76;              // RF_CH
 static const uint8_t  PAYLOAD   = 32;              // fixed payload size
 
@@ -88,7 +88,6 @@ void setup() {
 
 void loop() {
   if (!radio.available()) {
-    
     return; // nothing to read
   }
 
