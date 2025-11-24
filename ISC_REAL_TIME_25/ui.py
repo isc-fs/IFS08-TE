@@ -34,6 +34,7 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 import ISC_RTT_serial as rtt
+import ISC_RTT_demo as demo
 
 # ============== CONSTANTS ==============
 NUM_MODULES = 5
@@ -41,13 +42,13 @@ TEMPS_PER_MODULE = 38
 CELLS_PER_MODULE = 19
 
 # F1/MODERN COLOR SCHEME using Irish Green
-ISC_GREEN = '#008000'       # Primary ISC Green (Irish Green)
-F1_DARK_BG = '#101010'      # Very dark grey/black for background
-F1_MID_BG = '#282828'       # Medium dark grey for container panels
-F1_TEXT = '#FFFFFF'         # White/Light text
-F1_ACCENT = ISC_GREEN       # Accent color for borders, lines, and primary highlights
-F1_WARNING = '#FFFF00'      # Yellow for warnings
-F1_ERROR = '#FF3333'        # Bright Red for errors
+ISC_GREEN = '#008000'
+F1_DARK_BG = '#101010'
+F1_MID_BG = '#282828'
+F1_TEXT = '#FFFFFF'
+F1_ACCENT = ISC_GREEN
+F1_WARNING = '#FFFF00'
+F1_ERROR = '#FF3333'
 
 PLOT_COLOR = ISC_GREEN
 PLOT_BG = F1_DARK_BG
@@ -57,12 +58,12 @@ ACCENT_COLOR = F1_ACCENT
 WARNING_COLOR = F1_WARNING
 ERROR_COLOR = F1_ERROR
 
-# Persistent state for settings panel initialization (will be updated on start/settings change)
 current_settings = {
     "port": rtt.DEFAULT_PORT,
     "baud": rtt.DEFAULT_BAUD,
     "use_influx": rtt.INFLUX_ENABLE_DEFAULT,
     "debug": rtt.DEBUG_ENABLE_DEFAULT,
+    "demo_mode": False,
 }
 
 # ============== LOGGING OVERRIDE ==============
@@ -73,7 +74,6 @@ class QtHandler(logging.Handler):
         self.signaler = signaler
         
     def emit(self, record):
-        # Format the message and emit the signal
         msg = self.format(record)
         self.signaler.log_message.emit(msg)
 
@@ -85,7 +85,6 @@ class Signaler(QObject):
 
 signaler = Signaler()
 
-# Add the custom handler to the ISC_RTT_USB logger to capture messages
 logger_rtt = logging.getLogger("ISC_RTT_USB")
 logger_rtt.addHandler(QtHandler(signaler))
 
@@ -103,13 +102,13 @@ plt.rcParams.update({
     'grid.alpha': 0.5,
 })
 
-# ============== SETTINGS DIALOG (NEW) ==============
+# ============== SETTINGS DIALOG ==============
 class SettingsDialog(QDialog):
     def __init__(self, parent: 'MainWindow' = None):
         super().__init__(parent)
         self.setWindowTitle("ISCmetrics - Ajustes (Settings)")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setGeometry(200, 200, 450, 250)
+        self.setGeometry(200, 200, 450, 300)
         
         self.parent_ui = parent
         self.apply_f1_theme()
@@ -120,7 +119,6 @@ class SettingsDialog(QDialog):
         input_style = parent.get_input_style()
         label_style = f"color: {F1_TEXT}; font-size: 11px; font-weight: bold;"
         
-        # COM Port
         lbl_port = QLabel("COM Port:")
         lbl_port.setStyleSheet(label_style)
         self.combo_port = QComboBox()
@@ -129,7 +127,6 @@ class SettingsDialog(QDialog):
         layout.addWidget(lbl_port, 0, 0)
         layout.addWidget(self.combo_port, 0, 1)
         
-        # Baud Rate
         lbl_baud = QLabel("Baud Rate:")
         lbl_baud.setStyleSheet(label_style)
         self.input_baud = QLineEdit(str(rtt.DEFAULT_BAUD))
@@ -137,27 +134,29 @@ class SettingsDialog(QDialog):
         layout.addWidget(lbl_baud, 1, 0)
         layout.addWidget(self.input_baud, 1, 1)
 
-        # Marple Checkbox (Appearance change only)
-        # Note: The logic variable remains 'use_influx'
         self.chk_marple = QCheckBox("Enable Marple Logging")
         self.chk_marple.setStyleSheet(f"color: {F1_TEXT}; font-size: 11px;")
         self.chk_marple.setChecked(self.parent_ui.settings["use_influx"])
         layout.addWidget(self.chk_marple, 2, 0)
         
-        # Debug Checkbox
         self.chk_debug = QCheckBox("Enable Debug Output")
         self.chk_debug.setStyleSheet(f"color: {F1_TEXT}; font-size: 11px;")
         self.chk_debug.setChecked(self.parent_ui.settings["debug"])
         layout.addWidget(self.chk_debug, 3, 0)
         
-        # Button layout
+        # ADDED: Demo Mode Checkbox
+        self.chk_demo = QCheckBox("Enable Demo Mode (Simulated Data)")
+        self.chk_demo.setStyleSheet(f"color: {F1_ACCENT}; font-size: 11px; font-weight: bold;")
+        self.chk_demo.setChecked(self.parent_ui.settings["demo_mode"])
+        layout.addWidget(self.chk_demo, 4, 0, 1, 2)
+        
         btn_layout = QHBoxLayout()
         btn_ok = QPushButton("Apply & Close")
         btn_ok.setStyleSheet(parent.get_button_style('accent'))
         btn_ok.clicked.connect(self.accept)
         btn_layout.addWidget(btn_ok)
         
-        layout.addLayout(btn_layout, 4, 0, 1, 2)
+        layout.addLayout(btn_layout, 5, 0, 1, 2)
         self.setLayout(layout)
 
     def apply_f1_theme(self):
@@ -178,7 +177,6 @@ class SettingsDialog(QDialog):
                  default_idx = i
         
         if ports:
-            # Set the current/default port if it exists, otherwise select the first one
             self.combo_port.setCurrentIndex(default_idx if default_idx != -1 else 0)
         
     def get_settings(self):
@@ -193,6 +191,7 @@ class SettingsDialog(QDialog):
             "baud": baud,
             "use_influx": self.chk_marple.isChecked(),
             "debug": self.chk_debug.isChecked(),
+            "demo_mode": self.chk_demo.isChecked(),
         }
 
 # ============== MAIN WINDOW ==============
@@ -200,43 +199,37 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ISCmetrics - Formula Student Telemetry")
-        # Optimized for graphs
         self.setGeometry(100, 100, 1920, 1080) 
 
-        # --- Data setup
         self.settings = current_settings.copy()
+        self.demo_mode = self.settings["demo_mode"]
         
-        # Set window icon using the ICO file (FIX)
         icon_path_ico = Path("isc_logo.ico")
         if icon_path_ico.exists():
-            # This should fix the window icon
             self.setWindowIcon(QIcon(str(icon_path_ico)))
 
-        # --- Initialize UI and Theme ---
-        # The log must be initialized early to receive setup messages
         self.log_text: Optional[QTextEdit] = None 
         
         self.init_ui()
         self.apply_f1_theme()
         
-        # Data receiving thread
         self.rx_thread: Optional[threading.Thread] = None
         self.is_receiving = False
         
-        # Sub-windows
         self.settings_dialog: Optional[SettingsDialog] = None
         self.session_viewer: Optional['SessionViewerWindow'] = None
         
-        # Update timer - 0.5 seconds
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_displays)
         self.timer.start(500)
         
-        # Connect signals
         signaler.log_message.connect(self.append_log)
         
-        # Initial status logging
         self.append_log("UI Initialized. Ready to connect.")
+        
+        # Start demo if enabled in settings
+        if self.demo_mode:
+            self.activate_demo_mode()
 
     def get_input_style(self):
         """Reusable style for QLineEdit and QComboBox"""
@@ -319,32 +312,23 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(5)
         main_layout.setContentsMargins(10, 10, 10, 10)
         
-        # === BOTTOM SECTION: Single Consolidated Log (Must be created first to capture setup logs) ===
         log_frame = self.create_single_log_frame()
         
-        # === TOP SECTION: Compact Control Panel (Max Height 85) ===
         top_section = self.create_compact_top_section()
         main_layout.addWidget(top_section, stretch=1) 
         
-        # === MIDDLE SECTION: Tab widget with ALL panels (LARGER for graphs) ===
         self.tabs = QTabWidget()
         self.tabs.setFont(QFont("Arial", 10, QFont.Bold))
 
-        # Tab initialization
         self.tabs.addTab(self.create_overview_tab(), "Overview")
         self.tabs.addTab(self.create_ams_tab(), "AMS Modules")
         self.tabs.addTab(self.create_motor_tab(), "Motor")
         self.tabs.addTab(self.create_driver_tab(), "Driver")
         self.tabs.addTab(self.create_accu_tab(), "Accumulator")
         
-        # Stretch=8 gives 8 times the height allocation compared to the log panel
         main_layout.addWidget(self.tabs, stretch=8) 
-        
-        # === BOTTOM SECTION: Single Consolidated Log (Add to layout now) ===
-        # Stretch=1 gives a controlled, minimum height
         main_layout.addWidget(log_frame, stretch=1)
         
-        # === ATTRIBUTION ===
         attribution = QLabel("Andrés Sánchez de Ágreda © 2025/2026 - ICAI Racing Formula Student")
         attribution.setAlignment(Qt.AlignCenter)
         attribution.setStyleSheet(f"color: {F1_MID_BG}; font-size: 8px; padding: 2px;")
@@ -354,21 +338,18 @@ class MainWindow(QMainWindow):
         """Create super compact top section."""
         container = QFrame()
         container.setStyleSheet(f"background: {F1_DARK_BG}; border: 1px solid {F1_MID_BG}; border-radius: 3px;")
-        container.setMaximumHeight(85) # Reduced size
+        container.setMaximumHeight(85)
         
         main_layout = QHBoxLayout(container)
         main_layout.setSpacing(15)
         main_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 1. Logo + Mini-metrics (FIXED: Added stretch factor to ensure logo/text get enough horizontal space)
         logo_section = self.create_logo_section_compact()
         main_layout.addWidget(logo_section, stretch=1) 
         
-        # 2. Session Controls (Piloto/Circuito - Increased size)
         config_section = self.create_session_config_section()
         main_layout.addWidget(config_section, stretch=3)
         
-        # 3. Status indicator
         self.status_label = QLabel("IDLE")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setMinimumWidth(100)
@@ -383,43 +364,37 @@ class MainWindow(QMainWindow):
         """)
         main_layout.addWidget(self.status_label)
         
-        # 4. Action buttons
         buttons_section = self.create_buttons_section_compact()
         main_layout.addWidget(buttons_section, stretch=1)
         
         return container
     
     def create_logo_section_compact(self):
-        """Minimal logo section with image and mini-metrics. FIXED for display."""
+        """Minimal logo section with image and mini-metrics."""
         frame = QFrame()
-        frame.setMinimumWidth(180) # Ensure enough space is allocated
+        frame.setMinimumWidth(180)
         frame.setStyleSheet(f"background: {F1_DARK_BG}; border: none;")
         
         layout = QHBoxLayout(frame)
         layout.setSpacing(5)
         layout.setContentsMargins(3, 3, 3, 3)
         
-        # Logo Image (Top Left Corner)
         logo_label = QLabel()
-        # Resolve the logo path relative to this source file so it loads regardless of current working directory
         logo_path = Path(__file__).resolve().parent / "isc_logo.png"
         
         if logo_path.exists():
             pixmap = QPixmap(str(logo_path))
-            # Ensure the pixmap actually loaded; if not, fall back to text
             if not pixmap.isNull():
                 scaled_pixmap = pixmap.scaled(50, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 logo_label.setPixmap(scaled_pixmap)
-                logo_label.setMinimumSize(50, 50) # Ensure space even if scaled
+                logo_label.setMinimumSize(50, 50)
             else:
                 logo_label.setText("ISC")
                 logo_label.setStyleSheet(f"color: {F1_ACCENT}; font-size: 18px; font-weight: bold;")
-            
-        # Ensure image is left aligned within its slot
+        
         logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         layout.addWidget(logo_label)
         
-        # Text/Mini-Metrics
         metrics_layout = QVBoxLayout()
         metrics_layout.setSpacing(0)
         
@@ -439,7 +414,7 @@ class MainWindow(QMainWindow):
         return frame
 
     def create_session_config_section(self):
-        """Piloto/Circuito selection section (Increased size)"""
+        """Piloto/Circuito selection section"""
         frame = QFrame()
         layout = QGridLayout(frame)
         layout.setSpacing(5)
@@ -447,36 +422,33 @@ class MainWindow(QMainWindow):
         
         label_style = f"color: {F1_ACCENT}; font-size: 12px; font-weight: bold;"
         
-        # Row 1: Piloto
         lbl_pilot = QLabel("PILOT:")
         lbl_pilot.setStyleSheet(label_style)
         layout.addWidget(lbl_pilot, 0, 0)
         
         self.input_pilot = QLineEdit("Piloto_Test")
         self.input_pilot.setStyleSheet(self.get_input_style())
-        self.input_pilot.setMinimumWidth(200) # Increased size
+        self.input_pilot.setMinimumWidth(200)
         layout.addWidget(self.input_pilot, 0, 1)
         
-        # Row 2: Circuito
         lbl_circuit = QLabel("CIRCUIT:")
         lbl_circuit.setStyleSheet(label_style)
         layout.addWidget(lbl_circuit, 1, 0)
         
         self.input_circuit = QLineEdit("Circuito_Test")
         self.input_circuit.setStyleSheet(self.get_input_style())
-        self.input_circuit.setMinimumWidth(200) # Increased size
+        self.input_circuit.setMinimumWidth(200)
         layout.addWidget(self.input_circuit, 1, 1)
         
         return frame
 
     def create_buttons_section_compact(self):
-        """Compact action buttons with new 'Ajustes' button."""
+        """MODIFIED: Compact action buttons without demo button"""
         frame = QFrame()
         layout = QGridLayout(frame)
         layout.setSpacing(4)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Row 1: Controls
         self.btn_start = QPushButton("START")
         self.btn_start.setStyleSheet(self.get_button_style('accent'))
         self.btn_start.clicked.connect(self.start_reception)
@@ -488,8 +460,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_reception)
         layout.addWidget(self.btn_stop, 0, 1)
         
-        # Row 2: Utilities
-        self.btn_settings = QPushButton("Ajustes") # New Settings Button
+        self.btn_settings = QPushButton("Ajustes")
         self.btn_settings.setStyleSheet(self.get_button_style())
         self.btn_settings.clicked.connect(self.open_settings)
         layout.addWidget(self.btn_settings, 1, 0)
@@ -501,18 +472,53 @@ class MainWindow(QMainWindow):
         
         return frame
 
+    def activate_demo_mode(self):
+        """Activate demo mode"""
+        self.demo_mode = True
+        self.append_log("[DEMO] Demo mode ENABLED - Using simulated data")
+        demo.start_demo()
+        self.btn_start.setEnabled(False)
+        self.status_label.setText("TEST")
+        self.status_label.setStyleSheet(f"""
+            background: {F1_ACCENT}; 
+            color: {F1_DARK_BG}; 
+            font-size: 16px; 
+            font-weight: bold; 
+            padding: 8px 15px; 
+            border-radius: 4px;
+            border: 2px solid {F1_ACCENT};
+        """)
+    
+    def deactivate_demo_mode(self):
+        """Deactivate demo mode"""
+        self.demo_mode = False
+        self.append_log("[DEMO] Demo mode DISABLED - Ready for real data")
+        demo.stop_demo()
+        if not self.is_receiving:
+            self.btn_start.setEnabled(True)
+        self.status_label.setText("IDLE")
+        self.status_label.setStyleSheet(f"""
+            background: {F1_MID_BG}; 
+            color: {F1_TEXT}; 
+            font-size: 16px; 
+            font-weight: bold; 
+            padding: 8px 15px; 
+            border-radius: 4px;
+            border: 2px solid {F1_MID_BG};
+        """)
+
     def open_settings(self):
-        """Opens the new Settings dialog and updates internal settings."""
+        """Opens the Settings dialog and updates internal settings."""
         self.settings_dialog = SettingsDialog(self)
         
-        # Set initial values based on current settings
         if self.settings_dialog.exec_():
             new_settings = self.settings_dialog.get_settings()
             
-            # Update local settings
+            # Check if demo mode changed
+            demo_changed = new_settings["demo_mode"] != self.settings["demo_mode"]
+            
             self.settings.update(new_settings)
             
-            # Update global defaults for persistence (used when Main is restarted)
             global current_settings
             current_settings.update(new_settings)
             rtt.DEFAULT_PORT = new_settings['port']
@@ -520,18 +526,23 @@ class MainWindow(QMainWindow):
             rtt.INFLUX_ENABLE_DEFAULT = new_settings['use_influx']
             rtt.DEBUG_ENABLE_DEFAULT = new_settings['debug']
 
-            self.append_log(f"Settings updated: Port={self.settings['port']}, Baud={self.settings['baud']}, Marple={self.settings['use_influx']}, Debug={self.settings['debug']}")
+            self.append_log(f"Settings updated: Port={self.settings['port']}, Baud={self.settings['baud']}, Marple={self.settings['use_influx']}, Debug={self.settings['debug']}, Demo={self.settings['demo_mode']}")
+            
+            # Handle demo mode changes
+            if demo_changed:
+                if new_settings["demo_mode"]:
+                    self.activate_demo_mode()
+                else:
+                    self.deactivate_demo_mode()
 
     def create_overview_tab(self):
         """Create overview dashboard with greater vertical space for graphs."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Metrics grid (2 Rows x 4 Cols)
         metrics_grid = QGridLayout()
         metrics_grid.setSpacing(6)
         
-        # Row 1
         self.lbl_dc_bus = self.create_metric_label("DC BUS", "--- V", F1_ACCENT, compact=True)
         metrics_grid.addWidget(self.lbl_dc_bus, 0, 0)
         self.lbl_rpm = self.create_metric_label("RPM", "---", F1_ACCENT, compact=True)
@@ -541,7 +552,6 @@ class MainWindow(QMainWindow):
         self.lbl_current = self.create_metric_label("CURRENT", "--- A", F1_ACCENT, compact=True)
         metrics_grid.addWidget(self.lbl_current, 0, 3)
         
-        # Row 2
         self.lbl_min_cell = self.create_metric_label("MIN CELL V", "--- mV", F1_WARNING, compact=True)
         metrics_grid.addWidget(self.lbl_min_cell, 1, 0)
         self.lbl_stack = self.create_metric_label("STACK V", "--- V", F1_ACCENT, compact=True)
@@ -551,10 +561,8 @@ class MainWindow(QMainWindow):
         self.lbl_throttle = self.create_metric_label("THROTTLE", "--- %", F1_ACCENT, compact=True)
         metrics_grid.addWidget(self.lbl_throttle, 1, 3)
         
-        # Metrics use less vertical space (stretch=2)
         layout.addLayout(metrics_grid, stretch=2) 
         
-        # Plots use more vertical space (stretch=5)
         plot_layout = QHBoxLayout()
         self.plot_rpm = MplCanvas(title="RPM History", color=F1_ACCENT)
         plot_layout.addWidget(self.plot_rpm)
@@ -570,7 +578,6 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout()
         
-        # Global AMS stats
         global_stats = QGroupBox("GLOBAL BATTERY METRICS")
         global_layout = QGridLayout()
         
@@ -590,7 +597,6 @@ class MainWindow(QMainWindow):
         global_stats.setLayout(global_layout)
         layout.addWidget(global_stats)
         
-        # Module summary
         modules_group = QGroupBox("MODULE SUMMARY")
         modules_layout = QHBoxLayout()
         self.module_cards = []
@@ -714,7 +720,6 @@ class MainWindow(QMainWindow):
         self.accu_heatmaps = []
         for i in range(NUM_MODULES):
             heatmap = HeatmapCanvas(title=f"MODULE {i}")
-            # Layout the modules in 2 rows, 3 columns
             heatmap_layout.addWidget(heatmap, i // 3, i % 3)
             self.accu_heatmaps.append(heatmap)
         
@@ -762,7 +767,7 @@ class MainWindow(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(120) # Ensure it stays compact
+        self.log_text.setMaximumHeight(120)
         self.log_text.setStyleSheet(f"""
             background: {F1_DARK_BG}; 
             color: {F1_TEXT}; 
@@ -780,7 +785,6 @@ class MainWindow(QMainWindow):
         ports = rtt.list_serial_ports()
         
         if ports:
-            # Set the new default if the old one is no longer available or was None
             if self.settings["port"] not in [p[0] for p in ports]:
                 self.settings["port"] = ports[0][0]
                 self.append_log(f"Port auto-selected: {self.settings['port']}")
@@ -790,9 +794,9 @@ class MainWindow(QMainWindow):
         
     def start_reception(self):
         """Start data reception thread"""
-        if self.is_receiving: return
+        if self.is_receiving or self.demo_mode: 
+            return
         
-        # Pull settings from internal state
         piloto = self.input_pilot.text()
         circuito = self.input_circuit.text()
         port = self.settings["port"]
@@ -816,7 +820,7 @@ class MainWindow(QMainWindow):
         self.is_receiving = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.btn_settings.setEnabled(False) # Disable settings while running
+        self.btn_settings.setEnabled(False)
         
         def rx_worker():
             try:
@@ -830,11 +834,9 @@ class MainWindow(QMainWindow):
                     debug=debug
                 )
             except Exception as e:
-                # Log any runtime exception from the worker thread
                 signaler.log_message.emit(f"FATAL ERROR IN RX THREAD: {e}")
             finally:
                 self.is_receiving = False
-                # Re-enable buttons must happen in the main thread (done via timer check)
 
         self.rx_thread = threading.Thread(target=rx_worker, daemon=True)
         self.rx_thread.start()
@@ -844,33 +846,33 @@ class MainWindow(QMainWindow):
         if not self.is_receiving: return
         
         self.append_log("Stopping reception...")
-        rtt.new_data_flag = -1 # Signal the worker thread to stop
-        # Wait slightly for the thread to finish cleanly
+        rtt.new_data_flag = -1
         if self.rx_thread and self.rx_thread.is_alive():
             self.rx_thread.join(timeout=1.0)
             
         self.is_receiving = False
-        self.btn_start.setEnabled(True)
+        if not self.demo_mode:
+            self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_settings.setEnabled(True)
 
     def update_displays(self):
         """Update all displays with latest data"""
-        data = rtt.get_latest_data()
+        if self.demo_mode:
+            data = demo.get_latest_data()
+            status_info = {'badge': 'LIVE'}
+        else:
+            data = rtt.get_latest_data()
+            status_info = data.get("__STATUS__", {'badge': 'IDLE', 'reason': 'no data', 'ts': 0})
         
-        # Check if worker thread is running and update button states if it stopped unexpectedly
         if self.is_receiving and rtt.new_data_flag == -1:
              self.stop_reception()
         
-        # --- Update Status Badge ---
-        status_info = data.get("__STATUS__", {})
-        # If not receiving, show IDLE. If receiving, use the badge status.
-        badge = status_info.get("badge", "IDLE" if not self.is_receiving else "STALE")
-        
+        badge = status_info.get("badge", "IDLE" if not self.is_receiving and not self.demo_mode else "STALE")
         style = f"background: {F1_MID_BG}; font-size: 16px; font-weight: bold; padding: 8px 15px; border-radius: 4px;"
         
-        if badge == "LIVE":
-            self.status_label.setText("LIVE")
+        if badge == "LIVE" or self.demo_mode:
+            self.status_label.setText("LIVE" if not self.demo_mode else "DEMO")
             self.status_label.setStyleSheet(style + f"color: {F1_ACCENT}; border: 2px solid {F1_ACCENT};")
         elif badge == "STALE":
             self.status_label.setText("STALE")
@@ -882,83 +884,142 @@ class MainWindow(QMainWindow):
              self.status_label.setText("IDLE")
              self.status_label.setStyleSheet(style + f"color: {F1_TEXT}; border: 2px solid {F1_MID_BG};")
 
-
-        # --- Update Metrics (Overview Tab) ---
-        data_600 = data.get("0x600", {})
-        rpm = data_600.get('rpm', 0)
-        dc_bus = data_600.get('dc_bus_voltage', 0)
+        if self.demo_mode:
+            data_600 = data.get(0x600, {})
+            data_610 = data.get(0x610, {})
+            data_620 = data.get(0x620, {})
+            data_630 = data.get(0x630, {})
+            data_201 = data.get(0x201, {})
+            data_202 = data.get(0x202, {})
+            data_208 = data.get(0x208, {})
+            
+            rpm = data_600.get('rpm', 0)
+            dc_bus = data_600.get('dcbusvoltage', 0)
+            torque = data_600.get('torquetotal', 0)
+            cell_min_v = data_600.get('cellminv', 0)
+            throttle = data_630.get('throttle', 0)
+            current = data_610.get('iactual', 0)
+            stack_mv = data_202.get('stacktotalmv', 0)
+            max_temp = data_208.get('maxtempc', 0)
+            brake = data_630.get('brake', 0)
+            s1_raw = data_620.get('s1raw', 0)
+            s2_raw = data_620.get('s2raw', 0)
+            motor_temp = data_610.get('motortemp', 0)
+            
+        else:
+            data_600 = data.get("0x600", {})
+            data_610 = data.get("0x610", {})
+            data_620 = data.get("0x620", {})
+            data_630 = data.get("0x630", {})
+            
+            rpm = data_600.get('rpm', 0)
+            dc_bus = data_600.get('dc_bus_voltage', 0)
+            torque = data_600.get('torque_total', 0)
+            cell_min_v = data_600.get('cell_min_v', 0)
+            throttle = data_630.get('throttle', 0)
+            current = data_610.get('i_actual', 0)
+            
+            ams_summary = data.get("ams_summary", {})
+            stack_mv = ams_summary.get('stack_mv', 0)
+            
+            ams_temp = data.get("ams_temp_summary", {})
+            max_temp = ams_temp.get('max_temp_c', 0)
+            
+            brake = data_630.get('brake', 0)
+            s1_raw = data_620.get('s1_raw', 0)
+            s2_raw = data_620.get('s2_raw', 0)
+            motor_temp = data_610.get('motor_temp', 0)
         
         self.lbl_dc_bus.value_label.setText(f"{dc_bus:.1f} V")
         self.lbl_rpm.value_label.setText(f"{rpm:.0f}")
-        self.lbl_torque.value_label.setText(f"{data_600.get('torque_total', 0):.1f} Nm")
-        self.lbl_min_cell.value_label.setText(f"{data_600.get('cell_min_v', 0):.0f} mV")
-        
-        data_630 = data.get("0x630", {})
-        throttle = data_630.get('throttle', 0)
+        self.lbl_torque.value_label.setText(f"{torque:.1f} Nm")
+        self.lbl_min_cell.value_label.setText(f"{cell_min_v:.0f} mV")
         self.lbl_throttle.value_label.setText(f"{throttle:.1f} %")
-        
-        data_610 = data.get("0x610", {})
-        current = data_610.get('i_actual', 0)
         self.lbl_current.value_label.setText(f"{current:.1f} A")
-        
-        # Update AMS data
-        ams_summary = data.get("ams_summary", {})
-        stack_mv = ams_summary.get('stack_mv', 0)
         self.lbl_stack.value_label.setText(f"{stack_mv / 1000:.1f} V")
-        
-        ams_temp = data.get("ams_temp_summary", {})
-        max_temp = ams_temp.get('max_temp_c', 0)
         self.lbl_max_temp.value_label.setText(f"{max_temp:.0f} °C")
         
-        # --- Update Mini Metrics (Top Bar) ---
         speed_kmh = rpm * 0.05
         self.mini_speed.setText(f"{speed_kmh:.1f} km/h")
         self.mini_voltage.setText(f"{dc_bus:.1f} V")
         self.mini_temp.setText(f"{max_temp:.0f} °C")
         
-        # --- Update Global AMS stats (AMS Tab) ---
-        self.lbl_global_min.setText(f"Global Min: {rtt.ams_global_min_mv} mV")
-        self.lbl_global_max.setText(f"Global Max: {rtt.ams_global_max_mv} mV")
-        self.lbl_stack_total.setText(f"Stack Total: {rtt.ams_stack_total_mv / 1000:.1f} V")
-        self.lbl_ams_current.setText(f"Current: {rtt.ams_current_dA / 10:.1f} A")
+        if self.demo_mode:
+            self.lbl_global_min.setText(f"Global Min: {data_202.get('mincellmv', 0):.0f} mV")
+            self.lbl_global_max.setText(f"Global Max: {data_202.get('maxcellmv', 0):.0f} mV")
+            self.lbl_stack_total.setText(f"Stack Total: {data_202.get('stacktotalmv', 0) / 1000:.1f} V")
+            self.lbl_ams_current.setText(f"Current: {data_201.get('currentdA', 0) / 10:.1f} A")
+        else:
+            self.lbl_global_min.setText(f"Global Min: {rtt.ams_global_min_mv} mV")
+            self.lbl_global_max.setText(f"Global Max: {rtt.ams_global_max_mv} mV")
+            self.lbl_stack_total.setText(f"Stack Total: {rtt.ams_stack_total_mv / 1000:.1f} V")
+            self.lbl_ams_current.setText(f"Current: {rtt.ams_current_dA / 10:.1f} A")
         
-        # --- Update Module Cards (AMS Tab) ---
         now = time.time()
         for i, card in enumerate(self.module_cards):
-            mod = rtt.get_ams_module_data(i)
-            if mod:
-                card.lbl_min_v.setText(f"Min: {mod.min_cell_mv} mV")
-                card.lbl_max_v.setText(f"Max: {mod.max_cell_mv} mV")
-                card.lbl_min_t.setText(f"Min T: {mod.min_temp_c:.0f} °C")
-                card.lbl_max_t.setText(f"Max T: {mod.max_temp_c:.0f} °C")
-                age = now - mod.last_update_ts
-                card.lbl_age.setText(f"Age: {age:.1f}s")
+            if self.demo_mode:
+                mod = demo.get_ams_module_data(i)
+                if mod:
+                    voltages = mod.get('voltages', [])
+                    temps = mod.get('tempsc', [])
+                    if voltages and temps:
+                        card.lbl_min_v.setText(f"Min: {min(voltages):.0f} mV")
+                        card.lbl_max_v.setText(f"Max: {max(voltages):.0f} mV")
+                        card.lbl_min_t.setText(f"Min T: {min(temps):.0f} °C")
+                        card.lbl_max_t.setText(f"Max T: {max(temps):.0f} °C")
+                        card.lbl_age.setText(f"Age: 0.0s")
+            else:
+                mod = rtt.get_ams_module_data(i)
+                if mod:
+                    card.lbl_min_v.setText(f"Min: {mod.min_cell_mv} mV")
+                    card.lbl_max_v.setText(f"Max: {mod.max_cell_mv} mV")
+                    card.lbl_min_t.setText(f"Min T: {mod.min_temp_c:.0f} °C")
+                    card.lbl_max_t.setText(f"Max T: {mod.max_temp_c:.0f} °C")
+                    age = now - mod.last_update_ts
+                    card.lbl_age.setText(f"Age: {age:.1f}s")
         
-        # --- Update Plots and Other Tabs ---
+        self.motor_lbl_rpm.value_label.setText(f"{rpm:.0f}")
+        self.motor_lbl_torque.value_label.setText(f"{torque:.1f} Nm")
+        self.motor_lbl_current.value_label.setText(f"{current:.1f} A")
+        self.motor_lbl_temp.value_label.setText(f"{motor_temp:.0f} °C")
+        
+        self.driver_lbl_throttle.value_label.setText(f"{throttle:.1f} %")
+        self.driver_lbl_brake.value_label.setText(f"{brake:.1f} %")
+        self.driver_lbl_s1.value_label.setText(f"{s1_raw:.0f}")
+        self.driver_lbl_s2.value_label.setText(f"{s2_raw:.0f}")
+        
         self.plot_rpm.update_plot(rpm)
-        self.plot_voltage.update_plot(data_600.get('cell_min_v', 0))
+        self.plot_voltage.update_plot(cell_min_v)
         self.plot_temp.update_plot(max_temp)
         
-        self.motor_plot_torque.update_plot(data_600.get('torque_total', 0))
+        self.motor_plot_torque.update_plot(torque)
         self.motor_plot_current.update_plot(current)
         
-        brake = data_630.get('brake', 0)
         self.driver_plot_throttle.update_plot(throttle)
         self.driver_plot_brake.update_plot(brake)
         
         self.accu_lbl_stack.value_label.setText(f"{stack_mv / 1000:.1f} V")
-        self.accu_lbl_current.value_label.setText(f"{rtt.ams_current_dA / 10:.1f} A")
-        self.accu_lbl_min_cell.value_label.setText(f"{rtt.ams_global_min_mv} mV")
+        if self.demo_mode:
+            self.accu_lbl_current.value_label.setText(f"{data_201.get('currentdA', 0) / 10:.1f} A")
+            self.accu_lbl_min_cell.value_label.setText(f"{data_202.get('mincellmv', 0):.0f} mV")
+        else:
+            self.accu_lbl_current.value_label.setText(f"{rtt.ams_current_dA / 10:.1f} A")
+            self.accu_lbl_min_cell.value_label.setText(f"{rtt.ams_global_min_mv} mV")
         self.accu_lbl_max_temp.value_label.setText(f"{max_temp:.0f} °C")
-        for i, heatmap in enumerate(self.accu_heatmaps):
-            mod = rtt.get_ams_module_data(i)
-            if mod:
-                heatmap.update_heatmap(mod.temps_c)
         
-        # Update consolidated log with latest raw data
-        if rtt.new_data_flag == 1:
+        for i, heatmap in enumerate(self.accu_heatmaps):
+            if self.demo_mode:
+                mod = demo.get_ams_module_data(i)
+                if mod:
+                    heatmap.update_heatmap(mod.get('tempsc', []))
+            else:
+                mod = rtt.get_ams_module_data(i)
+                if mod:
+                    heatmap.update_heatmap(mod.temps_c)
+        
+        if not self.demo_mode and rtt.new_data_flag == 1:
             self.append_log(rtt.data_str)
-            rtt.new_data_flag = 0 # Reset flag
+            rtt.new_data_flag = 0
 
     def append_log(self, msg: str):
         """Append message to log window"""
@@ -966,9 +1027,8 @@ class MainWindow(QMainWindow):
             ts = datetime.now().strftime("%H:%M:%S")
             self.log_text.append(f"[{ts}] {msg}")
             
-            # Keep log concise
             doc = self.log_text.document()
-            max_blocks = 20 # Keep up to 20 lines for debug visibility
+            max_blocks = 20
             while doc.blockCount() > max_blocks:
                 cursor = self.log_text.textCursor()
                 cursor.movePosition(cursor.Start)
@@ -977,7 +1037,6 @@ class MainWindow(QMainWindow):
                 cursor.deleteChar()
             
     def open_log_viewer(self):
-        # Redirects the deprecated log viewer button to show the consolidated log info.
         QMessageBox.information(self, "Log Viewer", "The system log and debug output are now consolidated at the bottom of the main window.")
         
     def open_session_viewer(self):
@@ -992,6 +1051,8 @@ class MainWindow(QMainWindow):
         if self.is_receiving:
             self.stop_reception()
             time.sleep(0.5)
+        if self.demo_mode:
+            demo.stop_demo()
         event.accept()
 
 # ============== SESSION VIEWER WINDOW ==============
@@ -1016,7 +1077,6 @@ class SessionViewerWindow(QWidget):
     def init_ui(self):
         layout = QHBoxLayout()
         
-        # Left panel
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         
@@ -1037,7 +1097,6 @@ class SessionViewerWindow(QWidget):
         left_panel.setLayout(left_layout)
         left_panel.setMaximumWidth(300)
         
-        # Right panel
         right_panel = QWidget()
         right_layout = QVBoxLayout()
         
@@ -1117,7 +1176,6 @@ class SessionViewerWindow(QWidget):
             
             plot_layout = QGridLayout()
             
-            # Simple logic to plot first two numeric columns if available
             numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col]) and col not in ['module_id']]
             
             if len(numeric_cols) >= 1:
@@ -1195,11 +1253,9 @@ class HeatmapCanvas(FigureCanvas):
         self.ax.set_facecolor(PLOT_BG)
         self.ax.set_title(title, color=F1_TEXT, fontsize=10, fontweight='bold')
         super().__init__(self.fig)
-        # Reshape to approx 6 cells x 7 cells grid (38 total cells per module)
         self.grid_data = np.zeros((7, 6)) 
         self.im = self.ax.imshow(self.grid_data, cmap='viridis', vmin=20, vmax=60, aspect='auto')
         
-        # Style the colorbar for the new theme
         cbar = self.fig.colorbar(self.im, ax=self.ax)
         cbar.set_label('°C', color=F1_TEXT)
         cbar.ax.yaxis.set_tick_params(color=F1_TEXT)
@@ -1211,9 +1267,8 @@ class HeatmapCanvas(FigureCanvas):
     
     def update_heatmap(self, temps):
         temps_array = np.array(temps[:TEMPS_PER_MODULE])
-        temps_array = np.nan_to_num(temps_array, nan=20.0) # Set NaN/invalid to 20C (low value)
+        temps_array = np.nan_to_num(temps_array, nan=20.0)
         
-        # Pad or truncate to the size of our visualization grid (42 points for 7x6)
         target_size = 42
         if len(temps_array) < target_size:
              padded = np.pad(temps_array, (0, target_size - len(temps_array)), constant_values=20.0)
