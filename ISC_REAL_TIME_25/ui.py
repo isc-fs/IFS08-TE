@@ -17,11 +17,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
+import math
 matplotlib.use("Qt5Agg")
 
 from PyQt5 import QtCore, QtWidgets, QtGui
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap, QIcon
+from PyQt5.QtWidgets import QProgressBar
+from PyQt5.QtGui import QPainter
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QWidget, QLabel, QPushButton, QLineEdit, QComboBox, QTextEdit,
@@ -221,7 +225,7 @@ class MainWindow(QMainWindow):
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_displays)
-        self.timer.start(500)
+        
         
         signaler.log_message.connect(self.append_log)
         
@@ -230,6 +234,8 @@ class MainWindow(QMainWindow):
         # Start demo if enabled in settings
         if self.demo_mode:
             self.activate_demo_mode()
+        
+        self.timer.start(500)
 
     def get_input_style(self):
         """Reusable style for QLineEdit and QComboBox"""
@@ -325,6 +331,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.create_motor_tab(), "Motor")
         self.tabs.addTab(self.create_driver_tab(), "Driver")
         self.tabs.addTab(self.create_accu_tab(), "Accumulator")
+        self.tabs.addTab(self.create_dynamics_tab(), "Dynamics")
+
         
         main_layout.addWidget(self.tabs, stretch=8) 
         main_layout.addWidget(log_frame, stretch=1)
@@ -727,6 +735,64 @@ class MainWindow(QMainWindow):
         
         return widget
     
+    def create_dynamics_tab(self):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        # G-force IMU Panel
+        gbox_g = QGroupBox("IMU G-Forces (Long / Lat)")
+        v_g = QVBoxLayout(gbox_g)
+        self.g_circle = GCircleWidget()
+        v_g.addWidget(self.g_circle)
+        self.g_long_label = QLabel("Longitudinal G: 0.00")
+        self.g_lat_label = QLabel("Lateral G: 0.00")
+        self.g_total_label = QLabel("Total G: 0.00")
+        for l in (self.g_long_label, self.g_lat_label, self.g_total_label):
+            l.setStyleSheet(f"color: {F1_ACCENT}; font-size: 12px;")
+            v_g.addWidget(l)
+        layout.addWidget(gbox_g, 1)
+        # Suspension
+        gbox_susp = QGroupBox("Suspension Forces & Travel")
+        v_s = QVBoxLayout(gbox_susp)
+        self.s_susp_force = []
+        self.s_susp_travel = []
+        for i, pos in enumerate(['FL','FR','RL','RR']):
+            bar1 = QProgressBar()
+            bar1.setMaximum(1000)
+            bar1.setStyleSheet("QProgressBar {background: #222; color: #90ee90; border-radius: 2px;}"
+                            "QProgressBar::chunk {background-color: #008000;}")
+            lbl1 = QLabel(f"{pos} Force: 0N")
+            v_s.addWidget(lbl1)
+            v_s.addWidget(bar1)
+            self.s_susp_force.append((lbl1, bar1))
+            bar2 = QProgressBar()
+            bar2.setMaximum(100)
+            bar2.setStyleSheet("QProgressBar {background: #222; color: #00d4ff; border-radius: 2px;}"
+                            "QProgressBar::chunk {background-color: #005580;}")
+            lbl2 = QLabel(f"{pos} Travel: 0mm")
+            v_s.addWidget(lbl2)
+            v_s.addWidget(bar2)
+            self.s_susp_travel.append((lbl2, bar2))
+        layout.addWidget(gbox_susp, 1)
+        # Brake temp
+        gbox_brake = QGroupBox("Brake Disc Temperatures (°C)")
+        v_b = QVBoxLayout(gbox_brake)
+        self.brake_temp_widgets = []
+        for i, pos in enumerate(['FL','FR','RL','RR']):
+            disc = BrakeDiscWidget()
+            temp_lbl = QLabel("0°C")
+            temp_lbl.setStyleSheet("font-size:14px;font-weight:bold;")
+            h_lay = QHBoxLayout()
+            h_lay.addWidget(QLabel(pos))
+            h_lay.addWidget(disc)
+            h_lay.addWidget(temp_lbl)
+            v_b.addLayout(h_lay)
+            self.brake_temp_widgets.append((disc, temp_lbl))
+        layout.addWidget(gbox_brake, 1)
+        return widget
+
+    
+    
+    
     def create_metric_label(self, title, value, color, compact=False):
         """Create a styled metric display label with F1 aesthetic"""
         frame = QFrame()
@@ -858,6 +924,7 @@ class MainWindow(QMainWindow):
 
     def update_displays(self):
         """Update all displays with latest data"""
+        
         if self.demo_mode:
             data = demo.get_latest_data()
             status_info = {'badge': 'LIVE'}
@@ -1020,6 +1087,38 @@ class MainWindow(QMainWindow):
         if not self.demo_mode and rtt.new_data_flag == 1:
             self.append_log(rtt.data_str)
             rtt.new_data_flag = 0
+        # Dynamics GUI update
+        d_imu = data.get(0x700, {})
+        g_long = d_imu.get('g_long', 0.0)
+        g_lat = d_imu.get('g_lat', 0.0)
+        g_tot = d_imu.get('g_total', 0.0)
+        self.g_circle.set_g_force(g_long, g_lat)
+        self.g_long_label.setText(f"Longitudinal G: {g_long:+.2f}")
+        self.g_lat_label.setText(f"Lateral G: {g_lat:+.2f}")
+        self.g_total_label.setText(f"Total G: {g_tot:.2f}")
+        d_susp = data.get(0x710, {})
+        s_forces = d_susp.get('susp_forces', [0,0,0,0])
+        s_travel = d_susp.get('susp_travel', [0,0,0,0])
+        for i in range(4):
+            lbl, bar = self.s_susp_force[i]
+            lbl.setText(f"{['FL','FR','RL','RR'][i]} Force: {int(s_forces[i])}N")
+            bar.setValue(min(int(abs(s_forces[i])), 1000))
+            lbl2, bar2 = self.s_susp_travel[i]
+            lbl2.setText(f"{['FL','FR','RL','RR'][i]} Travel: {int(s_travel[i])}mm")
+            bar2.setValue(min(int(s_travel[i]), 100))
+        d_brake = data.get(0x720, {})
+        brake_temps = [
+            d_brake.get('brake_temp_fl', 0),
+            d_brake.get('brake_temp_fr', 0),
+            d_brake.get('brake_temp_rl', 0),
+            d_brake.get('brake_temp_rr', 0)
+        ]
+        for i, (disc, lbl) in enumerate(self.brake_temp_widgets):
+            disc.set_temp(brake_temps[i])
+            lbl.setText(f"{int(brake_temps[i])}°C")
+
+
+                
 
     def append_log(self, msg: str):
         """Append message to log window"""
@@ -1054,6 +1153,8 @@ class MainWindow(QMainWindow):
         if self.demo_mode:
             demo.stop_demo()
         event.accept()
+
+    
 
 # ============== SESSION VIEWER WINDOW ==============
 class SessionViewerWindow(QWidget):
@@ -1280,6 +1381,69 @@ class HeatmapCanvas(FigureCanvas):
         self.im.set_clim(vmin=max(20, grid[grid > 20].min() if grid[grid > 20].size > 0 else 20), 
                          vmax=min(60, grid.max()))
         self.draw()
+
+class GCircleWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.g_long = 0.0
+        self.g_lat = 0.0
+        self.setMinimumSize(160,160)
+        self.setMaximumSize(220,220)
+    def set_g_force(self, g_long, g_lat):
+        self.g_long = g_long
+        self.g_lat = g_lat
+        self.update()
+    def paintEvent(self, event):
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        radii = [1, 1.5, 2]
+        center = QtCore.QPointF(w/2,h/2)
+        scale = min(w, h) / 2.4
+        base_col = QColor(180,180,180)
+        accent_col = QColor(0,200,0)
+        qp.setPen(QtGui.QPen(base_col, 2))
+        for mult in radii:
+            qp.drawEllipse(center, scale*mult/2, scale*mult/2)
+        qp.drawEllipse(center, 5, 5)
+        qp.setPen(QtGui.QPen(accent_col, 5))
+        qp.drawLine(center.x(), center.y(), center.x(), center.y()-scale)
+        qp.drawLine(center.x(), center.y(), center.x(), center.y()+scale)
+        qp.drawLine(center.x(), center.y(), center.x()-scale, center.y())
+        qp.drawLine(center.x(), center.y(), center.x()+scale, center.y())
+        point_x = center.x() + self.g_lat*scale
+        point_y = center.y() - self.g_long*scale
+        qp.setBrush(QtGui.QBrush(QColor(250,230,100)))
+        qp.setPen(QtGui.QPen(QColor(230,200,50), 7))
+        qp.drawEllipse(QtCore.QPointF(point_x, point_y), 12, 12)
+
+class BrakeDiscWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.temp = 40.0
+        self.setMinimumSize(36,36)
+        self.setMaximumSize(42,42)
+    def set_temp(self, temp):
+        self.temp = temp
+        self.update()
+    def paintEvent(self, event):
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        r = min(w,h)/2 - 3
+        center = QtCore.QPointF(w/2,h/2)
+        color = QtGui.QColor.fromHsvF(
+            min(0.15+max(self.temp-100,0)/700.0*0.9,1), 1.0, 1.0
+        )
+        qp.setPen(QtGui.QPen(QtGui.QColor(100,100,100), 2))
+        qp.setBrush(QtGui.QBrush(color))
+        qp.drawEllipse(center, r, r)
+        qp.setPen(QtGui.QPen(QtGui.QColor(20,20,20), 1))
+        for i in range(8):
+            angle = 2*math.pi*i/8
+            dx, dy = math.cos(angle)*r*0.6, math.sin(angle)*r*0.6
+            qp.drawEllipse(center+QtCore.QPointF(dx,dy), 2, 2)
+
 
 # ============== MAIN ==============
 def main():
