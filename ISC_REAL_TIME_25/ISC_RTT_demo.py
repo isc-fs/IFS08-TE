@@ -1,434 +1,405 @@
 """
 ISC_RTT_demo.py
-Demo data generator for ISC Formula Student Telemetry System
-Simulates realistic CAN bus data for AMS, Inverter, Motor, Driver, and Dynamics/IMU/Suspension
-Author: Andrés Sánchez de Ojeda 2025-2026
+Advanced Physics Simulator for ISC Formula Student Telemetry.
+UPDATES:
+- Dynamic Brake Temperatures (Heating vs Cooling Airflow).
+- Battery Voltage: 400V -> 360V range.
+- CSV Logging & Marple Upload integrated.
 """
 
 import time
 import threading
 import random
 import math
+import csv
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any
+import isc_marple 
+
+# --- CONFIGURACIÓN ---
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+class DemoCSVLogger:
+    def __init__(self, piloto, circuito):
+        self.timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.filename = LOG_DIR / f"ISC_DEMO_{self.timestamp_str}_{piloto}_{circuito}.csv"
+        self.piloto = piloto
+        self.circuito = circuito
+        
+        self.file = open(self.filename, 'w', newline='')
+        self.writer = csv.writer(self.file)
+        self.record_count = 0
+        
+        # CABECERAS (Flat format for Marple)
+        self.headers = [
+            "time", "time_elapsed_s",
+            # 0x600 - Main
+            "dc_bus_voltage", "rpm", "torque_total", "cell_min_v", "throttle_raw1", "throttle_raw2",
+            # 0x610 - Motor
+            "motor_temp", "pwrstg_temp", "air_temp", "n_actual", "i_actual",
+            # 0x620 - Driver Raw
+            "s1_raw", "s2_raw", "brake_raw", "precharge_btn", "start_btn",
+            # 0x630 - Driver Proc
+            "torque_req", "torque_est", "throttle_pct", "brake_pct",
+            # AMS
+            "ams_min_cell_mv", "ams_max_cell_mv", "ams_stack_v", "ams_current_a", 
+            "ams_max_temp_c", "ams_min_temp_c", "ams_avg_temp_c",
+            # Dynamics
+            "g_long", "g_lat", "g_total",
+            "susp_force_fl", "susp_force_fr", "susp_force_rl", "susp_force_rr",
+            "susp_travel_fl", "susp_travel_fr", "susp_travel_rl", "susp_travel_rr",
+            "brake_temp_fl", "brake_temp_fr", "brake_temp_rl", "brake_temp_rr"
+        ]
+        self.writer.writerow(self.headers)
+        print(f"[DEMO] CSV creado: {self.filename}")
+
+    def log(self, data: Dict[int, Any], elapsed_time: float):
+        ts_now = datetime.now().isoformat()
+        
+        d600 = data.get(0x600, {})
+        d610 = data.get(0x610, {})
+        d620 = data.get(0x620, {})
+        d630 = data.get(0x630, {})
+        d202 = data.get(0x202, {}) 
+        d208 = data.get(0x208, {}) 
+        d201 = data.get(0x201, {}) 
+        d650 = data.get(0x650, {}) 
+        d660 = data.get(0x660, {}) 
+        d670 = data.get(0x670, {}) 
+        
+        s_forces = d660.get('susp_forces', [0]*4)
+        s_travel = d660.get('susp_travel', [0]*4)
+        
+        row = [
+            ts_now, f"{elapsed_time:.3f}",
+            d600.get('dcbusvoltage', 0), d600.get('rpm', 0), d600.get('torquetotal', 0),
+            d600.get('cellminv', 0), d600.get('throttleraw1', 0), d600.get('throttleraw2', 0),
+            
+            d610.get('motortemp', 0), d610.get('pwrstgtemp', 0), d610.get('airtemp', 0),
+            d610.get('nactual', 0), d610.get('iactual', 0),
+            
+            d620.get('s1raw', 0), d620.get('s2raw', 0), d620.get('brakeraw', 0),
+            d620.get('prechargebutton', 0), d620.get('startbutton', 0),
+            
+            d630.get('torquereq', 0), d630.get('torqueest', 0), d630.get('throttle', 0), d630.get('brake', 0),
+            
+            d202.get('mincellmv', 0), d202.get('maxcellmv', 0), d202.get('stacktotalmv', 0)/1000.0,
+            d201.get('currentdA', 0)/10.0, d208.get('maxtempc', 0), d208.get('mintempc', 0), d208.get('avgtempc', 0),
+            
+            d650.get('g_long', 0), d650.get('g_lat', 0), d650.get('g_total', 0),
+            s_forces[0], s_forces[1], s_forces[2], s_forces[3],
+            s_travel[0], s_travel[1], s_travel[2], s_travel[3],
+            d670.get('brake_temp_fl', 0), d670.get('brake_temp_fr', 0),
+            d670.get('brake_temp_rl', 0), d670.get('brake_temp_rr', 0)
+        ]
+        
+        self.writer.writerow(row)
+        self.record_count += 1
+        if self.record_count % 50 == 0: self.file.flush()
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            print(f"[DEMO] CSV Cerrado. Filas: {self.record_count}")
+            return str(self.filename)
+        return None
 
 class DemoDataGenerator:
     def __init__(self):
         self.running = False
         self.thread = None
         self.lock = threading.Lock()
-        # Car specs and simulation constants
-        self.MAX_POWER_KW = 85.0
-        self.MAX_TORQUE_NM = 230.0
-        self.MAX_RPM = 12000.0
-        self.MAX_SPEED_KPH = 170.0
-        self.NUM_CELLS = 95
-        self.CELL_MAX_V = 4.2
-        self.CELL_MIN_V = 3.6
-        self.BATTERY_MAX_V = self.NUM_CELLS * self.CELL_MAX_V  # 399V
-        self.BATTERY_MIN_V = 360.0
-        self.BATTERY_CAPACITY_AH = 6.0
-        self.BATTERY_ENERGY_WH = self.BATTERY_MAX_V * self.BATTERY_CAPACITY_AH  # ~2.4kWh
-        self.VEHICLE_MASS_KG = 250.0
-
-        # Physics state
+        self.logger = None
+        self.upload_to_marple = False
+        
+        # --- CAR PHYSICS CONSTANTS ---
+        self.MASS = 280.0       
+        self.MAX_TORQUE = 230.0 
+        self.MAX_POWER = 80000  
+        self.MAX_SPEED = 150.0 / 3.6 
+        self.DRAG_COEFF = 0.9   
+        self.WHEEL_RADIUS = 0.25 
+        self.GEAR_RATIO = 3.5
+        
+        # --- BATTERY MODEL ---
+        self.BATTERY_MAX_V = 400.0
+        self.BATTERY_MIN_V = 360.0 
+        self.internal_resistance = 0.12 
+        
+        # --- STATE VARIABLES ---
         self.time_elapsed = 0.0
-        self.session_start_time = time.time()
-        self.lap_time = 90.0  # s
-        self.lap_progress = 0.0
-        self.total_energy_used_wh = 0.0
-        self.state_of_charge = 100.0
-
-        # Telemetry
-        self.speed_kmh = 0.0
-        self.rpm = 0.0
-        self.throttle = 0.0
-        self.brake = 0.0
-        self.torque = 0.0
+        self.dt = 0.05 
+        
+        # Dynamic State
+        self.speed_ms = 0.0
+        self.dist_m = 0.0
+        self.throttle_cmd = 0.0 
+        self.brake_cmd = 0.0    
+        
+        # Electrical State
+        self.voltage_open_circuit = 400.0 
+        self.voltage_load = 400.0
         self.current = 0.0
-
-        self.dc_bus_voltage = self.BATTERY_MAX_V
-        self.dc_bus_power = 0.0
-
-        # AMS values
-        self.ams_current_dA = 0.0
-        self.ams_global_max_mv = self.CELL_MAX_V * 1000
-        self.ams_global_min_mv = self.CELL_MAX_V * 1000
-        self.ams_stack_total_mv = self.BATTERY_MAX_V * 1000
-        self.ams_max_temp_c = 25.0
-        self.ams_min_temp_c = 25.0
-        self.ams_avg_temp_c = 25.0
-
-        # Module/cell/thermal simulation
-        self.modules = []
-        for mod_id in range(5):
-            module = {
-                'id': mod_id,
-                'cell_voltages': [self.CELL_MAX_V * 1000 + random.uniform(-10, 10) for _ in range(19)],
-                'temperatures': [25.0 + random.uniform(-1, 1) for _ in range(38)],
-                'base_temp': 25.0
-            }
-            self.modules.append(module)
-
-        # Motor/Inverter/etc
-        self.motor_temp = 40.0
-        self.igbt_temp = 35.0
-        self.air_temp = 20.0
-
-        self.throttle_raw1 = 1500
-        self.throttle_raw2 = 1520
-        self.brake_raw = 800
-        self.precharge_button = 0
-        self.start_button = 0
-        self.suspension = [50.0 for _ in range(4)]
-
-        # DYNAMICS: IMU, Suspension, Brake temp
-        self.imu_g_lat = 0.0
-        self.imu_g_long = 0.0
-        self.imu_g_total = 0.0
-        self.susp_force = [0.0] * 4
-        self.susp_travel = [40.0] * 4
-        self.brake_temps = [40.0] * 4
-
-        self.system_status = 2
-        self.error_code = 0
+        
+        # Thermal State
+        self.pack_temp = 25.0
+        self.inverter_temp = 30.0
+        self.motor_temp = 35.0
+        self.ambient_temp = 25.0
+        
+        # Dynamics
+        self.g_lat = 0.0
+        self.g_long = 0.0
+        self.susp_travel = [40.0]*4
+        self.brake_temps = [25.0]*4 # Initialize at ambient
+        
         self.data = {}
 
-        # Barcelona Catalunya "circuit profile"
-        self.circuit_profile = [
-            (0.00, 120,  0.10),   # (progress, target speed kph, turn radius G)
-            (0.10, 70,   0.90),   # Heavy right
-            (0.13, 90,   0.40),   # Exit right
-            (0.23, 132,  0.25),   # Fast left
-            (0.36, 60,   0.70),   # Heavy left
-            (0.44, 85,   0.25),   # Exit
-            (0.53, 120,  0.15),   # Back straight
-            (0.65, 65,   0.85),   # Heavy right
-            (0.70, 95,   0.27),   # Exit
-            (0.77, 130,  0.15),   # Very fast
-            (0.87, 80,   0.65),   # Chicane, double turn
-            (0.95, 120,  0.40),   # Final turn exit
-            (1.00, 135,  0.10)
+        # --- TRACK PROFILE ---
+        self.track_segments = [
+            (300, 150, 0),   # Recta principal
+            (60,  60,  0),   # Frenada
+            (90,  60,  25),  # Curva cerrada
+            (150, 110, 0),   # Recta corta
+            (140, 90,  40),  # Curva larga
+            (50,  120, 0),   # Salida
+            (70,  50,  15),  # Horquilla
+            (250, 145, 0),   # Recta trasera
         ]
+        self.total_track_len = sum(s[0] for s in self.track_segments)
 
-    def start(self):
-        if self.running:
-            return
+    def start(self, use_marple=False, piloto="Demo", circuito="Track"):
+        if self.running: return
         self.running = True
-        self.session_start_time = time.time()
-        self.total_energy_used_wh = 0.0
-        self.thread = threading.Thread(target=self._generation_loop, daemon=True)
+        self.upload_to_marple = use_marple
+        
+        # Reset State
+        self.time_elapsed = 0.0
+        self.dist_m = 0.0
+        self.voltage_open_circuit = 400.0
+        self.pack_temp = 25.0
+        self.speed_ms = 0.0
+        self.brake_temps = [25.0] * 4 # RESET BRAKES TO COOL
+        
+        self.logger = DemoCSVLogger(piloto, circuito)
+        self.thread = threading.Thread(target=self._physics_loop, daemon=True)
         self.thread.start()
-        print("[DEMO] Started")
+        print(f"[DEMO] Physics Engine Started. V_batt: 400->360V. Active Brake Thermal Model.")
 
     def stop(self):
         self.running = False
         if self.thread:
             self.thread.join(timeout=2.0)
+        
+        if self.logger:
+            file_path = self.logger.close()
+            if self.upload_to_marple and file_path:
+                print("[DEMO] Iniciando subida a Marple...")
+                meta = {"piloto": self.logger.piloto, "circuito": self.logger.circuito, "type": "DemoSim"}
+                isc_marple.upload_session_csv(file_path, meta)
+            self.logger = None
 
-    def _generation_loop(self):
-        update_rate = 0.05  # 20Hz
+    def _get_current_segment(self, distance):
+        d_accum = 0
+        dist_in_lap = distance % self.total_track_len
+        for length, target_kph, radius in self.track_segments:
+            if dist_in_lap < d_accum + length:
+                segment_progress = (dist_in_lap - d_accum) / length
+                return target_kph, radius, segment_progress, length
+            d_accum += length
+        return 0, 0, 0, 0
+
+    def _physics_loop(self):
         while self.running:
-            start_time = time.time()
-            self._update_vehicle_dynamics(update_rate)
-            with self.lock:
-                self._update_can_data()
-            time.sleep(max(0, update_rate - (time.time() - start_time)))
-            self.time_elapsed += update_rate
+            start_t = time.time()
+            
+            # 1. Driver Logic
+            target_kph, radius, progress, seg_len = self._get_current_segment(self.dist_m)
+            target_ms = target_kph / 3.6
+            dist_to_end = seg_len * (1.0 - progress)
+            speed_error = target_ms - self.speed_ms
+            
+            brake_zone = False
+            if radius == 0 and dist_to_end < 80 and self.speed_ms > 25: 
+                brake_zone = True
 
-    def _get_profile_section(self, position):
-        for i in range(len(self.circuit_profile) - 1):
-            if self.circuit_profile[i][0] <= position <= self.circuit_profile[i + 1][0]:
-                return self.circuit_profile[i], self.circuit_profile[i + 1]
-        return self.circuit_profile[-2], self.circuit_profile[-1]
-
-    def _update_vehicle_dynamics(self, dt):
-        self.lap_progress = (self.time_elapsed % self.lap_time) / self.lap_time
-        # Interpolate speed and G target from circuit profile
-        (p1, s1, g1), (p2, s2, g2) = self._get_profile_section(self.lap_progress)
-        pratio = (self.lap_progress - p1) / (p2 - p1) if p2 != p1 else 0
-        target_speed = s1 + (s2 - s1) * pratio  # [kph]
-        target_g_lat = g1 + (g2 - g1) * pratio  # [fraction, 0=straight, >0 sharp turn]
-        cornering = target_g_lat > 0.2
-
-        speed_error = target_speed - self.speed_kmh
-        # Throttle/Brake logic
-        if speed_error > 5:
-            self.throttle = min(100.0, max(30.0, speed_error * 1.5))
-            self.brake = 0.0
-        elif speed_error < -5:
-            self.throttle = 0.0
-            self.brake = min(100.0, abs(speed_error) * 2.0)
-        else:
-            self.throttle = 40.0 + random.uniform(-6, 6)
-            self.brake = 0.0
-        self.throttle = max(0, min(100, self.throttle))
-        self.brake = max(0, min(100, self.brake))
-
-        # Torque curve / power limit (flat until base rpm)
-        base_rpm = 6000.0
-        wheel_diam = 0.51
-        final_drive = 3.5
-        if self.rpm < base_rpm:
-            avail_torque = self.MAX_TORQUE_NM
-        else:
-            avail_torque = (self.MAX_POWER_KW * 9549.0) / self.rpm if self.rpm > 0 else self.MAX_TORQUE_NM
-        self.torque = (self.throttle / 100.0) * avail_torque
-
-        # Wheel & engine speed
-        wheel_speed_rps = (self.speed_kmh / 3.6) / (math.pi * wheel_diam)
-        self.rpm = wheel_speed_rps * 60.0 * final_drive
-        self.rpm = min(max(self.rpm, 0), self.MAX_RPM)
-
-        # Power and current
-        power_kw = (self.torque * self.rpm) / 9549.0
-        if self.throttle > 0:
-            self.current = (power_kw * 1000.0) / self.dc_bus_voltage if self.dc_bus_voltage > 0 else 0
-            self.current = max(0, min(320, self.current))
-        else:
-            self.current = 8.0 + random.uniform(-2, 2)
-        # Energy use for SoC
-        self.total_energy_used_wh += (power_kw * dt) / 3600.0
-        self.state_of_charge = 100.0 - (self.total_energy_used_wh / self.BATTERY_ENERGY_WH) * 100.0
-        self.state_of_charge = max(0, self.state_of_charge)
-        # Battery voltage
-        base_voltage = self.BATTERY_MIN_V + (self.BATTERY_MAX_V - self.BATTERY_MIN_V) * (self.state_of_charge / 100.0)
-        voltage_sag = self.current * 0.08
-        self.dc_bus_voltage = base_voltage - voltage_sag + random.uniform(-1, 1)
-        self.dc_bus_voltage = max(self.BATTERY_MIN_V, min(self.BATTERY_MAX_V, self.dc_bus_voltage))
-        self.dc_bus_power = self.dc_bus_voltage * self.current
-        self.ams_current_dA = self.current * 10.0
-
-        # Simple kinematics for speed
-        if self.brake > 0:
-            decel_mps2 = (self.brake / 100.0) * 14.0  # Max 1.4g
-            self.speed_kmh -= (decel_mps2 * 3.6 * dt)
-        elif self.throttle > 0:
-            wheel_force = (self.torque * final_drive) / (wheel_diam / 2.0)
-            accel_mps2 = wheel_force / self.VEHICLE_MASS_KG
-            accel_mps2 = min(accel_mps2, 9.0)
-            drag_force = 0.5 * 1.2 * 0.5 * 1.5 * ((self.speed_kmh / 3.6) ** 2)
-            rolling_resistance = self.VEHICLE_MASS_KG * 9.81 * 0.012
-            resistance_decel = (drag_force + rolling_resistance) / self.VEHICLE_MASS_KG
-            net_accel = max(0, accel_mps2 - resistance_decel)
-            self.speed_kmh += (net_accel * 3.6 * dt)
-        else:
-            drag_force = 0.5 * 1.2 * 0.5 * 1.5 * ((self.speed_kmh / 3.6) ** 2)
-            rolling_resistance = self.VEHICLE_MASS_KG * 9.81 * 0.012
-            decel_mps2 = (drag_force + rolling_resistance) / self.VEHICLE_MASS_KG
-            self.speed_kmh -= (decel_mps2 * 3.6 * dt)
-        self.speed_kmh = min(max(self.speed_kmh, 0), self.MAX_SPEED_KPH)
-
-        # -- DYNAMICS simulation --
-        # Estimate G-forces: longitudinal from accel, lat from target_g_lat
-        g_base = 9.81
-        long_accel = 0.0
-        if self.throttle > 0:
-            long_accel = (self.torque * final_drive) / (self.VEHICLE_MASS_KG * (wheel_diam/2))
-        if self.brake > 0:
-            long_accel = -((self.brake / 100.0) * 14.0)
-        self.imu_g_long = long_accel / g_base
-        # Lateral G from section curvature and current speed
-        turn_coeff = min(1.0, abs(target_g_lat))
-        lat_g = turn_coeff * ((self.speed_kmh / 90.0) ** 1.15) * 1.1  # Up to 1.2G in hard turns
-        if not cornering:
-            lat_g = 0.0
-        lat_g = lat_g * (-1 if ((int(self.lap_progress*10)%2)==0) else 1)  # alternate left/right
-        self.imu_g_lat = lat_g
-        self.imu_g_total = math.sqrt(self.imu_g_lat**2 + self.imu_g_long**2)
-
-        # Suspension travel: more in hard braking/turn and uneven track
-        base_travel = 40.0
-        max_travel = 80.0
-        delta = abs(self.imu_g_lat)*35 + abs(self.imu_g_long)*30
-        noise = [random.uniform(-2,2) for _ in range(4)]
-        self.susp_travel = [
-            min(max(base_travel + delta*(1 if i < 2 else -1) + n, 25), max_travel)
-            for i, n in enumerate(noise)
-        ]
-        # Suspension force: proportional to dynamic load shift
-        sprung_mass = self.VEHICLE_MASS_KG / 4.0
-        load_shift = 40 * self.imu_g_long
-        self.susp_force = [
-            sprung_mass*g_base + load_shift + random.uniform(-8,8)
-            for _ in range(4)
-        ]
-
-        # Brake disk temperature elevation while braking (no regenerative)
-        for i in range(4):
-            if self.brake > 1:
-                self.brake_temps[i] += (self.brake / 100.0)*1.8 + 0.1*abs(self.imu_g_long)
+            if brake_zone:
+                self.throttle_cmd = 0.0
+                self.brake_cmd = min(100.0, self.brake_cmd + 20) # Frenada más agresiva
+            elif speed_error > 2.0:
+                self.throttle_cmd = min(100.0, speed_error * 15)
+                self.brake_cmd = 0.0
+            elif speed_error < -2.0:
+                self.throttle_cmd = 0.0
+                self.brake_cmd = min(100.0, abs(speed_error) * 8)
             else:
-                self.brake_temps[i] -= 0.6 + 0.2*random.uniform(0,1)
-            if self.brake_temps[i] > 540:
-                self.brake_temps[i] -= 1.5  # radiative/convective extra
-            self.brake_temps[i] = max(40.0, min(700, self.brake_temps[i]))
+                self.throttle_cmd = 25.0 
+                self.brake_cmd = 0.0
 
-        # Motor/inverter temperature increases under load, with cooldown
-        self.motor_temp += (self.current*0.012-(self.motor_temp-22.0)*0.019)*dt
-        self.motor_temp = min(max(self.motor_temp, 35), 97)
-        self.igbt_temp += (self.current*0.0115-(self.igbt_temp-22.0)*0.02)*dt
-        self.igbt_temp = min(max(self.igbt_temp, 30), 85)
-        self.air_temp = 22.0 + random.uniform(-0.5,0.5)
+            # 2. Dynamics
+            traction_force = (self.throttle_cmd / 100.0) * self.MAX_TORQUE * self.GEAR_RATIO / self.WHEEL_RADIUS
+            if self.speed_ms > self.MAX_SPEED: traction_force = 0
+            braking_force = (self.brake_cmd / 100.0) * 4500.0 
+            drag_force = 0.5 * 1.225 * self.DRAG_COEFF * 1.6 * (self.speed_ms ** 2)
+            
+            net_force = traction_force - braking_force - drag_force
+            accel = net_force / self.MASS
+            
+            self.speed_ms += accel * self.dt
+            if self.speed_ms < 0: self.speed_ms = 0
+            self.dist_m += self.speed_ms * self.dt
+            
+            self.g_long = accel / 9.81
+            if radius > 0 and self.speed_ms > 1:
+                lat_accel = (self.speed_ms ** 2) / radius
+                direction = 1 if int(self.dist_m / 100) % 2 == 0 else -1
+                self.g_lat = (lat_accel / 9.81) * direction
+                self.g_lat = max(-2.8, min(2.8, self.g_lat))
+            else:
+                self.g_lat = 0.0
+            g_total = math.sqrt(self.g_lat**2 + self.g_long**2)
 
-        # Cell / AMS temperatures
-        cell_temp_rise = 0.03*self.current
-        for module in self.modules:
-            for i in range(len(module['temperatures'])):
-                module['temperatures'][i] += cell_temp_rise*dt
-                module['temperatures'][i] -= (module['temperatures'][i]-22.0)*0.015*dt
-                module['temperatures'][i] += random.uniform(-0.07,0.09)
-                module['temperatures'][i] = min(max(module['temperatures'][i],20), 57)
-        all_temps = []
-        for module in self.modules:
-            all_temps.extend(module['temperatures'])
-        self.ams_max_temp_c = max(all_temps)
-        self.ams_min_temp_c = min(all_temps)
-        self.ams_avg_temp_c = sum(all_temps) / len(all_temps)
+            # 3. Electrical Model
+            mech_power = max(0, traction_force * self.speed_ms)
+            elec_power = mech_power / 0.90
+            
+            if self.voltage_load > 0:
+                self.current = elec_power / self.voltage_load
+            self.current += 4.0 
+            
+            # Voltaje 400 -> 360 logic
+            base_drop = (self.time_elapsed / 2100.0) * 40.0
+            usage_factor = (self.current * self.dt) * 0.005 
+            self.voltage_open_circuit -= usage_factor * 0.01
+            voc = 400.0 - base_drop - (self.voltage_open_circuit - 400.0)
+            if voc < 360.0: voc = 360.0
+            self.voltage_load = voc - (self.current * self.internal_resistance)
 
-        # Cell voltages: discharge & slight variance by temp
-        avg_cell_v = (self.dc_bus_voltage*1000)/self.NUM_CELLS
-        for module in self.modules:
-            for i in range(len(module['cell_voltages'])):
-                tv = avg_cell_v + random.uniform(-24,26) - (module['temperatures'][i%len(module['temperatures'])]-25.0)*0.45
-                tv = max(self.CELL_MIN_V*1000, min(self.CELL_MAX_V*1000, tv))
-                module['cell_voltages'][i] = tv
-        all_volts = []
-        for module in self.modules:
-            all_volts.extend(module['cell_voltages'])
-        self.ams_global_max_mv = max(all_volts)
-        self.ams_global_min_mv = min(all_volts)
-        self.ams_stack_total_mv = sum(all_volts)
+            # 4. Thermal Model - BRAKES & BATTERY
+            
+            # Battery: I^2 heating vs Air Cooling
+            heating_joule = (self.current ** 2) * 0.00015
+            cooling_factor = 0.005 + (self.speed_ms * 0.0015) 
+            delta_temp = self.pack_temp - self.ambient_temp
+            self.pack_temp += (heating_joule - (delta_temp * cooling_factor)) * self.dt
+            if self.pack_temp < self.ambient_temp: self.pack_temp = self.ambient_temp
 
-        # Driver input ADC
-        self.throttle_raw1 = int(1500 + self.throttle * 15)
-        self.throttle_raw2 = int(1520 + self.throttle * 15.2)
-        self.brake_raw = int(800 + self.brake * 10)
-        for i in range(4):
-            self.suspension[i] = self.susp_travel[i] + random.uniform(-1,1)
+            # BRAKE THERMAL MODEL (Dynamic)
+            # Energy input = Brake Force * Velocity (Power dissipated)
+            # Cooling = Convection coefficient (Function of velocity)
+            
+            brake_power_kw = (braking_force * self.speed_ms) / 1000.0 
+            
+            # Cooling coeff grows significantly with speed (Airflow over rotors)
+            # Base cooling (radiation) + Airflow cooling
+            brake_cooling_coeff = 0.08 + (self.speed_ms * 0.015) 
+            
+            for i in range(4):
+                # 4 brakes share the load approx equally
+                # Heating factor: 0.15 deg per kW per timestep (tuned for demo visual)
+                heating = (brake_power_kw / 4.0) * 0.15 
+                
+                delta_t = self.brake_temps[i] - self.ambient_temp
+                cooling = delta_t * brake_cooling_coeff * self.dt
+                
+                self.brake_temps[i] += heating - cooling
+                
+                # Floor at ambient
+                if self.brake_temps[i] < self.ambient_temp: 
+                    self.brake_temps[i] = self.ambient_temp
 
-    def _update_can_data(self):
+            # Update Dictionaries
+            self._update_data(g_total)
+            
+            with self.lock:
+                if self.logger: self.logger.log(self.data, self.time_elapsed)
+            
+            self.time_elapsed += self.dt
+            time.sleep(max(0, self.dt - (time.time() - start_t)))
+
+    def _update_data(self, g_total):
+        rpm = (self.speed_ms / (2 * math.pi * self.WHEEL_RADIUS)) * 60 * self.GEAR_RATIO
+        min_cell = (self.voltage_load / 95.0) - 0.005 + random.uniform(0, 0.002)
+        max_cell = (self.voltage_load / 95.0) + 0.005 + random.uniform(0, 0.002)
+        
         self.data[0x600] = {
-            'dcbusvoltage': self.dc_bus_voltage,
-            'dcbuspower': self.dc_bus_power,
-            'rpm': self.rpm,
-            'torquetotal': self.torque,
-            'cellminv': self.ams_global_min_mv,
-            'throttleraw1': self.throttle_raw1,
-            'throttleraw2': self.throttle_raw2
+            'dcbusvoltage': self.voltage_load,
+            'rpm': rpm,
+            'torquetotal': (self.throttle_cmd/100)*self.MAX_TORQUE,
+            'cellminv': min_cell * 1000,
+            'throttleraw1': 1500 + (self.throttle_cmd*5),
+            'throttleraw2': 1500 + (self.throttle_cmd*5)
         }
         self.data[0x610] = {
-            'motortemp': self.motor_temp,
-            'pwrstgtemp': self.igbt_temp,
-            'airtemp': self.air_temp,
-            'nactual': self.rpm,
+            'motortemp': self.motor_temp + (self.current*0.05),
+            'pwrstgtemp': self.inverter_temp + (self.current*0.04),
+            'airtemp': 25.0,
+            'nactual': rpm,
             'iactual': self.current
         }
         self.data[0x620] = {
-            's1raw': self.throttle_raw1,
-            's2raw': self.throttle_raw2,
-            'brakeraw': self.brake_raw,
-            'prechargebutton': self.precharge_button,
-            'startbutton': self.start_button
+            's1raw': 1500 + (self.throttle_cmd*5),
+            's2raw': 1500 + (self.throttle_cmd*5),
+            'brakeraw': 800 + (self.brake_cmd*5),
+            'prechargebutton': 1, 'startbutton': 1
         }
         self.data[0x630] = {
-            'torquereq': self.torque,
-            'torqueest': self.torque * 0.98,
-            'throttle': self.throttle,
-            'brake': self.brake
+            'torquereq': (self.throttle_cmd/100)*self.MAX_TORQUE,
+            'torqueest': (self.throttle_cmd/100)*self.MAX_TORQUE * 0.9,
+            'throttle': self.throttle_cmd,
+            'brake': self.brake_cmd
         }
-        self.data[0x640] = {
-            'currentsensor': self.current,
-            'cellminv': self.ams_global_min_mv,
-            'cellmaxtemp': self.ams_max_temp_c
+        self.data[0x202] = {'mincellmv': min_cell*1000, 'maxcellmv': max_cell*1000, 'stacktotalmv': self.voltage_load*1000}
+        self.data[0x201] = {'currentdA': self.current * 10}
+        self.data[0x208] = {'maxtempc': self.pack_temp, 'mintempc': self.pack_temp-2, 'avgtempc': self.pack_temp-1}
+        
+        self.data[0x650] = {'g_long': self.g_long, 'g_lat': self.g_lat, 'g_total': g_total}
+        
+        travel = [
+            40 + (self.g_long * 8) + (self.g_lat * 8) + random.uniform(-0.5,0.5), 
+            40 + (self.g_long * 8) - (self.g_lat * 8) + random.uniform(-0.5,0.5), 
+            40 - (self.g_long * 8) + (self.g_lat * 8) + random.uniform(-0.5,0.5), 
+            40 - (self.g_long * 8) - (self.g_lat * 8) + random.uniform(-0.5,0.5)  
+        ]
+        forces = [t * 25 for t in travel]
+        
+        self.data[0x660] = {'susp_forces': forces, 'susp_travel': travel}
+        
+        # Mapeo correcto de temperaturas de frenos
+        self.data[0x670] = {
+            'brake_temp_fl': self.brake_temps[0], 'brake_temp_fr': self.brake_temps[1],
+            'brake_temp_rl': self.brake_temps[2], 'brake_temp_rr': self.brake_temps[3]
         }
-        self.data[0x645] = {
-            'dst1': self.suspension[0],
-            'dst2': self.suspension[1],
-            'dst3': self.suspension[2],
-            'dst4': self.suspension[3],
-            'dsavg': sum(self.suspension) / 4.0,
-            'dsmax': max(self.suspension),
-            'dscount': 4
-        }
-        self.data[0x680] = {
-            'status': self.system_status,
-            'errors': self.error_code
-        }
-        self.data[0x201] = {
-            'currentdA': self.ams_current_dA
-        }
-        self.data[0x202] = {
-            'maxcellmv': self.ams_global_max_mv,
-            'mincellmv': self.ams_global_min_mv,
-            'stacktotalmv': self.ams_stack_total_mv
-        }
-        self.data[0x208] = {
-            'maxtempc': self.ams_max_temp_c,
-            'mintempc': self.ams_min_temp_c,
-            'avgtempc': self.ams_avg_temp_c,
-            'validcount': 190
-        }
-
-        # Dynamics panel: IMU (G-forces)
-        self.data[0x700] = {
-            'g_long': self.imu_g_long, 'g_lat': self.imu_g_lat, 'g_total': self.imu_g_total
-        }
-        # Suspension
-        self.data[0x710] = {
-            'susp_forces': self.susp_force, 'susp_travel': self.susp_travel
-        }
-        # Brake temp
-        self.data[0x720] = {
-            'brake_temp_fl': self.brake_temps[0],
-            'brake_temp_fr': self.brake_temps[1],
-            'brake_temp_rl': self.brake_temps[2],
-            'brake_temp_rr': self.brake_temps[3]
-        }
-
-        # Module-specific data
-        for i, module in enumerate(self.modules):
-            self.data[f'module{i}_voltages'] = module['cell_voltages']
-            self.data[f'module{i}_temps'] = module['temperatures']
+        
+        self.data[0x700] = self.data[0x650]
+        self.data[0x710] = self.data[0x660]
+        self.data[0x720] = self.data[0x670]
 
     def get_latest_data(self) -> Dict[str, Any]:
-        with self.lock:
-            return self.data.copy()
+        with self.lock: return self.data.copy()
 
-    def get_ams_module_data(self, module_id: int) -> Dict[str, Any]:
+    def get_ams_module_data(self, module_id: int):
         with self.lock:
-            if 0 <= module_id < len(self.modules):
-                return {
-                    'voltages': self.modules[module_id]['cell_voltages'].copy(),
-                    'tempsc': self.modules[module_id]['temperatures'].copy()
-                }
-        return {'voltages': [], 'tempsc': []}
+            base_v = (self.voltage_load / 95.0) * 1000
+            return {
+                'voltages': [base_v + random.uniform(-10,10) for _ in range(19)],
+                'tempsc': [self.pack_temp + random.uniform(-0.5,0.5) for _ in range(38)]
+            }
 
-# Global instance and API
 _demo_generator = None
 
-def start_demo():
+def start_demo(use_marple=False, piloto="Demo", circuito="Track"):
     global _demo_generator
-    if _demo_generator is None:
-        _demo_generator = DemoDataGenerator()
-    _demo_generator.start()
+    if _demo_generator is None: _demo_generator = DemoDataGenerator()
+    _demo_generator.start(use_marple, piloto, circuito)
 
 def stop_demo():
     global _demo_generator
-    if _demo_generator:
-        _demo_generator.stop()
+    if _demo_generator: _demo_generator.stop()
 
-def get_latest_data() -> Dict[str, Any]:
-    global _demo_generator
-    if _demo_generator:
-        return _demo_generator.get_latest_data()
-    return {}
-
-def get_ams_module_data(module_id: int) -> Dict[str, Any]:
-    global _demo_generator
-    if _demo_generator:
-        return _demo_generator.get_ams_module_data(module_id)
-    return {'voltages': [], 'tempsc': []}
-
-def is_demo_running() -> bool:
-    global _demo_generator
-    return _demo_generator is not None and _demo_generator.running
+def get_latest_data(): return _demo_generator.get_latest_data() if _demo_generator else {}
+def get_ams_module_data(mid): return _demo_generator.get_ams_module_data(mid) if _demo_generator else {}
+def is_demo_running(): return _demo_generator.running if _demo_generator else False

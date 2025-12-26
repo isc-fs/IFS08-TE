@@ -1,0 +1,96 @@
+{
+  "name": "Marple DB",
+  "type": "MARPLEDB",
+  "config": {
+    "dataset": {
+      "folderStructure": [
+        {
+          "key": "stream",
+          "split": ""
+        }
+      ],
+      "groupBy": [
+        "dataset",
+        "stream",
+        "layer_shift"
+      ],
+      "libraryColumns": [
+        "displayName",
+        "timestampStart",
+        "duration",
+        "metadata.nsignals"
+      ],
+      "metadata": [
+        {
+          "displayKey": "display_name",
+          "key": "dataset",
+          "name": "Dataset"
+        },
+        {
+          "displayKey": "stream_name",
+          "key": "stream",
+          "name": "Stream"
+        },
+        {
+          "displayKey": "layer_shift",
+          "key": "layer_shift",
+          "name": "Layer Shift"
+        },
+        {
+          "displayKey": "created_at",
+          "key": "created_at",
+          "name": "Created At"
+        },
+        {
+          "displayKey": "datapoints",
+          "key": "datapoints",
+          "name": "Datapoints"
+        },
+        {
+          "displayKey": "nsignals",
+          "key": "nsignals",
+          "name": "# Signals"
+        },
+        {
+          "displayKey": "datapool",
+          "key": "datapool",
+          "name": "Datapool"
+        }
+      ]
+    },
+    "features": [],
+    "distance": {
+      "signal": "{\"name\": \"\"}"
+    },
+    "segments": {
+      "alias": "Segment",
+      "highlight_fastest": false,
+      "fastest_blacklist": []
+    },
+    "queries": {
+      "constants": [
+        {
+          "name": "datapool",
+          "value": "default"
+        }
+      ],
+      "templates": {
+        "dataset_list": "select\n  dataset.id as dataset,\n  dataset.stream_id as stream,\n  dataset.path as display_name,\n  to_char(dataset.created_at, 'YYYY-MM-DD HH24:MI:ssOF') as created_at,\n  timestamp_start,\n  timestamp_stop,\n  n_datapoints as datapoints,\n  n_signals as nsignals,\n  dataset.metadata,\n  (\n    datastream.type = 'realtime'\n    AND timestamp_stop + (5 * 60 * (1e9::BIGINT)) >= extract(epoch from now()) * 1e9\n  )\n  as realtime,\n  datastream.name as stream_name,\n  datastream.datapool,\n  datastream.layer_shifts -> 0 :: int as layer_shift\nfrom \"mdb_{{datapool}}_dataset\" dataset\nleft join \"_mdb\".\"mdb_datastream\" datastream\n  on stream_id = datastream.id",
+        "signal_list": "WITH signal AS (\n  SELECT\n    signal_id as id,\n    name,\n    unit,\n    description,\n    storage_status,\n    count,\n    count_value,\n    count_text,\n    metadata || stats AS metadata,\n    coalesce((stats->>'frequency')::float,\n             CASE\n                WHEN count > 1 THEN (count - 1) * 1e9 / (GREATEST(time_max - time_min, 1))\n                ELSE NULL\n             END\n            ) as frequency\n  FROM \"mdb_{{datapool}}_signal\"\n  WHERE dataset_id = {{ dataset.dataset }}\n  {%- if signal_filters %}\n  AND name IN ({% for signal in signal_filters %}{{ signal.name | sql_literal}}{% if not loop.last %}, {% endif %}{% endfor %})\n  {%- endif %}\n)\n(\n  SELECT\n    signal.*,\n    name AS name,\n    'number' as datatype\n  FROM signal\n    where (count_text = 0 and count_value >= 0)\n      or (count_text IS NULL and count_value IS NULL)\n)\nUNION\n(\n  SELECT\n    signal.*,\n    name AS name,\n    'text' as datatype\n  FROM signal\n    where (count_text > 0 and count_value = 0)\n)\nUNION\n(\n  SELECT\n    signal.*,\n    name || '.raw' AS name,\n    'number' AS datatype\n  FROM signal\n  WHERE (count_text > 0 and count_value  > 0)\n)\nUNION\n(\n  SELECT\n    signal.*,\n    name AS name,\n    'text' AS datatype\n  FROM signal\n  WHERE (count_text > 0 and count_value > 0)\n)\n",
+        "time_series_batch": "{% for (name, series), signal in time_series|zip(signals) %}\nselect {{name | sql_literal}} as name, * from (\n{%- if subsampled -%}\n  {%- if signal.datatype == 'number' and (timestamp_stop - timestamp_start) >= (resolution * 2**(dataset.get(\"layer_shift\", 32)|int)) -%}\n    with time_series as ( -- layer1 buckets\n      select\n        width_bucket(\n          time + (1::bigint<<{{ (dataset.get(\"layer_shift\", 32)|int) - 1 }}),\n          {{ timestamp_start }},\n          {{ timestamp_stop }},\n          {{ resolution }}\n        ) as time_bucket,\n        min(min_value) as low_bound,\n        max(max_value) as up_bound\n      from \"mdb_data\".\"mdb_{{datapool}}_layer1_{{dataset.dataset}}_{{signal.metadata.id}}\"\n      where {{ timestamp_start }} <= time\n        and {{ timestamp_stop }} >= time\n      group by time_bucket\n    )\n  {%- else -%}\n    with time_series as ( -- raw buckets\n      select\n        width_bucket(\n          \"timestamp\",\n          {{ timestamp_start }},\n          {{ timestamp_stop }},\n          {{ resolution }}\n        ) as time_bucket,\n        min(value) as low_bound,\n        max(value) as up_bound\n      from ({{ series }}) as series\n      group by time_bucket\n    )\n  {% endif %}\nselect\n  ({{timestamp_stop}} - {{timestamp_start}}) / {{resolution}} * (n-1) + {{timestamp_start}} as \"timestamp\",\n  time_series.low_bound,\n  time_series.up_bound\nfrom generate_series(1, {{resolution}}) as range(n) -- insert empty buckets\nleft join time_series\n  on range.n = time_series.time_bucket\n{%- else -%}\n{{ series }} -- raw data\n{%- endif %}\n) as data\norder by \"timestamp\" asc;\n{% endfor %}",
+        "time_series": "select\n  time as \"timestamp\",\n  {{ 'value_text' if signal.datatype == 'text' else 'value' }} as value\nfrom mdb_{{datapool}}_data(\n    {{dataset.dataset}},\n    {{signal.metadata.id}},\n    {{ timestamp_start | int if timestamp_start is not none and timestamp_start != '' else 'NULL' }},\n    {{ timestamp_stop | int if timestamp_stop is not none and timestamp_stop != '' else 'NULL' }}\n)",
+        "segment_list": "",
+        "metric_dataset": "{% for signal in signals -%}\n    {% if agg == \"count\" %}\n        SELECT {{ index }} as index, count as metric\n        from \"public\".\"mdb_{{datapool}}_signal\"\n        where dataset_id = {{dataset.dataset}}\n        and signal_id = {{signal.metadata.id}}\n    {% else %}\n        {% set stat = \"mean\" if agg == \"avg\" else agg %}\n        SELECT {{ index }} as index, (stats->>'{{stat}}')::float as metric\n        from \"public\".\"mdb_{{datapool}}_signal\"\n        where dataset_id = {{dataset.dataset}}\n        and signal_id = {{signal.metadata.id}}\n    {% endif %}\n{% endfor %}"
+      }
+    }
+  },
+  "auth": {
+    "dbHost": "saas-2025-db.c4wdkf8eoqel.eu-central-1.rds.amazonaws.com",
+    "dbName": "mdb_isc_racing_team",
+    "dbUser": "mdb_isc_racing_team_user",
+    "dbPort": 5432,
+    "dbPassword": "ab946643318ce3b317cd66b55e927360",
+    "apiURL": "https://db.marpledata.com/api/v1",
+    "apiToken": "mdb_DNKk9_6u-FACcPHTz-bjfhOaTO7_jCUhyp1EVk5vSKM"
+  }
+}

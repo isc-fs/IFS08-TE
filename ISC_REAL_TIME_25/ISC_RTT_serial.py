@@ -1,5 +1,7 @@
 """
-ISC RTT Serial - Enhanced with comprehensive Excel logging
+ISC RTT Serial - Full Implementation
+Replaces Excel/Influx with Flat CSV Logging & Marple Data Upload.
+Retains all original Serial management, parsing, and AMS logic.
 """
 
 from __future__ import annotations
@@ -7,15 +9,18 @@ import os
 import time
 import struct
 import logging
+import csv
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
+import pandas as pd
 import serial
 import serial.tools.list_ports
-
-import pandas as pd
 import numpy as np
+
+# Importamos el módulo de subida a Marple
+import isc_marple
 
 # ================== CONFIG RF ==================
 RF_EXPECTED = {
@@ -34,60 +39,20 @@ CELLS_PER_MODULE = 19
 TEMPS_PER_MODULE = 38
 TOTAL_TEMPS = NUM_MODULES * TEMPS_PER_MODULE # 190
 
-# ================== EXCEL LOGGING ==================
-EXCEL_SESSIONS_DIR = Path("logs")
-EXCEL_SESSIONS_DIR.mkdir(exist_ok=True)
+# ================== LOGGING CONSTANTS ==================
+# Usamos una carpeta de logs locales antes de subir
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
 
 # ================== CONFIG DERIVADOS ==================
-GEAR_RATIO: Optional[float] = None
-FINAL_DRIVE: Optional[float] = None
-WHEEL_RADIUS_M: Optional[float] = None
-
-# ================== INFLUX (OPCIONAL) ==================
-INFLUX_CONFIG = {
-    "url": "http://localhost:8086",
-    "token": "TOKEN",
-    "org": "TORG",
-}
-# Make default settings globally accessible for UI config
-INFLUX_ENABLE_DEFAULT = False
-DEBUG_ENABLE_DEFAULT = False # New state variable added for debug toggle
 DEFAULT_BAUD = 115200
 DEFAULT_PORT = None
 
-_client = None
-_influx_ok = False
+# --- VARIABLES GLOBALES QUE FALTABAN ---
+INFLUX_ENABLE_DEFAULT = False # Se usa en la UI para marcar el checkbox de Marple por defecto
+DEBUG_ENABLE_DEFAULT = False  # Se usa en la UI para el checkbox de debug
 
-def _init_influx():
-    global _client, _influx_ok
-    if _client is not None:
-        return
-    try:
-        from influxdb_client import InfluxDBClient
-        _client = InfluxDBClient(**INFLUX_CONFIG)
-        _influx_ok = True
-        logging.getLogger("ISC_RTT_USB").info("InfluxDB inicializado")
-    except Exception as e:
-        _client = None
-        _influx_ok = False
-        logging.getLogger("ISC_RTT_USB").warning(f"Influx deshabilitado: {e}")
-
-def _get_write_api():
-    if not _influx_ok or _client is None:
-        return None
-    try:
-        from influxdb_client.client.write_api import SYNCHRONOUS
-        return _client.write_api(write_options=SYNCHRONOUS)
-    except Exception as e:
-        logging.getLogger("ISC_RTT_USB").warning(f"No se pudo crear write_api: {e}")
-        return None
-
-# ================== MARCO SERIAL ==================
-SOF1 = 0xAA
-SOF2 = 0x55
-PAYLOAD_LEN = 32
-
-# ================== ESTADO PARA LA UI ==================
+# Variables globales para la UI y estado
 data_str = ""
 new_data_flag = 0
 latest_data_dict: dict = {}
@@ -102,10 +67,15 @@ _last_seq = None
 _last_seq_advance_ts = 0.0
 _STALE_T = 0.20
 
+# Configuración de Logging de Python (Consola/UI)
 logger = logging.getLogger("ISC_RTT_USB")
-# Configure basicConfig so logger messages go to the UI via the proxy in the UI file
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# ================== MARCO SERIAL ==================
+SOF1 = 0xAA
+SOF2 = 0x55
+PAYLOAD_LEN = 32
+TEST_PATTERN = bytes(range(0xA0, 0xA0 + PAYLOAD_LEN))
 
 # ================== PER-MODULE AMS DATA ==================
 class AMSModule:
@@ -127,181 +97,124 @@ ams_global_max_mv = 0
 ams_stack_total_mv = 0
 ams_current_dA = 0
 
-# ================== EXCEL SESSION LOGGER ==================
-class ExcelSessionLogger:
-    """Comprehensive Excel logger for telemetry sessions"""
+# ================== CSV LOGGER (REEMPLAZA EXCEL/INFLUX) ==================
+class SerialCSVLogger:
+    """
+    Logger que genera un CSV plano compatible con Marple Data.
+    Sustituye al ExcelSessionLogger anterior.
+    """
     def __init__(self, bucket_id: str, piloto: str, circuito: str):
         self.bucket_id = bucket_id
         self.piloto = piloto
         self.circuito = circuito
-        self.session_start = datetime.now()
+        self.start_time = time.time()
         
-        # Create session filename in logs folder
-        self.filename = EXCEL_SESSIONS_DIR / f"{bucket_id}.xlsx"
+        # Nombre del archivo
+        self.filename = LOG_DIR / f"{bucket_id}.csv"
         
-        # Data buffers for each sheet
-        self.data_buffers = {
-            'Main': [],
-            'Motor_Inverter': [],
-            'AMS_Summary': [],
-            'AMS_Modules': [],
-            'Driver': [],
-            'Temperatures': []
-        }
+        self.file = open(self.filename, 'w', newline='')
+        self.writer = csv.writer(self.file)
+        self.record_count = 0
         
-        self.last_write = time.time()
-        self.write_interval = 5.0 # Write to Excel every 5 seconds
-        
-        logger.info(f"Excel logger initialized: {self.filename}")
-    
-    def log_data(self, data_dict: dict):
-        """Log data from latest_data_dict"""
-        timestamp = datetime.now()
-        
-        # Main sheet - Overview data
-        main_row = {
-            'timestamp': timestamp,
-            'piloto': self.piloto,
-            'circuito': self.circuito,
-        }
-        
-        # Extract data from 0x600
-        data_600 = data_dict.get('0x600', {})
-        main_row.update({
-            'dc_bus_voltage': data_600.get('dc_bus_voltage', 0),
-            'rpm': data_600.get('rpm', 0),
-            'torque_total': data_600.get('torque_total', 0),
-            'cell_min_v': data_600.get('cell_min_v', 0),
-            'throttle_raw1': data_600.get('throttle_raw1', 0),
-            'throttle_raw2': data_600.get('throttle_raw2', 0),
-        })
-        self.data_buffers['Main'].append(main_row)
-        
-        # Motor/Inverter sheet - 0x610
-        data_610 = data_dict.get('0x610', {})
-        motor_row = {
-            'timestamp': timestamp,
-            'motor_temp': data_610.get('motor_temp', 0),
-            'pwrstg_temp': data_610.get('pwrstg_temp', 0),
-            'air_temp': data_610.get('air_temp', 0),
-            'n_actual': data_610.get('n_actual', 0),
-            'i_actual': data_610.get('i_actual', 0),
-        }
-        self.data_buffers['Motor_Inverter'].append(motor_row)
-        
-        # Driver sheet - 0x620 and 0x630
-        data_620 = data_dict.get('0x620', {})
-        data_630 = data_dict.get('0x630', {})
-        driver_row = {
-            'timestamp': timestamp,
-            's1_raw': data_620.get('s1_raw', 0),
-            's2_raw': data_620.get('s2_raw', 0),
-            'brake_raw': data_620.get('brake_raw', 0),
-            'throttle_pct': data_630.get('throttle', 0),
-            'brake_pct': data_630.get('brake', 0),
-            'torque_req': data_630.get('torque_req', 0),
-            'torque_est': data_630.get('torque_est', 0),
-            'start_button': data_620.get('start_button', 0),
-            'precharge_button': data_620.get('precharge_button', 0),
-        }
-        self.data_buffers['Driver'].append(driver_row)
-        
-        # AMS Summary sheet
-        ams_summary = data_dict.get('ams_summary', {})
-        ams_temp_summary = data_dict.get('ams_temp_summary', {})
-        ams_row = {
-            'timestamp': timestamp,
-            'global_min_mv': ams_global_min_mv,
-            'global_max_mv': ams_global_max_mv,
-            'stack_mv': ams_stack_total_mv,
-            'current_A': ams_current_dA / 10.0,
-            'max_temp_c': ams_temp_summary.get('max_temp_c', 0),
-            'min_temp_c': ams_temp_summary.get('min_temp_c', 0),
-            'avg_temp_c': ams_temp_summary.get('avg_temp_c', 0),
-        }
-        self.data_buffers['AMS_Summary'].append(ams_row)
-        
-        # AMS Modules sheet - detailed per-module data
-        for i in range(NUM_MODULES):
-            mod = ams_modules[i]
-            module_row = {
-                'timestamp': timestamp,
-                'module_id': i,
-                'min_cell_mv': mod.min_cell_mv,
-                'max_cell_mv': mod.max_cell_mv,
-                'min_temp_c': mod.min_temp_c,
-                'max_temp_c': mod.max_temp_c,
-            }
-            self.data_buffers['AMS_Modules'].append(module_row)
-        
-        # Temperatures sheet - all 190 temperatures
-        temp_row = {'timestamp': timestamp}
-        all_temps = get_all_temps_array()
-        for i in range(min(len(all_temps), TOTAL_TEMPS)):
-            module_id = i // TEMPS_PER_MODULE
-            sensor_id = i % TEMPS_PER_MODULE
-            temp_row[f'M{module_id}_T{sensor_id}'] = all_temps[i]
-        self.data_buffers['Temperatures'].append(temp_row)
-        
-        # Write to Excel periodically
-        if time.time() - self.last_write > self.write_interval:
-            self.write_to_excel()
-            self.last_write = time.time()
-    
-    def write_to_excel(self):
-        """Write all buffered data to Excel file"""
-        if not any(len(buf) > 0 for buf in self.data_buffers.values()):
-            return
-        
-        try:
-            with pd.ExcelWriter(self.filename, engine='openpyxl', mode='a' if self.filename.exists() else 'w') as writer:
-                for sheet_name, data_list in self.data_buffers.items():
-                    if len(data_list) > 0:
-                        df = pd.DataFrame(data_list)
-                        
-                        # If file exists, append to existing sheet
-                        if self.filename.exists() and sheet_name in pd.ExcelFile(self.filename).sheet_names:
-                            existing_df = pd.read_excel(self.filename, sheet_name=sheet_name)
-                            df = pd.concat([existing_df, df], ignore_index=True)
-                        
-                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+        # CABECERAS: Primera columna "time" para Marple
+        self.headers = [
+            "time", "time_elapsed_s",  # <--- CRÍTICO: "time"
             
-            # Clear buffers after successful write
-            for key in self.data_buffers:
-                self.data_buffers[key] = []
+            # 0x600 - Main
+            "dc_bus_voltage", "rpm", "torque_total", "cell_min_v", "throttle_raw1", "throttle_raw2",
             
-            logger.info(f"Data written to Excel: {self.filename}")
+            # 0x610 - Motor
+            "motor_temp", "pwrstg_temp", "air_temp", "n_actual", "i_actual",
+            
+            # 0x620 - Driver Raw
+            "s1_raw", "s2_raw", "brake_raw", "precharge_btn", "start_btn",
+            
+            # 0x630 - Driver Proc
+            "torque_req", "torque_est", "throttle_pct", "brake_pct",
+            
+            # AMS Summary
+            "ams_min_cell_mv", "ams_max_cell_mv", "ams_stack_v", "ams_current_a", 
+            "ams_max_temp_c", "ams_min_temp_c", "ams_avg_temp_c",
+            
+            # Dynamics (Placeholders)
+            "g_long", "g_lat", "g_total",
+            "susp_force_fl", "susp_force_fr", "susp_force_rl", "susp_force_rr",
+            "susp_travel_fl", "susp_travel_fr", "susp_travel_rl", "susp_travel_rr",
+            "brake_temp_fl", "brake_temp_fr", "brake_temp_rl", "brake_temp_rr"
+        ]
         
-        except Exception as e:
-            logger.error(f"Error writing to Excel: {e}")
-    
-    def finalize(self):
-        """Final write and close"""
-        self.write_to_excel()
-        
-        # Write session metadata sheet
-        try:
-            metadata = {
-                'Session ID': [self.bucket_id],
-                'Piloto': [self.piloto],
-                'Circuito': [self.circuito],
-                'Start Time': [self.session_start],
-                'End Time': [datetime.now()],
-                'Duration (min)': [(datetime.now() - self.session_start).total_seconds() / 60],
-            }
-            df_meta = pd.DataFrame(metadata)
-            
-            with pd.ExcelWriter(self.filename, engine='openpyxl', mode='a') as writer:
-                df_meta.to_excel(writer, sheet_name='Metadata', index=False)
-            
-            logger.info(f"Session finalized: {self.filename}")
-        except Exception as e:
-            logger.error(f"Error writing metadata: {e}")
+        self.writer.writerow(self.headers)
+        logger.info(f"CSV Logger iniciado: {self.filename}")
 
-# Global logger instance
-_excel_logger: Optional[ExcelSessionLogger] = None
+    def log_snapshot(self, data_dict: dict):
+        """Toma una foto del estado actual y escribe una fila en el CSV"""
+        current_ts = datetime.now().isoformat()
+        elapsed = time.time() - self.start_time
+        
+        # Extracción segura de datos (con valores por defecto 0)
+        d600 = data_dict.get('0x600', {})
+        d610 = data_dict.get('0x610', {})
+        d620 = data_dict.get('0x620', {})
+        d630 = data_dict.get('0x630', {})
+        
+        # AMS data
+        ams_sum = data_dict.get('ams_summary', {})
+        ams_tmp = data_dict.get('ams_temp_summary', {})
+        ams_cur = data_dict.get('ams_current', {})
+        
+        # Dynamics 
+        d650 = data_dict.get('0x650', {})
+        d660 = data_dict.get('0x660', {})
+        d670 = data_dict.get('0x670', {})
+        
+        s_forces = d660.get('susp_forces', [0]*4)
+        s_travel = d660.get('susp_travel', [0]*4)
 
-# ================== UTILIDADES ==================
+        row = [
+            current_ts, f"{elapsed:.3f}",
+            
+            # 0x600
+            d600.get('dc_bus_voltage', 0), d600.get('rpm', 0), d600.get('torque_total', 0),
+            d600.get('cell_min_v', 0), d600.get('throttle_raw1', 0), d600.get('throttle_raw2', 0),
+            
+            # 0x610
+            d610.get('motor_temp', 0), d610.get('pwrstg_temp', 0), d610.get('air_temp', 0),
+            d610.get('n_actual', 0), d610.get('i_actual', 0),
+            
+            # 0x620
+            d620.get('s1_raw', 0), d620.get('s2_raw', 0), d620.get('brake_raw', 0),
+            d620.get('precharge_button', 0), d620.get('start_button', 0),
+            
+            # 0x630
+            d630.get('torque_req', 0), d630.get('torque_est', 0), d630.get('throttle', 0), d630.get('brake', 0),
+            
+            # AMS
+            ams_sum.get('min_cell_mv', 0), ams_sum.get('max_cell_mv', 0), 
+            ams_sum.get('stack_mv', 0) / 1000.0 if ams_sum.get('stack_mv') else 0, # Convert mV to V
+            ams_cur.get('current_A', 0),
+            ams_tmp.get('max_temp_c', 0), ams_tmp.get('min_temp_c', 0), ams_tmp.get('avg_temp_c', 0),
+            
+            # Dynamics
+            d650.get('g_long', 0), d650.get('g_lat', 0), d650.get('g_total', 0),
+            s_forces[0] if len(s_forces)>0 else 0, s_forces[1] if len(s_forces)>1 else 0, s_forces[2] if len(s_forces)>2 else 0, s_forces[3] if len(s_forces)>3 else 0,
+            s_travel[0] if len(s_travel)>0 else 0, s_travel[1] if len(s_travel)>1 else 0, s_travel[2] if len(s_travel)>2 else 0, s_travel[3] if len(s_travel)>3 else 0,
+            d670.get('brake_temp_fl', 0), d670.get('brake_temp_fr', 0), d670.get('brake_temp_rl', 0), d670.get('brake_temp_rr', 0)
+        ]
+        
+        self.writer.writerow(row)
+        self.record_count += 1
+        
+        if self.record_count % 50 == 0:
+            self.file.flush()
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            logger.info(f"CSV cerrado. Registros: {self.record_count}")
+            return str(self.filename)
+        return None
+
+# ================== UTILIDADES SERIAL ==================
 def _dump_hex(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
 
@@ -312,31 +225,26 @@ def list_serial_ports():
     return out
 
 def list_excel_sessions():
-    """List all available Excel session files"""
+    """Ahora lista archivos CSV en lugar de Excel"""
     sessions = []
-    if EXCEL_SESSIONS_DIR.exists():
-        for file in EXCEL_SESSIONS_DIR.glob("*.xlsx"):
-            if not file.name.startswith('~'): # Skip temp files
-                sessions.append(file)
+    if LOG_DIR.exists():
+        for file in LOG_DIR.glob("*.csv"):
+            sessions.append(file)
     return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
 
 def load_excel_session(filepath: Path) -> Dict[str, pd.DataFrame]:
-    """Load all sheets from an Excel session file"""
+    """Carga CSV para el visor de la UI (Adapta a formato dict)"""
     try:
-        excel_file = pd.ExcelFile(filepath)
-        sheets = {}
-        for sheet_name in excel_file.sheet_names:
-            sheets[sheet_name] = pd.read_excel(filepath, sheet_name=sheet_name)
-        return sheets
+        df = pd.read_csv(filepath)
+        return {'Main': df} # Retornamos todo en una 'hoja' llamada Main
     except Exception as e:
-        logger.error(f"Error loading Excel session: {e}")
+        logger.error(f"Error loading CSV session: {e}")
         return {}
 
 def _auto_detect_port():
     ports = list(serial.tools.list_ports.comports())
     for p in ports:
         desc = (p.description or "").upper()
-        hwid = (p.hwid or "").upper()
         if "CH340" in desc or "USB-SERIAL" in desc or "CP210" in desc:
             return p.device
     return ports[0].device if ports else None
@@ -359,8 +267,6 @@ def _set_badge(badge: str, reason: str):
 def _mod16_diff(curr: int, prev: int) -> int:
     return (curr - prev) & 0xFFFF
 
-TEST_PATTERN = bytes(range(0xA0, 0xA0 + PAYLOAD_LEN))
-
 def _is_consecutive_ramp(payload: bytes) -> bool:
     if len(payload) != PAYLOAD_LEN:
         return False
@@ -370,6 +276,9 @@ def is_test_payload(payload: bytes) -> bool:
     return payload == TEST_PATTERN or _is_consecutive_ramp(payload)
 
 def _read_frame(ser, counters=None):
+    """
+    Lectura robusta del frame con SOF y Checksum
+    """
     b = ser.read(1)
     if not b:
         if counters is not None: counters["timeout"] += 1
@@ -527,11 +436,9 @@ def parse_telemetry_data_frame(frame_dict: dict):
     # Consolidated Log String for UI
     status_badge = _status.get('badge', '?')
     if seq is not None:
-        # Changed formatting to a single line for the single log box
-        data_str = f"[{status_badge}] ID={id_hex} SEQ={seq} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
+        data_str = f"[{status_badge}] ID={id_hex} SEQ={seq} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}..."
     else:
-        # Changed formatting to a single line for the single log box
-        data_str = f"[{status_badge}] ID={id_hex} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}, {v4:.2f}, {v5:.2f}, {v6:.2f}, {v7:.2f}"
+        data_str = f"[{status_badge}] ID={id_hex} | V: {v1:.2f}, {v2:.2f}, {v3:.2f}..."
 
     latest_data_dict[id_hex] = {
         "id": id_int, "seq": seq,
@@ -542,7 +449,7 @@ def parse_telemetry_data_frame(frame_dict: dict):
     if 0x201 <= id_int <= 0x20D:
         parse_ams_extended(id_int, frame_dict)
 
-    # Legacy mappings
+    # Legacy mappings (Standard Data)
     if id_int == 0x600:
         latest_data_dict[id_hex].update({
             "dc_bus_voltage": v1,
@@ -585,25 +492,10 @@ def parse_telemetry_data_frame(frame_dict: dict):
             "cell_min_v": v2,
             "cell_max_temp": v3,
         })
-
-    try:
-        from influxdb_client import Point
-        pt = (
-            Point("telemetry")
-            .tag("id_hex", id_hex)
-            .field("v1", float(v1))
-            .field("v2", float(v2))
-            .field("v3", float(v3))
-            .field("v4", float(v4))
-            .field("v5", float(v5))
-            .field("v6", float(v6))
-            .field("v7", float(v7))
-        )
-        if seq is not None:
-            pt = pt.field("seq", int(seq))
-        return pt
-    except Exception:
-        return None
+    
+    # Nuevos mapeos para Dinámicas (si los recibes por serial, ajusta esto)
+    # Por ahora, placeholders para evitar errores en el CSV
+    # if id_int == 0x650: ...
 
 # ================== API FOR UI ==================
 def get_ams_module_data(module_idx: int) -> Optional[AMSModule]:
@@ -619,18 +511,12 @@ def get_all_temps_array() -> np.ndarray:
         temps.extend(mod.temps_c)
     return np.array(temps)
 
-def create_bucket(piloto: str, circuito: str, use_influx: bool = INFLUX_ENABLE_DEFAULT) -> str:
-    global INFLUX_ENABLE_DEFAULT
-    INFLUX_ENABLE_DEFAULT = bool(use_influx)
-
+def create_bucket(piloto: str, circuito: str, use_influx: bool = False) -> str:
+    # use_influx argument kept for UI compatibility (it now triggers Marple)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_piloto = piloto.replace(" ", "_")
     safe_circuito = circuito.replace(" ", "_")
     bucket_name = f"ISC_{ts}_{safe_piloto}_{safe_circuito}"
-
-    if use_influx:
-        _init_influx()
-
     return bucket_name
 
 def get_latest_data(data_id: str = None):
@@ -644,23 +530,17 @@ def receive_data(bucket_id: str,
                  circuito: str,
                  port: str = DEFAULT_PORT,
                  baud: int = DEFAULT_BAUD,
-                 use_influx: bool = INFLUX_ENABLE_DEFAULT,
+                 use_influx: bool = False, # Nota: use_influx ahora activa Marple Upload
                  debug: bool = False):
+    
     global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT
     
-    # Update global variable for debugging state, used by logger.setLevel
     DEBUG_ENABLE_DEFAULT = debug
-
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    logger.info("Recepción USB-Serial iniciada con soporte para 5 módulos AMS")
+    logger.info("Recepción USB-Serial iniciada. Modo Marple Upload: %s", use_influx)
 
-    write_api = None
-    if use_influx:
-        _init_influx()
-        write_api = _get_write_api()
-
-    # Initialize Excel logger
-    _excel_logger = ExcelSessionLogger(bucket_id, piloto, circuito)
+    # Initialize CSV Logger (Replaces Excel)
+    _excel_logger = SerialCSVLogger(bucket_id, piloto, circuito)
 
     if port is None:
         port = _auto_detect_port()
@@ -670,18 +550,13 @@ def receive_data(bucket_id: str,
     ser = _open_serial(port, baud)
 
     logger.info("[CONFIG] Serial: port=%s, baud=%d", port, baud)
-    logger.info("[CONFIG] AMS: %d módulos, %d celdas/mod, %d temps/mod",
-                NUM_MODULES, CELLS_PER_MODULE, TEMPS_PER_MODULE)
-    logger.info("[CONFIG] Excel: %s", _excel_logger.filename)
+    logger.info("[CONFIG] Logging to: %s", _excel_logger.filename)
 
     counters = {"rx": 0, "decode": 0, "timeout": 0, "len": 0, "short": 0, "chk": 0, "decode_fail": 0, "test": 0}
-    last_check_t = time.time()
-    last_stats_t = last_check_t
-    last_excel_log = last_check_t
+    last_stats_t = time.time()
+    last_log_t = time.time()
 
     _set_badge("STALE", "esperando primer frame")
-
-    logger.info("Leyendo de %s @ %d bps", port, baud)
 
     try:
         while new_data_flag != -1:
@@ -736,26 +611,19 @@ def receive_data(bucket_id: str,
             else:
                 _set_badge("LIVE", "legacy sin SEQ")
 
-            pt = parse_telemetry_data_frame(decoded)
+            parse_telemetry_data_frame(decoded)
 
-            if write_api and pt:
-                try:
-                    pt = pt.tag("piloto", piloto).tag("circuito", circuito)
-                    write_api.write(bucket=bucket_id, record=pt)
-                except Exception as e:
-                    logger.warning("Error escribiendo en Influx: %s", e)
-
-            # Log to Excel every second
-            if now - last_excel_log >= 1.0:
+            # Log to CSV (Approx 10Hz to avoid massive file growth, adjustable)
+            if now - last_log_t >= 0.1: 
                 if _excel_logger:
-                    _excel_logger.log_data(latest_data_dict)
-                last_excel_log = now
+                    _excel_logger.log_snapshot(latest_data_dict)
+                last_log_t = now
 
             new_data_flag = 1
 
             if debug and now - last_stats_t >= 2.0:
                 logger.debug("[STATS] rx=%d decode=%d",
-                              counters["rx"], counters["decode"])
+                             counters["rx"], counters["decode"])
                 last_stats_t = now
 
     finally:
@@ -764,8 +632,19 @@ def receive_data(bucket_id: str,
         except Exception:
             pass
         
-        # Finalize Excel logger
+        file_path = None
         if _excel_logger:
-            _excel_logger.finalize()
+            file_path = _excel_logger.close()
         
         logger.info("Recepción USB-Serial finalizada.")
+        
+        # --- SUBIDA A MARPLE ---
+        if use_influx and file_path:
+            logger.info("Iniciando subida a Marple Data...")
+            metadata = {
+                "piloto": piloto,
+                "circuito": circuito,
+                "type": "Real_Telemetry",
+                "date": datetime.now().isoformat()
+            }
+            isc_marple.upload_session_csv(file_path, metadata)

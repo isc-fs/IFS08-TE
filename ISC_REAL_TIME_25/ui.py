@@ -1,7 +1,7 @@
 """
 ISCmetrics - ISC Formula Student Telemetry System
 Developed by Andrés Sánchez de Ágreda © 2025/2026
-Modified for F1-style modern aesthetic and improved layout
+Modified for F1-style modern aesthetic and Marple Data Integration
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ ERROR_COLOR = F1_ERROR
 current_settings = {
     "port": rtt.DEFAULT_PORT,
     "baud": rtt.DEFAULT_BAUD,
-    "use_influx": rtt.INFLUX_ENABLE_DEFAULT,
+    "use_influx": False, # Maps to Marple Upload
     "debug": rtt.DEBUG_ENABLE_DEFAULT,
     "demo_mode": False,
 }
@@ -89,8 +89,9 @@ class Signaler(QObject):
 
 signaler = Signaler()
 
-logger_rtt = logging.getLogger("ISC_RTT_USB")
-logger_rtt.addHandler(QtHandler(signaler))
+# Capture logs from both Serial and Marple modules
+logging.getLogger("ISC_RTT_USB").addHandler(QtHandler(signaler))
+logging.getLogger("ISC_MARPLE").addHandler(QtHandler(signaler))
 
 # ============== MATPLOTLIB F1 STYLE ==============
 plt.style.use('dark_background')
@@ -138,7 +139,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(lbl_baud, 1, 0)
         layout.addWidget(self.input_baud, 1, 1)
 
-        self.chk_marple = QCheckBox("Enable Marple Logging")
+        # Updated Label for Marple
+        self.chk_marple = QCheckBox("Upload to Marple Data (Cloud)")
         self.chk_marple.setStyleSheet(f"color: {F1_TEXT}; font-size: 11px;")
         self.chk_marple.setChecked(self.parent_ui.settings["use_influx"])
         layout.addWidget(self.chk_marple, 2, 0)
@@ -148,7 +150,6 @@ class SettingsDialog(QDialog):
         self.chk_debug.setChecked(self.parent_ui.settings["debug"])
         layout.addWidget(self.chk_debug, 3, 0)
         
-        # ADDED: Demo Mode Checkbox
         self.chk_demo = QCheckBox("Enable Demo Mode (Simulated Data)")
         self.chk_demo.setStyleSheet(f"color: {F1_ACCENT}; font-size: 11px; font-weight: bold;")
         self.chk_demo.setChecked(self.parent_ui.settings["demo_mode"])
@@ -193,7 +194,7 @@ class SettingsDialog(QDialog):
         return {
             "port": self.combo_port.currentData(),
             "baud": baud,
-            "use_influx": self.chk_marple.isChecked(),
+            "use_influx": self.chk_marple.isChecked(), # Maps to use_marple
             "debug": self.chk_debug.isChecked(),
             "demo_mode": self.chk_demo.isChecked(),
         }
@@ -225,7 +226,6 @@ class MainWindow(QMainWindow):
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_displays)
-        
         
         signaler.log_message.connect(self.append_log)
         
@@ -483,9 +483,10 @@ class MainWindow(QMainWindow):
     def activate_demo_mode(self):
         """Activate demo mode"""
         self.demo_mode = True
-        self.append_log("[DEMO] Demo mode ENABLED - Using simulated data")
-        demo.start_demo()
-        self.btn_start.setEnabled(False)
+        self.append_log("[DEMO] Demo mode ENABLED - Ready to record")
+        # Just init demo, don't start loop until REC is pressed to allow config
+        demo.start_demo(False) 
+        self.btn_start.setEnabled(True)
         self.status_label.setText("TEST")
         self.status_label.setStyleSheet(f"""
             background: {F1_ACCENT}; 
@@ -534,7 +535,7 @@ class MainWindow(QMainWindow):
             rtt.INFLUX_ENABLE_DEFAULT = new_settings['use_influx']
             rtt.DEBUG_ENABLE_DEFAULT = new_settings['debug']
 
-            self.append_log(f"Settings updated: Port={self.settings['port']}, Baud={self.settings['baud']}, Marple={self.settings['use_influx']}, Debug={self.settings['debug']}, Demo={self.settings['demo_mode']}")
+            self.append_log(f"Settings updated: Port={self.settings['port']}, UploadMarple={self.settings['use_influx']}, Demo={self.settings['demo_mode']}")
             
             # Handle demo mode changes
             if demo_changed:
@@ -790,9 +791,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(gbox_brake, 1)
         return widget
 
-    
-    
-    
     def create_metric_label(self, title, value, color, compact=False):
         """Create a styled metric display label with F1 aesthetic"""
         frame = QFrame()
@@ -860,13 +858,13 @@ class MainWindow(QMainWindow):
         
     def start_reception(self):
         """Start data reception thread"""
-        if self.is_receiving or self.demo_mode: 
+        if self.is_receiving: 
             return
         
         piloto = self.input_pilot.text()
         circuito = self.input_circuit.text()
         port = self.settings["port"]
-        use_influx = self.settings["use_influx"]
+        use_marple = self.settings["use_influx"] # Reused flag for Marple Upload
         debug = self.settings["debug"]
         
         try:
@@ -875,50 +873,65 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Invalid baudrate in settings.")
             return
         
-        if not port:
-            QMessageBox.warning(self, "Error", "No COM port selected. Check Ajustes.")
-            return
-        
-        bucket_id = rtt.create_bucket(piloto, circuito, use_influx=use_influx)
-        self.append_log(f"Starting: {port} @ {baud} bps. Marple logging: {use_influx}")
-        self.append_log(f"Session ID: {bucket_id}")
-        
         self.is_receiving = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_settings.setEnabled(False)
         
-        def rx_worker():
-            try:
-                rtt.receive_data(
-                    bucket_id=bucket_id,
-                    piloto=piloto,
-                    circuito=circuito,
-                    port=port,
-                    baud=baud,
-                    use_influx=use_influx,
-                    debug=debug
-                )
-            except Exception as e:
-                signaler.log_message.emit(f"FATAL ERROR IN RX THREAD: {e}")
-            finally:
+        if self.demo_mode:
+            # En modo demo, paramos el loop de visualización y reiniciamos con logging
+            demo.stop_demo() 
+            demo.start_demo(use_marple=use_marple, piloto=piloto, circuito=circuito)
+            self.append_log(f"Recording DEMO. Upload to Marple: {use_marple}")
+        else:
+            if not port:
+                QMessageBox.warning(self, "Error", "No COM port selected. Check Ajustes.")
                 self.is_receiving = False
+                self.btn_start.setEnabled(True)
+                self.btn_stop.setEnabled(False)
+                return
 
-        self.rx_thread = threading.Thread(target=rx_worker, daemon=True)
-        self.rx_thread.start()
+            bucket_id = rtt.create_bucket(piloto, circuito)
+            self.append_log(f"Starting Serial: {port} @ {baud}. Upload Marple: {use_marple}")
+            self.append_log(f"Session ID: {bucket_id}")
+            
+            def rx_worker():
+                try:
+                    rtt.receive_data(
+                        bucket_id=bucket_id,
+                        piloto=piloto,
+                        circuito=circuito,
+                        port=port,
+                        baud=baud,
+                        use_influx=use_marple,
+                        debug=debug
+                    )
+                except Exception as e:
+                    signaler.log_message.emit(f"FATAL ERROR IN RX THREAD: {e}")
+                finally:
+                    self.is_receiving = False
+
+            self.rx_thread = threading.Thread(target=rx_worker, daemon=True)
+            self.rx_thread.start()
         
     def stop_reception(self):
         """Stop data reception"""
         if not self.is_receiving: return
         
         self.append_log("Stopping reception...")
-        rtt.new_data_flag = -1
-        if self.rx_thread and self.rx_thread.is_alive():
-            self.rx_thread.join(timeout=1.0)
+        
+        if self.demo_mode:
+            demo.stop_demo()
+            self.is_receiving = False
+        else:
+            rtt.new_data_flag = -1
+            if self.rx_thread and self.rx_thread.is_alive():
+                self.rx_thread.join(timeout=1.0)
+            self.is_receiving = False
             
-        self.is_receiving = False
         if not self.demo_mode:
             self.btn_start.setEnabled(True)
+        
         self.btn_stop.setEnabled(False)
         self.btn_settings.setEnabled(True)
 
@@ -932,7 +945,8 @@ class MainWindow(QMainWindow):
             data = rtt.get_latest_data()
             status_info = data.get("__STATUS__", {'badge': 'IDLE', 'reason': 'no data', 'ts': 0})
         
-        if self.is_receiving and rtt.new_data_flag == -1:
+        # Check if serial thread died cleanly
+        if not self.demo_mode and self.is_receiving and not self.rx_thread.is_alive():
              self.stop_reception()
         
         badge = status_info.get("badge", "IDLE" if not self.is_receiving and not self.demo_mode else "STALE")
@@ -1407,10 +1421,15 @@ class GCircleWidget(QWidget):
             qp.drawEllipse(center, scale*mult/2, scale*mult/2)
         qp.drawEllipse(center, 5, 5)
         qp.setPen(QtGui.QPen(accent_col, 5))
-        qp.drawLine(center.x(), center.y(), center.x(), center.y()-scale)
-        qp.drawLine(center.x(), center.y(), center.x(), center.y()+scale)
-        qp.drawLine(center.x(), center.y(), center.x()-scale, center.y())
-        qp.drawLine(center.x(), center.y(), center.x()+scale, center.y())
+        # Top
+        qp.drawLine(center, QtCore.QPointF(center.x(), center.y() - scale))
+        # Bottom
+        qp.drawLine(center, QtCore.QPointF(center.x(), center.y() + scale))
+        # Left
+        qp.drawLine(center, QtCore.QPointF(center.x() - scale, center.y()))
+        # Right
+        qp.drawLine(center, QtCore.QPointF(center.x() + scale, center.y()))
+        
         point_x = center.x() + self.g_lat*scale
         point_y = center.y() - self.g_long*scale
         qp.setBrush(QtGui.QBrush(QColor(250,230,100)))
