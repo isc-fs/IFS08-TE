@@ -1,5 +1,5 @@
 """
-ISC RTT Serial — v2 (Fragmented Snapshot Protocol)
+ISC RTT Serial — v3 (Optimized + Post-Race Data Injection)
 Replaces Excel/Influx with Flat CSV Logging & Marple Data Upload.
 Retains all original Serial management and binary framing logic.
 
@@ -21,21 +21,29 @@ On-air protocol (STM32 → NRF24 → Arduino Nano → USB-Serial → here):
 
 Serial framing from Arduino (unchanged):
   AA 55 20 <32 raw bytes> <XOR checksum>
+
+Post-race data injection:
+  GPS coordinates and AMS temperatures are logged separately on the car
+  (micro-SD card), then merged into the session CSV after the race via
+  merge_gps_into_session() and merge_ams_temps_into_session().
 """
 
 from __future__ import annotations
-import time
-import struct
-import logging
 import csv
-from datetime import datetime
-from typing import Optional, Dict, List
+import logging
+import struct
+import threading
+import time
+from datetime import datetime, timedelta
+from functools import reduce
+from operator import xor
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import serial
 import serial.tools.list_ports
-import numpy as np
 
 import isc_marple
 
@@ -69,6 +77,21 @@ PAYLOAD_LEN = 32       # NRF24 fixed payload size
 NUM_MODULES      = 5
 CELLS_PER_MODULE = 19   # granular per-cell data not in radio snapshot; kept for future
 TEMPS_PER_MODULE = 38   # same
+
+# ================== POST-RACE DATA CONSTANTS ==================
+# GPS columns added to session CSV during post-race injection
+GPS_MERGE_COLS: List[str] = [
+    'gps_lat_deg', 'gps_lon_deg', 'gps_sog_knots',
+    'gps_cog_deg', 'gps_sats', 'gps_fix',
+]
+
+# AMS per-cell temperature column names (format: ams_t_mod{m}_cell{c})
+# 19 cells × 5 modules = 95 columns (populated during post-race injection)
+AMS_TEMP_COLS: List[str] = [
+    f'ams_t_mod{m}_cell{c}'
+    for m in range(NUM_MODULES)
+    for c in range(CELLS_PER_MODULE)
+]
 
 # ================== LOG DIR ==================
 LOG_DIR = Path("logs")
@@ -120,48 +143,44 @@ class SerialCSVLogger:
     Flat CSV logger compatible with Marple Data.
     Columns mirror the 102-byte snapshot wire format from serialize_radio_snapshot().
     """
-    def __init__(self, bucket_id: str, piloto: str, circuito: str):
-        self.bucket_id  = bucket_id
-        self.piloto     = piloto
-        self.circuito   = circuito
-        self.start_time = time.time()
+    # Column order — must match log_snapshot()
+    HEADERS: List[str] = [
+        # ── Timing ──────────────────────────────────────────────────────────
+        "time", "time_elapsed_s",
+        # ── Snapshot meta ───────────────────────────────────────────────────
+        "seq", "tick_ms",
+        # ── Driver inputs  [snap bytes 6-12] ────────────────────────────────
+        "start_button",
+        "apps1_raw", "apps2_raw", "brake_raw",
+        # ── Control  [snap bytes 13-17] ─────────────────────────────────────
+        "torque_pct", "ev_2_3", "t11_8_9", "ctrl_state",
+        # ── AMS / BMS  [snap bytes 18-58] ───────────────────────────────────
+        "ok_precharge", "ams_fsm_state",
+        "v_cell_min_mV", "soc",
+        "vmin_mod0", "vmin_mod1", "vmin_mod2", "vmin_mod3", "vmin_mod4",
+        "vmax_mod0", "vmax_mod1", "vmax_mod2", "vmax_mod3", "vmax_mod4",
+        "corriente_accu", "corriente_dcdc", "temp_dcdc",
+        "tmax_mod0", "tmax_mod1", "tmax_mod2", "tmax_mod3", "tmax_mod4",
+        # ── Inverter  [snap bytes 59-81] ────────────────────────────────────
+        "inv_state", "inv_vconfig_active", "inv_error",
+        "inv_dc_bus_V",
+        "inv_temp_motor1", "inv_temp_pwrstg", "inv_temp_board",
+        "inv_rpm", "inv_speed_actual", "inv_current_actual",
+    ]
 
-        self.filename = LOG_DIR / f"{bucket_id}.csv"
-        self.file     = open(self.filename, 'w', newline='')
-        self.writer   = csv.writer(self.file)
+    def __init__(self, bucket_id: str, piloto: str, circuito: str, flush_every: int = 50):
+        self.bucket_id    = bucket_id
+        self.piloto       = piloto
+        self.circuito     = circuito
+        self.start_time   = time.time()
+        self.flush_every  = flush_every
+
+        self.filename     = LOG_DIR / f"{bucket_id}.csv"
+        self.file         = open(self.filename, 'w', newline='')
+        self.writer       = csv.writer(self.file)
         self.record_count = 0
 
-        # "time" is the mandatory Marple timestamp column
-        self.headers = [
-            # ── Timing ──────────────────────────────────────────────────────────
-            "time", "time_elapsed_s",
-
-            # ── Snapshot meta ───────────────────────────────────────────────────
-            "seq", "tick_ms",
-
-            # ── Driver inputs  [snap bytes 6-12] ────────────────────────────────
-            "start_button",
-            "apps1_raw", "apps2_raw", "brake_raw",
-
-            # ── Control  [snap bytes 13-17] ─────────────────────────────────────
-            "torque_pct", "ev_2_3", "t11_8_9", "ctrl_state",
-
-            # ── AMS / BMS  [snap bytes 18-58] ───────────────────────────────────
-            "ok_precharge", "ams_fsm_state",
-            "v_cell_min_mV", "soc",
-            "vmin_mod0", "vmin_mod1", "vmin_mod2", "vmin_mod3", "vmin_mod4",
-            "vmax_mod0", "vmax_mod1", "vmax_mod2", "vmax_mod3", "vmax_mod4",
-            "corriente_accu", "corriente_dcdc", "temp_dcdc",
-            "tmax_mod0", "tmax_mod1", "tmax_mod2", "tmax_mod3", "tmax_mod4",
-
-            # ── Inverter  [snap bytes 59-81] ────────────────────────────────────
-            "inv_state", "inv_vconfig_active", "inv_error",
-            "inv_dc_bus_V",
-            "inv_temp_motor1", "inv_temp_pwrstg", "inv_temp_board",
-            "inv_rpm", "inv_speed_actual", "inv_current_actual",
-        ]
-
-        self.writer.writerow(self.headers)
+        self.writer.writerow(self.HEADERS)
         logger.info(f"CSV Logger iniciado: {self.filename}")
 
     def log_snapshot(self, data_dict: dict) -> None:
@@ -176,27 +195,29 @@ class SerialCSVLogger:
 
         row = [
             current_ts, f"{elapsed:.3f}",
-            s.get('seq',          0), s.get('tick_ms', 0),
-            s.get('start_button', 0),
-            s.get('apps1_raw',    0), s.get('apps2_raw', 0), s.get('brake_raw', 0),
-            s.get('torque_pct',   0), s.get('ev_2_3', 0), s.get('t11_8_9', 0), s.get('state', 0),
-            s.get('ok_precharge', 0), s.get('ams_fsm_state', 0),
-            s.get('v_cell_min_mV', 0), s.get('soc', 0),
+            s.get('seq',            0), s.get('tick_ms',        0),
+            s.get('start_button',   0),
+            s.get('apps1_raw',      0), s.get('apps2_raw',      0), s.get('brake_raw', 0),
+            s.get('torque_pct',     0), s.get('ev_2_3',         0),
+            s.get('t11_8_9',        0), s.get('state',          0),
+            s.get('ok_precharge',   0), s.get('ams_fsm_state',  0),
+            s.get('v_cell_min_mV',  0), s.get('soc',            0),
             *(vmin[i] if i < len(vmin) else 0 for i in range(5)),
             *(vmax[i] if i < len(vmax) else 0 for i in range(5)),
             s.get('corriente_accu', 0),
             s.get('corriente_dcdc', 0),
             s.get('temp_dcdc',      0),
             *(tmax[i] if i < len(tmax) else 0 for i in range(5)),
-            s.get('inv_state',          0), s.get('last_vconfig_tick', 0), s.get('inv_error', 0),
-            s.get('inv_dc_bus_V',       0),
-            s.get('inv_temp_motor1',    0), s.get('inv_temp_pwrstg', 0), s.get('inv_temp_board', 0),
-            s.get('inv_rpm',            0), s.get('inv_speed_actual', 0), s.get('inv_current_actual', 0),
+            s.get('inv_state',             0), s.get('last_vconfig_tick', 0),
+            s.get('inv_error',             0), s.get('inv_dc_bus_V',      0),
+            s.get('inv_temp_motor1',       0), s.get('inv_temp_pwrstg',   0),
+            s.get('inv_temp_board',        0), s.get('inv_rpm',           0),
+            s.get('inv_speed_actual',      0), s.get('inv_current_actual', 0),
         ]
 
         self.writer.writerow(row)
         self.record_count += 1
-        if self.record_count % 50 == 0:
+        if self.record_count % self.flush_every == 0:
             self.file.flush()
 
     def close(self) -> Optional[str]:
@@ -206,6 +227,7 @@ class SerialCSVLogger:
             return str(self.filename)
         return None
 
+
 # ================== SERIAL UTILITIES ==================
 def _dump_hex(b: bytes) -> str:
     return " ".join(f"{x:02X}" for x in b)
@@ -214,9 +236,13 @@ def list_serial_ports():
     return [(p.device, p.description) for p in serial.tools.list_ports.comports()]
 
 def list_excel_sessions():
-    """List CSV session files (sorted newest first)."""
+    """List CSV session files (sorted newest first, excluding _gps suffix files)."""
     if LOG_DIR.exists():
-        return sorted(LOG_DIR.glob("*.csv"), key=lambda x: x.stat().st_mtime, reverse=True)
+        return sorted(
+            [f for f in LOG_DIR.glob("*.csv") if not f.stem.endswith('_gps')],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
     return []
 
 def load_excel_session(filepath: Path) -> Dict[str, pd.DataFrame]:
@@ -249,6 +275,10 @@ def _set_badge(badge: str, reason: str) -> None:
 
 def _mod16_diff(curr: int, prev: int) -> int:
     return (curr - prev) & 0xFFFF
+
+def _xor_check(payload: bytes) -> int:
+    """Return XOR of all bytes in payload (checksum byte)."""
+    return reduce(xor, payload, 0)
 
 def _read_frame(ser: serial.Serial, counters: Optional[dict] = None):
     """
@@ -289,14 +319,12 @@ def _read_frame(ser: serial.Serial, counters: Optional[dict] = None):
         if counters is not None: counters["timeout"] += 1
         return None, "timeout"
 
-    xorv = 0
-    for bb in payload:
-        xorv ^= bb
-    if xorv != chk[0]:
+    if _xor_check(payload) != chk[0]:
         if counters is not None: counters["chk"] += 1
         return None, "chk"
 
     return payload, None
+
 
 # ================== FRAGMENT VALIDATION & REASSEMBLY ==================
 def _validate_fragment(payload: bytes) -> bool:
@@ -323,14 +351,12 @@ def _validate_fragment(payload: bytes) -> bool:
         return False
     return True
 
+
 def _process_fragment(payload: bytes) -> Optional[bytes]:
     """
     Store a validated fragment in the reassembly buffer keyed by seq.
     Returns the complete 102-byte snapshot bytes when all FRAG_TOTAL
     fragments for the same seq have arrived; otherwise returns None.
-
-    Partial buffers for stale seqs are evicted when _MAX_PENDING_SEQS
-    is exceeded (oldest seq discarded).
     """
     global _frag_buffers
 
@@ -338,7 +364,6 @@ def _process_fragment(payload: bytes) -> Optional[bytes]:
     seq: int      = struct.unpack_from('<H', payload, 4)[0]
     data: bytes   = bytes(payload[HDR_SIZE: HDR_SIZE + DATA_SIZE])
 
-    # Evict oldest partial buffer if too many seqs are in flight
     if seq not in _frag_buffers and len(_frag_buffers) >= _MAX_PENDING_SEQS:
         oldest = min(_frag_buffers.keys(), key=lambda s: _mod16_diff(seq, s))
         del _frag_buffers[oldest]
@@ -359,103 +384,100 @@ def _process_fragment(payload: bytes) -> Optional[bytes]:
 
     return None
 
+
 # ================== SNAPSHOT DECODER ==================
-def _u16(data: bytes, offset: int) -> int:
-    """Unsigned little-endian 16-bit integer."""
-    return struct.unpack_from('<H', data, offset)[0]
+# Pre-compiled struct formats for one-shot unpacking of the 102-byte snapshot.
+#
+# Head: bytes 0..22  (14 fields, 23 bytes)
+#   I  tick_ms, H  seq, B  start_button,
+#   H  apps1, H  apps2, H  brake,
+#   H  torque_pct, B  ev_2_3, B  t11_8_9, B  state,
+#   B  ok_precharge, B  ams_fsm_state,
+#   H  v_cell_min_mV, B  soc
+_SNAP_FMT_HEAD   = struct.Struct('<IHBHHHHBBBBBHB')   # 23 bytes
 
-def _i16(data: bytes, offset: int) -> int:
-    """Signed little-endian 16-bit integer (stored as uint16, reinterpreted)."""
-    v = struct.unpack_from('<H', data, offset)[0]
-    return v if v < 0x8000 else v - 0x10000
+# Arrays: bytes 23..58  (5+5+3+5 = 18 fields, 36 bytes)
+#   5H vmin, 5H vmax, h corriente_accu, h corriente_dcdc, h temp_dcdc, 5h temp_max
+_SNAP_FMT_ARRAYS = struct.Struct('<5H5Hhhh5h')         # 36 bytes
 
-def _i32(data: bytes, offset: int) -> int:
-    return struct.unpack_from('<i', data, offset)[0]
+# Tail: bytes 59..81  (10 fields, 23 bytes)
+#   B inv_state, B inv_vcfg, B inv_err,
+#   H inv_vbus, H inv_tm1, H inv_tpwr, H inv_tbd,
+#   i inv_rpm, i inv_spd, i inv_cur
+_SNAP_FMT_TAIL   = struct.Struct('<BBBHHHHiii')         # 23 bytes
 
-def _u32(data: bytes, offset: int) -> int:
-    return struct.unpack_from('<I', data, offset)[0]
 
 def _decode_snapshot(data: bytes) -> dict:
     """
-    Parse a 102-byte serialized snapshot into a Python dict.
-
-    Matches serialize_radio_snapshot() in app_tasks.cpp exactly:
-
-      [0..3]   tick_ms               uint32 LE
-      [4..5]   seq                   uint16 LE
-      [6]      start_button          uint8  (bool)
-      [7..8]   apps1_raw             uint16 LE
-      [9..10]  apps2_raw             uint16 LE
-      [11..12] brake_raw             uint16 LE
-      [13..14] torque_pct            uint16 LE  (uint8 zero-extended by put_le16)
-      [15]     ev_2_3                uint8
-      [16]     t11_8_9               uint8
-      [17]     state                 uint8
-      [18]     ok_precharge          uint8  (bool)
-      [19]     ams_fsm_state         uint8
-      [20..21] v_cell_min_mV         uint16 LE
-      [22]     soc                   uint8
-      [23..32] vmin_modulo[0..4]     5 × uint16 LE
-      [33..42] vmax_modulo[0..4]     5 × uint16 LE
-      [43..44] corriente_accu        int16  LE  (cast to uint16 on TX)
-      [45..46] corriente_dcdc        int16  LE  (cast to uint16 on TX)
-      [47..48] temp_dcdc             int16  LE  (cast to uint16 on TX)
-      [49..58] temp_max_modulo[0..4] 5 × int16 LE (cast to uint16 on TX)
-      [59]     inv_state             uint8
-      [60]     inv_vconfig_active    uint8  (bool: last_vconfig_tick != 0)
-      [61]     inv_error             uint8
-      [62..63] inv_dc_bus_V          uint16 LE
-      [64..65] inv_temp_motor1       uint16 LE
-      [66..67] inv_temp_pwrstg       uint16 LE
-      [68..69] inv_temp_board        uint16 LE
-      [70..73] inv_rpm               int32  LE
-      [74..77] inv_speed_actual      int32  LE
-      [78..81] inv_current_actual    int32  LE
-      [82..101] reserved / zero
+    Parse a 102-byte serialised snapshot into a Python dict using
+    pre-compiled struct formats (3 bulk unpacks instead of ~20 calls).
+    Matches serialize_radio_snapshot() in app_tasks.cpp exactly.
     """
     if len(data) < SNAPSHOT_SIZE:
         logger.warning(f"_decode_snapshot: short buffer ({len(data)} < {SNAPSHOT_SIZE})")
         return {}
 
+    # ── Head: bytes 0..22 ────────────────────────────────────────────────────
+    (tick_ms, seq, start_button,
+     apps1_raw, apps2_raw, brake_raw,
+     torque_pct, ev_2_3, t11_8_9, state,
+     ok_precharge, ams_fsm_state,
+     v_cell_min_mV, soc) = _SNAP_FMT_HEAD.unpack_from(data, 0)
+
+    # ── Arrays: bytes 23..58 ─────────────────────────────────────────────────
+    arr = _SNAP_FMT_ARRAYS.unpack_from(data, 23)
+    vmin_modulo     = list(arr[0:5])
+    vmax_modulo     = list(arr[5:10])
+    corriente_accu  = arr[10]
+    corriente_dcdc  = arr[11]
+    temp_dcdc       = arr[12]
+    temp_max_modulo = list(arr[13:18])
+
+    # ── Tail: bytes 59..81 ───────────────────────────────────────────────────
+    (inv_state, last_vconfig_tick, inv_error,
+     inv_dc_bus_V,
+     inv_temp_motor1, inv_temp_pwrstg, inv_temp_board,
+     inv_rpm, inv_speed_actual, inv_current_actual) = _SNAP_FMT_TAIL.unpack_from(data, 59)
+
     return {
-        'tick_ms':             _u32(data, 0),
-        'seq':                 _u16(data, 4),
-        'start_button':        data[6],
-        'apps1_raw':           _u16(data, 7),
-        'apps2_raw':           _u16(data, 9),
-        'brake_raw':           _u16(data, 11),
-        'torque_pct':          _u16(data, 13),   # uint8 stored in 2 bytes
-        'ev_2_3':              data[15],
-        't11_8_9':             data[16],
-        'state':               data[17],
-        'ok_precharge':        data[18],
-        'ams_fsm_state':       data[19],
-        'v_cell_min_mV':       _u16(data, 20),
-        'soc':                 data[22],
-        'vmin_modulo':         [_u16(data, 23 + 2 * i) for i in range(5)],
-        'vmax_modulo':         [_u16(data, 33 + 2 * i) for i in range(5)],
-        'corriente_accu':      _i16(data, 43),
-        'corriente_dcdc':      _i16(data, 45),
-        'temp_dcdc':           _i16(data, 47),
-        'temp_max_modulo':     [_i16(data, 49 + 2 * i) for i in range(5)],
-        'inv_state':           data[59],
-        'last_vconfig_tick':   data[60],
-        'inv_error':           data[61],
-        'inv_dc_bus_V':        _u16(data, 62),
-        'inv_temp_motor1':     _u16(data, 64),
-        'inv_temp_pwrstg':     _u16(data, 66),
-        'inv_temp_board':      _u16(data, 68),
-        'inv_rpm':             _i32(data, 70),
-        'inv_speed_actual':    _i32(data, 74),
-        'inv_current_actual':  _i32(data, 78),
+        'tick_ms':            tick_ms,
+        'seq':                seq,
+        'start_button':       start_button,
+        'apps1_raw':          apps1_raw,
+        'apps2_raw':          apps2_raw,
+        'brake_raw':          brake_raw,
+        'torque_pct':         torque_pct,
+        'ev_2_3':             ev_2_3,
+        't11_8_9':            t11_8_9,
+        'state':              state,
+        'ok_precharge':       ok_precharge,
+        'ams_fsm_state':      ams_fsm_state,
+        'v_cell_min_mV':      v_cell_min_mV,
+        'soc':                soc,
+        'vmin_modulo':        vmin_modulo,
+        'vmax_modulo':        vmax_modulo,
+        'corriente_accu':     corriente_accu,
+        'corriente_dcdc':     corriente_dcdc,
+        'temp_dcdc':          temp_dcdc,
+        'temp_max_modulo':    temp_max_modulo,
+        'inv_state':          inv_state,
+        'last_vconfig_tick':  last_vconfig_tick,
+        'inv_error':          inv_error,
+        'inv_dc_bus_V':       inv_dc_bus_V,
+        'inv_temp_motor1':    inv_temp_motor1,
+        'inv_temp_pwrstg':    inv_temp_pwrstg,
+        'inv_temp_board':     inv_temp_board,
+        'inv_rpm':            inv_rpm,
+        'inv_speed_actual':   inv_speed_actual,
+        'inv_current_actual': inv_current_actual,
     }
+
 
 # ================== SNAPSHOT → GLOBAL STATE ==================
 def parse_snapshot(snap: dict) -> None:
     """
     Update latest_data_dict and AMSModule objects from a freshly decoded snapshot.
-    Also maintains backward-compatible 'ams_summary' / 'ams_current' / 'ams_temp_summary'
-    keys so any existing UI code keeps working.
+    Maintains backward-compatible keys so existing UI code keeps working.
     """
     global data_str, ams_modules
 
@@ -464,34 +486,40 @@ def parse_snapshot(snap: dict) -> None:
 
     latest_data_dict['snapshot'] = snap
 
-    # ── Per-module AMS state ──────────────────────────────────────────────────
     vmin = snap.get('vmin_modulo',     [])
     vmax = snap.get('vmax_modulo',     [])
     tmax = snap.get('temp_max_modulo', [])
 
+    ts = time.time()
     for i, mod in enumerate(ams_modules):
         if i < len(vmin): mod.min_cell_mv = vmin[i]
         if i < len(vmax): mod.max_cell_mv = vmax[i]
         if i < len(tmax): mod.max_temp_c  = float(tmax[i])
-        mod.last_update_ts = time.time()
+        mod.last_update_ts = ts
 
-    # ── Backward-compat AMS summary keys ─────────────────────────────────────
+    # Single pass over tmax for all derived stats
     valid_tmax = [t for t in tmax if t != 0]
+    if valid_tmax:
+        tmax_max = max(valid_tmax)
+        tmax_min = min(valid_tmax)
+        tmax_avg = sum(valid_tmax) / len(valid_tmax)
+    else:
+        tmax_max = tmax_min = tmax_avg = 0
+
     latest_data_dict['ams_summary'] = {
         'min_cell_mv': snap.get('v_cell_min_mV', 0),
         'max_cell_mv': max(vmax) if vmax else 0,
-        'stack_mv':    0,  # not in snapshot wire format
+        'stack_mv':    0,
     }
     latest_data_dict['ams_current'] = {
         'current_A': snap.get('corriente_accu', 0),
     }
     latest_data_dict['ams_temp_summary'] = {
-        'max_temp_c': max(valid_tmax) if valid_tmax else 0,
-        'min_temp_c': min(valid_tmax) if valid_tmax else 0,
-        'avg_temp_c': (sum(valid_tmax) / len(valid_tmax)) if valid_tmax else 0,
+        'max_temp_c': tmax_max,
+        'min_temp_c': tmax_min,
+        'avg_temp_c': tmax_avg,
     }
 
-    # ── UI status string ──────────────────────────────────────────────────────
     badge = _status.get('badge', '?')
     data_str = (
         f"[{badge}] SEQ={snap.get('seq', 0):5d}  "
@@ -501,6 +529,7 @@ def parse_snapshot(snap: dict) -> None:
         f"apps2={snap.get('apps2_raw', 0):4d}  "
         f"soc={snap.get('soc', 0):3d}%"
     )
+
 
 # ================== API FOR UI ==================
 def get_ams_module_data(module_idx: int) -> Optional[AMSModule]:
@@ -525,20 +554,241 @@ def get_latest_data(data_id: Optional[str] = None):
         return latest_data_dict.get(data_id, {})
     return latest_data_dict.copy()
 
+
+# ================== POST-RACE DATA INJECTION ==================
+# ─────────────────────────────────────────────────────────────
+# GPS: parse NMEA 0183 log from micro-SD card and merge into session CSV
+# AMS: per-cell temperature injection (format TBD — stub provided)
+# ─────────────────────────────────────────────────────────────
+
+def _parse_latlon(ddmm: str, hemi: str, is_lon: bool) -> Optional[float]:
+    """
+    Convert NMEA ddmm.mmmm + hemisphere char to signed decimal degrees.
+    Returns None on parse error.
+    """
+    if not ddmm or not hemi:
+        return None
+    try:
+        dot = ddmm.index('.')
+    except ValueError:
+        return None
+    deg_digits = 3 if is_lon else 2
+    if dot < (deg_digits + 2):
+        return None
+    try:
+        degrees = float(ddmm[:deg_digits])
+        minutes = float(ddmm[deg_digits:])
+    except ValueError:
+        return None
+    dec = degrees + minutes / 60.0
+    if hemi in ('S', 'W'):
+        dec = -dec
+    return dec
+
+
+def parse_nmea_log(filepath: Path) -> pd.DataFrame:
+    """
+    Parse an NMEA 0183 log file (one sentence per line, from micro-SD logger).
+    Accepts .nmea / .txt / .log / .csv files.
+    Returns a DataFrame with columns:
+      [datetime_utc, gps_lat_deg, gps_lon_deg, gps_sog_knots,
+       gps_cog_deg, gps_sats, gps_fix]
+
+    GPRMC / GNRMC provide position, SOG, COG and the full UTC date+time.
+    GPGGA / GNGGA provide satellite count (cached between RMC sentences).
+    """
+    records   = []
+    sats_cache = 0
+    date_cache: Optional[tuple] = None  # (year, month, day)
+
+    with open(filepath, 'r', errors='ignore') as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line.startswith('$'):
+                continue
+
+            # Strip NMEA checksum
+            star = line.rfind('*')
+            clean = line[:star] if star != -1 else line
+            parts = clean.split(',')
+            if not parts:
+                continue
+
+            sid = parts[0].upper()
+
+            # ── GPRMC / GNRMC ────────────────────────────────────────────────
+            if sid in ('$GPRMC', '$GNRMC') and len(parts) >= 10:
+                try:
+                    time_str = parts[1]           # HHMMSS.ss
+                    status   = parts[2].upper()   # A = valid fix
+                    lat_raw, lat_hem = parts[3], parts[4]
+                    lon_raw, lon_hem = parts[5], parts[6]
+                    sog      = float(parts[7]) if parts[7] else 0.0
+                    cog      = float(parts[8]) if parts[8] else 0.0
+                    date_str = parts[9]           # DDMMYY
+
+                    # Decode date
+                    if len(date_str) == 6:
+                        date_cache = (
+                            2000 + int(date_str[4:6]),
+                            int(date_str[2:4]),
+                            int(date_str[0:2]),
+                        )
+
+                    # Decode time
+                    hh = int(time_str[0:2])
+                    mm = int(time_str[2:4])
+                    ss_f = float(time_str[4:]) if len(time_str) > 4 else 0.0
+                    us   = int((ss_f % 1) * 1_000_000)
+                    ss   = int(ss_f)
+
+                    yr, mo, dy = date_cache if date_cache else (2000, 1, 1)
+                    dt_utc = datetime(yr, mo, dy, hh, mm, ss, us)
+
+                    fix = (status == 'A')
+                    lat = _parse_latlon(lat_raw, lat_hem, is_lon=False) if fix else None
+                    lon = _parse_latlon(lon_raw, lon_hem, is_lon=True)  if fix else None
+
+                    records.append({
+                        'datetime_utc':  dt_utc,
+                        'gps_lat_deg':   lat  if lat is not None else float('nan'),
+                        'gps_lon_deg':   lon  if lon is not None else float('nan'),
+                        'gps_sog_knots': sog,
+                        'gps_cog_deg':   cog,
+                        'gps_sats':      sats_cache,
+                        'gps_fix':       int(fix),
+                    })
+                except (ValueError, IndexError, TypeError):
+                    continue
+
+            # ── GPGGA / GNGGA — satellite count ──────────────────────────────
+            elif sid in ('$GPGGA', '$GNGGA') and len(parts) >= 8:
+                try:
+                    sats_cache = int(parts[7]) if parts[7] else 0
+                except ValueError:
+                    pass
+
+    if not records:
+        return pd.DataFrame(columns=['datetime_utc'] + GPS_MERGE_COLS)
+
+    df = pd.DataFrame(records)
+    df.sort_values('datetime_utc', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def merge_gps_into_session(
+    session_path: Path,
+    gps_file_path: Path,
+    utc_offset_hours: float = 0.0,
+) -> Tuple[bool, str]:
+    """
+    Merge GPS coordinates from an NMEA log (micro-SD) into an existing
+    session CSV.
+
+    Strategy: parse the session 'time' column (local datetime) and the
+    NMEA UTC datetimes.  Apply utc_offset_hours to the GPS times to convert
+    them to local time, then use pandas merge_asof (nearest, ≤5 s tolerance)
+    to align rows.
+
+    Adds/overwrites columns: GPS_MERGE_COLS
+    Returns (success: bool, message: str).
+    """
+    try:
+        session_df = pd.read_csv(session_path)
+        if 'time' not in session_df.columns:
+            return False, "Session CSV missing 'time' column."
+
+        # Parse session timestamps (local time, timezone-naive)
+        session_df['_dt'] = pd.to_datetime(session_df['time'], errors='coerce')
+        if session_df['_dt'].isna().all():
+            return False, "Could not parse 'time' column as datetime."
+
+        # Parse GPS file
+        gps_df = parse_nmea_log(gps_file_path)
+        if gps_df.empty:
+            return False, "No valid GPS sentences found in the NMEA file."
+
+        total_fixes = int(gps_df['gps_fix'].sum())
+        if total_fixes == 0:
+            return False, "NMEA file found but contained 0 valid fixes (status=V)."
+
+        # Apply UTC offset to convert GPS UTC → local time
+        offset = timedelta(hours=utc_offset_hours)
+        gps_df['_dt'] = gps_df['datetime_utc'] + offset
+        gps_df.sort_values('_dt', inplace=True)
+        gps_df.reset_index(drop=True, inplace=True)
+
+        # Sort session by timestamp for merge_asof
+        orig_order = session_df.index.copy()
+        session_df.sort_values('_dt', inplace=True)
+
+        # Drop any previously injected GPS columns to avoid duplicates
+        for col in GPS_MERGE_COLS:
+            if col in session_df.columns:
+                session_df.drop(columns=[col], inplace=True)
+
+        # Nearest-neighbour time join (tolerance = 5 seconds)
+        merged = pd.merge_asof(
+            session_df,
+            gps_df[['_dt'] + GPS_MERGE_COLS],
+            on='_dt',
+            direction='nearest',
+            tolerance=pd.Timedelta(seconds=5),
+        )
+
+        # Restore original row order and drop helper column
+        merged = merged.loc[orig_order.values] if False else merged  # keep sorted
+        merged.drop(columns=['_dt'], inplace=True)
+        merged.to_csv(session_path, index=False)
+
+        matched = int(merged['gps_fix'].notna().sum()) if 'gps_fix' in merged.columns else 0
+        return True, (
+            f"GPS merged — {total_fixes} fixes in file, "
+            f"{matched}/{len(merged)} session rows matched (≤5 s)."
+        )
+
+    except Exception as exc:
+        logger.exception("[POST-RACE] GPS merge error")
+        return False, f"Error: {exc}"
+
+
+def merge_ams_temps_into_session(
+    session_path: Path,
+    ams_file_path: Path,
+) -> Tuple[bool, str]:
+    """
+    Inject per-cell AMS temperature data (19 cells × 5 modules) from a
+    micro-SD log file into the existing session CSV.
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  NOT YET IMPLEMENTED — AMS SD-card log format is TBD.       │
+    │  Expected columns once implemented: AMS_TEMP_COLS           │
+    │  (ams_t_mod{m}_cell{c}, m=0..4, c=0..18)                   │
+    └─────────────────────────────────────────────────────────────┘
+    """
+    return False, (
+        "AMS temperature import is not yet implemented.\n"
+        "The on-car SD-card log format for per-cell temperatures is still TBD.\n"
+        f"When ready, {len(AMS_TEMP_COLS)} columns will be added: "
+        f"ams_t_mod0_cell0 … ams_t_mod4_cell18."
+    )
+
+
 # ================== MAIN RECEIVE LOOP ==================
 def receive_data(bucket_id: str,
                  piloto: str,
                  circuito: str,
                  port: Optional[str] = DEFAULT_PORT,
                  baud: int = DEFAULT_BAUD,
-                 use_influx: bool = False,   # use_influx=True triggers Marple upload
+                 use_influx: bool = False,
                  debug: bool = False) -> None:
 
     global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT
 
     DEBUG_ENABLE_DEFAULT = debug
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    logger.info("Recepción USB-Serial iniciada (protocolo fragmentado v2). Marple Upload: %s", use_influx)
+    logger.info("Recepción USB-Serial iniciada (protocolo fragmentado v3). Marple Upload: %s", use_influx)
 
     _excel_logger = SerialCSVLogger(bucket_id, piloto, circuito)
 
@@ -551,14 +801,14 @@ def receive_data(bucket_id: str,
     logger.info("[CONFIG] port=%s  baud=%d  log=%s", port, baud, _excel_logger.filename)
 
     counters = {
-        "rx":        0,   # raw frames that passed XOR check
-        "frag_ok":   0,   # frames that passed fragment validation
-        "frag_drop": 0,   # frames dropped by _validate_fragment
-        "snapshot":  0,   # complete snapshots reassembled
+        "rx":        0,
+        "frag_ok":   0,
+        "frag_drop": 0,
+        "snapshot":  0,
         "timeout":   0,
         "len":       0,
         "short":     0,
-        "chk":       0,   # XOR mismatch
+        "chk":       0,
     }
     last_stats_t = time.time()
     last_log_t   = time.time()
@@ -571,7 +821,6 @@ def receive_data(bucket_id: str,
 
             payload, err = _read_frame(ser, counters=counters)
 
-            # ── Handle frame-level errors ─────────────────────────────────────
             if err == "timeout":
                 if _last_seq is not None and (now - _last_seq_advance_ts) > _STALE_T:
                     _set_badge("STALE", "sin avance de SEQ")
@@ -590,7 +839,6 @@ def receive_data(bucket_id: str,
 
             counters["rx"] += 1
 
-            # ── Fragment validation ───────────────────────────────────────────
             if not _validate_fragment(payload):
                 counters["frag_drop"] += 1
                 _set_badge("BAD", "frag_invalid")
@@ -598,7 +846,6 @@ def receive_data(bucket_id: str,
 
             counters["frag_ok"] += 1
 
-            # ── SEQ badge tracking (per fragment for fast LIVE detection) ─────
             frag_seq: int = struct.unpack_from('<H', payload, 4)[0]
             if _last_seq is None:
                 _last_seq            = frag_seq
@@ -613,12 +860,10 @@ def receive_data(bucket_id: str,
                 elif (now - _last_seq_advance_ts) > _STALE_T:
                     _set_badge("STALE", "SEQ detenido")
 
-            # ── Reassembly ────────────────────────────────────────────────────
             snapshot_bytes = _process_fragment(payload)
             if snapshot_bytes is None:
-                continue   # waiting for remaining fragments
+                continue
 
-            # ── Complete snapshot received ────────────────────────────────────
             counters["snapshot"] += 1
             snap = _decode_snapshot(snapshot_bytes)
             if not snap:
@@ -628,7 +873,6 @@ def receive_data(bucket_id: str,
             parse_snapshot(snap)
             new_data_flag = 1
 
-            # Log at ~10 Hz to keep CSV manageable
             if now - last_log_t >= 0.1:
                 if _excel_logger:
                     _excel_logger.log_snapshot(latest_data_dict)
@@ -652,7 +896,6 @@ def receive_data(bucket_id: str,
 
         logger.info("Recepción USB-Serial finalizada. Snapshots: %d", counters["snapshot"])
 
-        # ── Marple upload ─────────────────────────────────────────────────────
         if use_influx and file_path:
             logger.info("Iniciando subida a Marple Data...")
             isc_marple.upload_session_csv(file_path, {

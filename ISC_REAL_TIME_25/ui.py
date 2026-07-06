@@ -59,33 +59,94 @@ F1_BLUE     = '#3b82f6'
 F1_PURPLE   = '#8b5cf6'
 
 # Alert thresholds
-ALERT_TEMP_C = 40.0   # °C  — any module max temp above this
-ALERT_VOLT_V = 380    # V   — DC bus below this
+ALERT_TEMP_C   = 40.0   # °C   — any module max temp above this
+ALERT_VOLT_V   = 380    # V    — DC bus below this
+ALERT_CELL_MV  = 3400   # mV   — per-module min cell voltage below this
 
 HISTORY_LEN  = 120    # rolling plot sample depth
 ADC_MAX      = 4095   # 12-bit ADC full scale (pedal normalisation)
 RPM_MAX      = 6000
 
-# Snapshot channels available in the Customise tab
-SNAPSHOT_CHANNELS: Dict[str, str] = {
-    'inv_rpm':             'RPM',
-    'inv_dc_bus_V':        'DC Bus Voltage (V)',
-    'inv_temp_motor1':     'Motor Temp 1 (°C)',
-    'inv_temp_pwrstg':     'PWRSTG Temp (°C)',
-    'inv_temp_board':      'Board Temp (°C)',
-    'inv_current_actual':  'Inverter Current (A)',
-    'inv_speed_actual':    'Motor Speed (actual)',
-    'apps1_raw':           'APPS 1 (raw)',
-    'apps2_raw':           'APPS 2 (raw)',
-    'brake_raw':           'Brake Raw',
-    'torque_pct':          'Torque %',
-    'v_cell_min_mV':       'Min Cell Voltage (mV)',
-    'soc':                 'State of Charge (%)',
-    'corriente_accu':      'Accu Current (raw)',
-    'corriente_dcdc':      'DCDC Current (raw)',
-    'temp_dcdc':           'DCDC Temperature (°C)',
-    'tick_ms':             'RTOS Tick (ms)',
-    'seq':                 'Snapshot Sequence',
+# ── Sony VTC6 95s6p OCV–SoC lookup ───────────────────────────────────────────
+# 95 cells in series × 6 cells in parallel = 570 total cells
+# Pack capacity: 6 × 3.0 Ah = 18 Ah   |   Max voltage: 95 × 4.2 V ≈ 399 V
+# OCV table: (SoC_fraction, cell_OCV_V)  — derived from Sony VTC6 discharge curve
+_VTC6_OCV_TABLE = [
+    (1.000, 4.200), (0.950, 4.150), (0.900, 4.100), (0.800, 4.020),
+    (0.700, 3.940), (0.600, 3.870), (0.500, 3.800), (0.400, 3.740),
+    (0.300, 3.680), (0.200, 3.600), (0.100, 3.500), (0.050, 3.400),
+    (0.000, 3.000),
+]
+
+def soc_from_cell_mv(cell_mv: float) -> float:
+    """Estimate SoC (0–100 %) from minimum cell voltage using VTC6 OCV table."""
+    cell_v = cell_mv / 1000.0
+    for i in range(len(_VTC6_OCV_TABLE) - 1):
+        soc_hi, v_hi = _VTC6_OCV_TABLE[i]
+        soc_lo, v_lo = _VTC6_OCV_TABLE[i + 1]
+        if v_lo <= cell_v <= v_hi:
+            frac = (cell_v - v_lo) / (v_hi - v_lo) if v_hi != v_lo else 0.0
+            return round((soc_lo + frac * (soc_hi - soc_lo)) * 100.0, 1)
+    if cell_v >= _VTC6_OCV_TABLE[0][1]:  return 100.0
+    if cell_v <= _VTC6_OCV_TABLE[-1][1]: return 0.0
+    return 0.0
+
+# ── All ECU signals available in the Customise tab ───────────────────────────
+# Format: 'snapshot_key': ('Display Label', 'unit')
+SNAPSHOT_CHANNELS: Dict[str, tuple] = {
+    # ── Frame header ───────────────────────────────────────────────────────
+    'tick_ms':              ('RTOS Tick',              'ms'),
+    'seq':                  ('Snapshot Seq',           ''),
+    # ── Driver inputs ──────────────────────────────────────────────────────
+    'start_button':         ('Start Button',           '0/1'),
+    'apps1_raw':            ('APPS Sensor A',          'ADC'),
+    'apps2_raw':            ('APPS Sensor B',          'ADC'),
+    'brake_raw':            ('Brake Pressure',         'ADC'),
+    # ── Control FSM ───────────────────────────────────────────────────────
+    'torque_pct':           ('Torque Request',         '%'),
+    'ev_2_3':               ('EV 2/3 Flags',           ''),
+    't11_8_9':              ('T.11 Interlock',         ''),
+    'state':                ('Control FSM State',      ''),
+    # ── Battery / AMS — pack level ─────────────────────────────────────────
+    'ok_precharge':         ('Precharge OK',           '0/1'),
+    'ams_fsm_state':        ('AMS FSM State',          ''),
+    'v_cell_min_mV':        ('Min Cell Voltage',       'mV'),
+    'soc':                  ('State of Charge',        '%'),
+    # ── Battery / AMS — per-module min cell voltage ────────────────────────
+    'vmin_modulo_0':        ('Vmin Module 0',          'mV'),
+    'vmin_modulo_1':        ('Vmin Module 1',          'mV'),
+    'vmin_modulo_2':        ('Vmin Module 2',          'mV'),
+    'vmin_modulo_3':        ('Vmin Module 3',          'mV'),
+    'vmin_modulo_4':        ('Vmin Module 4',          'mV'),
+    # ── Battery / AMS — per-module max cell voltage ────────────────────────
+    'vmax_modulo_0':        ('Vmax Module 0',          'mV'),
+    'vmax_modulo_1':        ('Vmax Module 1',          'mV'),
+    'vmax_modulo_2':        ('Vmax Module 2',          'mV'),
+    'vmax_modulo_3':        ('Vmax Module 3',          'mV'),
+    'vmax_modulo_4':        ('Vmax Module 4',          'mV'),
+    # ── Battery / AMS — current & DC-DC ───────────────────────────────────
+    'corriente_accu':       ('Pack Current',           'dA'),
+    'corriente_dcdc':       ('DC-DC Current',          'dA'),
+    'temp_dcdc':            ('DC-DC Temperature',      'degC'),
+    # ── Battery / AMS — per-module max temperature ─────────────────────────
+    'tmax_modulo_0':        ('Tmax Module 0',          'degC'),
+    'tmax_modulo_1':        ('Tmax Module 1',          'degC'),
+    'tmax_modulo_2':        ('Tmax Module 2',          'degC'),
+    'tmax_modulo_3':        ('Tmax Module 3',          'degC'),
+    'tmax_modulo_4':        ('Tmax Module 4',          'degC'),
+    # ── Inverter status ───────────────────────────────────────────────────
+    'inv_state':            ('Inverter State',         ''),
+    'inv_vconfig_active':   ('Vconfig Active',         '0/1'),
+    'inv_error':            ('Inverter Error',         ''),
+    # ── Inverter electrical ───────────────────────────────────────────────
+    'inv_dc_bus_V':         ('DC Bus Voltage',         'V'),
+    'inv_temp_motor1':      ('Motor Temperature',      'degC'),
+    'inv_temp_pwrstg':      ('Power Stage Temp',       'degC'),
+    'inv_temp_board':       ('Inverter Board Temp',    'degC'),
+    # ── Motor speed & current ─────────────────────────────────────────────
+    'inv_rpm':              ('Motor Speed',            'RPM'),
+    'inv_speed_actual':     ('Speed Feedback',         'RPM'),
+    'inv_current_actual':   ('Motor Current',          'A'),
 }
 
 plt.style.use('dark_background')
@@ -531,8 +592,9 @@ class ChannelListWidget(QListWidget):
             QListWidget::item:selected {{ background: {ISC_GREEN}; color: {F1_DARK_BG}; }}
             QListWidget::item:hover    {{ background: #2a2a2a; }}
         """)
-        for key, label in SNAPSHOT_CHANNELS.items():
-            item = QListWidgetItem(label)
+        for key, (label, unit) in SNAPSHOT_CHANNELS.items():
+            display = f"{label}  [{unit}]" if unit else label
+            item = QListWidgetItem(display)
             item.setData(Qt.UserRole, key)
             self.addItem(item)
 
@@ -617,13 +679,19 @@ class DroppablePlotPanel(QFrame):
     # ── assignment ────────────────────────────────────────────────────────────
     def assign_channel(self, key: str) -> None:
         self._channel = key
-        self._title_lbl.setText(SNAPSHOT_CHANNELS.get(key, key))
+        label, unit = SNAPSHOT_CHANNELS.get(key, (key, ''))
+        self._unit = unit
+        title_txt = f"{label}  [{unit}]" if unit else label
+        self._title_lbl.setText(title_txt)
         self._title_lbl.setStyleSheet(
             f"color:{ISC_GREEN}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+        # Update y-axis label with unit
+        self._ax.set_ylabel(unit, fontsize=6, color='#555')
         self._history = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
 
     def clear_channel(self) -> None:
         self._channel = None
+        self._unit = ''
         self._title_lbl.setText(f"Drop channel here  (panel {self._idx})")
         self._title_lbl.setStyleSheet("color:#444; font-size:9px; background:transparent; border:none;")
         self._history  = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
@@ -641,8 +709,25 @@ class DroppablePlotPanel(QFrame):
     def update_value(self, snapshot: dict) -> None:
         if not self._channel:
             return
-        raw = snapshot.get(self._channel, 0)
-        val = float(raw[0] if isinstance(raw, list) else raw)
+        # Flat key lookup first; then handle per-module array channels
+        key = self._channel
+        if key in snapshot:
+            raw = snapshot[key]
+            val = float(raw[0] if isinstance(raw, list) else raw)
+        elif key.startswith('vmin_modulo_'):
+            idx = int(key[-1])
+            arr = snapshot.get('vmin_modulo', [])
+            val = float(arr[idx]) if idx < len(arr) else 0.0
+        elif key.startswith('vmax_modulo_'):
+            idx = int(key[-1])
+            arr = snapshot.get('vmax_modulo', [])
+            val = float(arr[idx]) if idx < len(arr) else 0.0
+        elif key.startswith('tmax_modulo_'):
+            idx = int(key[-1])
+            arr = snapshot.get('temp_max_modulo', [])
+            val = float(arr[idx]) if idx < len(arr) else 0.0
+        else:
+            val = 0.0
         self._history.append(val)
         y = list(self._history)
         x = list(range(len(y)))
@@ -652,7 +737,8 @@ class DroppablePlotPanel(QFrame):
         self._ax.set_xlim(0, HISTORY_LEN)
         self._ax.set_ylim(lo - mg, hi + mg)
         self._canvas.draw_idle()
-        self._val_lbl.setText(f"{val:.1f}")
+        unit = getattr(self, '_unit', '')
+        self._val_lbl.setText(f"{val:.1f} {unit}" if unit else f"{val:.1f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -663,7 +749,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ISCmetrics — Ajustes")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setGeometry(200, 200, 420, 270)
+        self.setGeometry(200, 200, 440, 300)
         self._p = parent
         self.setStyleSheet(f"QDialog {{ background:{F1_DARK_BG}; color:{F1_TEXT}; }}")
         self._build()
@@ -672,7 +758,7 @@ class SettingsDialog(QDialog):
         g = QGridLayout(self)
         g.setSpacing(10)
         g.setContentsMargins(16, 16, 16, 16)
-        ls = f"color:{F1_TEXT}; font-size:11px; font-weight:bold;"
+        ls  = f"color:{F1_TEXT}; font-size:11px; font-weight:bold;"
         ins = self._p.get_input_style()
 
         g.addWidget(self._lbl("COM Port:", ls), 0, 0)
@@ -787,6 +873,360 @@ class SessionViewerWindow(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  POST-RACE WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
+class PostRaceWindow(QWidget):
+    """
+    Post-race data injection window.
+
+    Allows the engineer to merge data recorded on the car's micro-SD card
+    (GPS coordinates from NMEA log, AMS per-cell temperatures) into an
+    existing telemetry session CSV, ready for analysis in Marple / Excel.
+
+    Two panels:
+      • GPS Coordinates  — select NMEA log (.nmea / .txt / .log)
+      • AMS Temperatures — select AMS SD-card file (format TBD)
+    """
+
+    # UTC-offset labels shown in the combo box
+    _UTC_OFFSETS = [
+        ("UTC+0  (Portugal / UK)",     0),
+        ("UTC+1  (Central Europe / CET)", 1),
+        ("UTC+2  (Central Europe / CEST — Spain summer)", 2),
+        ("UTC+3  (Eastern Europe)", 3),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ISCmetrics — Post-Race Analysis")
+        self.setGeometry(120, 120, 1050, 680)
+        self.setMinimumSize(900, 580)
+        self.setStyleSheet(f"background:{F1_DARK_BG}; color:{F1_TEXT};")
+        self._session_path: Optional[Path] = None
+        self._gps_file_path: Optional[Path] = None
+        self._ams_file_path: Optional[Path] = None
+        self._build()
+        self._refresh_sessions()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        title = QLabel("POST-RACE DATA INJECTION")
+        title.setStyleSheet(
+            f"color:{ISC_GREEN}; font-size:16px; font-weight:bold; "
+            f"border-bottom:2px solid {ISC_GREEN}; padding-bottom:6px;")
+        root.addWidget(title)
+
+        sub = QLabel(
+            "Merge data recorded on the car's micro-SD card into an existing session CSV.")
+        sub.setStyleSheet("color:#555; font-size:10px;")
+        root.addWidget(sub)
+
+        # ── Session selector row ───────────────────────────────────────────────
+        sel_row = QHBoxLayout()
+        lbl_s = QLabel("Session CSV:")
+        lbl_s.setStyleSheet(f"color:{ISC_GREEN}; font-weight:bold; font-size:11px;")
+        sel_row.addWidget(lbl_s)
+
+        self._session_combo = QComboBox()
+        self._session_combo.setMinimumWidth(460)
+        self._session_combo.setStyleSheet(
+            f"background:{F1_MID_BG}; color:{F1_TEXT}; border:1px solid {ISC_GREEN}; "
+            f"font-size:11px; padding:3px; border-radius:2px;")
+        self._session_combo.currentIndexChanged.connect(self._on_session_changed)
+        sel_row.addWidget(self._session_combo, stretch=1)
+
+        btn_ref = QPushButton("⟳ Refresh")
+        btn_ref.setStyleSheet(
+            f"background:{F1_MID_BG}; color:{ISC_GREEN}; border:1px solid {ISC_GREEN}; "
+            f"padding:4px 10px; font-size:10px; border-radius:2px;")
+        btn_ref.clicked.connect(self._refresh_sessions)
+        sel_row.addWidget(btn_ref)
+        root.addLayout(sel_row)
+
+        # Session info
+        self._session_info = QLabel("No session selected.")
+        self._session_info.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
+        root.addWidget(self._session_info)
+
+        # ── Two injection panels ───────────────────────────────────────────────
+        panels = QHBoxLayout()
+        panels.setSpacing(12)
+        panels.addWidget(self._build_gps_panel(), stretch=1)
+        panels.addWidget(self._build_ams_panel(), stretch=1)
+        root.addLayout(panels, stretch=1)
+
+        # ── Log area ──────────────────────────────────────────────────────────
+        log_box = QGroupBox("IMPORT LOG")
+        log_box.setStyleSheet(
+            f"QGroupBox {{ color:{ISC_GREEN}; border:1px solid #222; "
+            f"margin-top:10px; font-size:9px; font-weight:bold; }}")
+        log_lay = QVBoxLayout(log_box)
+        log_lay.setContentsMargins(4, 6, 4, 4)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumHeight(120)
+        self._log.setStyleSheet(
+            f"background:{F1_DARK_BG}; color:{F1_TEXT}; "
+            f"font-family:'Courier New'; font-size:9px; border:none;")
+        log_lay.addWidget(self._log)
+        root.addWidget(log_box)
+
+    def _build_gps_panel(self) -> QGroupBox:
+        """GPS coordinates injection panel."""
+        box = QGroupBox("GPS COORDINATES")
+        box.setStyleSheet(
+            f"QGroupBox {{ color:{F1_BLUE}; border:1px solid {F1_BLUE}; "
+            f"margin-top:14px; font-size:10px; font-weight:bold; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin; "
+            f"subcontrol-position:top left; padding:0 6px; "
+            f"color:{F1_BLUE}; background:{F1_DARK_BG}; }}")
+        v = QVBoxLayout(box)
+        v.setSpacing(8)
+        v.setContentsMargins(10, 14, 10, 10)
+
+        # Description
+        desc = QLabel(
+            "Select the NMEA 0183 log file recorded by the on-board GPS module\n"
+            "(MTK3339 micro-SD logger). Accepted formats: .nmea, .txt, .log, .csv")
+        desc.setStyleSheet(f"color:{F1_TEXT}; font-size:9px;")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+        # File selector
+        file_row = QHBoxLayout()
+        self._gps_file_lbl = QLabel("No file selected.")
+        self._gps_file_lbl.setStyleSheet("color:#555; font-size:9px; font-family:'Courier New';")
+        file_row.addWidget(self._gps_file_lbl, stretch=1)
+
+        btn_browse = QPushButton("Browse…")
+        btn_browse.setStyleSheet(
+            f"background:{F1_MID_BG}; color:{F1_BLUE}; border:1px solid {F1_BLUE}; "
+            f"padding:4px 10px; font-size:10px; border-radius:2px;")
+        btn_browse.clicked.connect(self._browse_gps)
+        file_row.addWidget(btn_browse)
+        v.addLayout(file_row)
+
+        # UTC offset
+        off_row = QHBoxLayout()
+        off_lbl = QLabel("GPS time zone:")
+        off_lbl.setStyleSheet(f"color:{F1_TEXT}; font-size:10px; font-weight:bold;")
+        off_row.addWidget(off_lbl)
+        self._utc_offset_combo = QComboBox()
+        self._utc_offset_combo.setStyleSheet(
+            f"background:{F1_MID_BG}; color:{F1_TEXT}; border:1px solid #333; "
+            f"font-size:9px; padding:3px; border-radius:2px;")
+        for label, _ in self._UTC_OFFSETS:
+            self._utc_offset_combo.addItem(label)
+        self._utc_offset_combo.setCurrentIndex(2)   # default UTC+2 (Spain CEST)
+        off_row.addWidget(self._utc_offset_combo, stretch=1)
+        v.addLayout(off_row)
+
+        v.addStretch()
+
+        # Import button + status
+        self._gps_status = QLabel("Ready.")
+        self._gps_status.setStyleSheet("color:#555; font-size:9px; font-family:'Courier New';")
+        self._gps_status.setWordWrap(True)
+        v.addWidget(self._gps_status)
+
+        btn_import = QPushButton("⬇  Import GPS Data")
+        btn_import.setStyleSheet(
+            f"QPushButton {{ background:{F1_BLUE}; color:{F1_DARK_BG}; border:none; "
+            f"border-radius:3px; padding:7px 14px; font-size:11px; font-weight:bold; }}"
+            f"QPushButton:hover {{ background:#60a5fa; }}"
+            f"QPushButton:disabled {{ background:#1e3a5f; color:#444; }}")
+        btn_import.clicked.connect(self._import_gps)
+        v.addWidget(btn_import)
+
+        return box
+
+    def _build_ams_panel(self) -> QGroupBox:
+        """AMS temperature injection panel."""
+        box = QGroupBox("AMS TEMPERATURES")
+        box.setStyleSheet(
+            f"QGroupBox {{ color:{F1_WARNING}; border:1px solid {F1_WARNING}; "
+            f"margin-top:14px; font-size:10px; font-weight:bold; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin; "
+            f"subcontrol-position:top left; padding:0 6px; "
+            f"color:{F1_WARNING}; background:{F1_DARK_BG}; }}")
+        v = QVBoxLayout(box)
+        v.setSpacing(8)
+        v.setContentsMargins(10, 14, 10, 10)
+
+        # Description
+        desc = QLabel(
+            "Select the AMS temperature log file from the micro-SD card.\n"
+            "When merged, adds 95 columns (ams_t_mod{m}_cell{c}) to the session CSV.")
+        desc.setStyleSheet(f"color:{F1_TEXT}; font-size:9px;")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+        # Coming-soon notice
+        notice = QFrame()
+        notice.setStyleSheet(
+            f"QFrame {{ background:#2a1a00; border:1px solid {F1_WARNING}; border-radius:4px; }}")
+        nl = QVBoxLayout(notice)
+        nl.setContentsMargins(10, 8, 10, 8)
+        nt = QLabel("⚠  AMS SD-card log format is not yet finalised.")
+        nt.setStyleSheet(f"color:{F1_WARNING}; font-size:10px; font-weight:bold;")
+        nd = QLabel(
+            "Import will be enabled once the on-board AMS logger firmware\n"
+            "and output format are defined.")
+        nd.setStyleSheet("color:#888; font-size:9px;")
+        nd.setWordWrap(True)
+        nl.addWidget(nt)
+        nl.addWidget(nd)
+        v.addWidget(notice)
+
+        # File selector (visible but disabled)
+        file_row = QHBoxLayout()
+        self._ams_file_lbl = QLabel("No file selected.")
+        self._ams_file_lbl.setStyleSheet("color:#333; font-size:9px; font-family:'Courier New';")
+        file_row.addWidget(self._ams_file_lbl, stretch=1)
+
+        btn_browse = QPushButton("Browse…")
+        btn_browse.setStyleSheet(
+            f"background:{F1_MID_BG}; color:#555; border:1px solid #444; "
+            f"padding:4px 10px; font-size:10px; border-radius:2px;")
+        btn_browse.clicked.connect(self._browse_ams)
+        file_row.addWidget(btn_browse)
+        v.addLayout(file_row)
+
+        v.addStretch()
+
+        # Status
+        self._ams_status = QLabel("Not yet implemented.")
+        self._ams_status.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
+        self._ams_status.setWordWrap(True)
+        v.addWidget(self._ams_status)
+
+        btn_import = QPushButton("⬇  Import AMS Temperatures")
+        btn_import.setEnabled(False)
+        btn_import.setStyleSheet(
+            f"QPushButton {{ background:#222; color:#444; border:1px solid #333; "
+            f"border-radius:3px; padding:7px 14px; font-size:11px; font-weight:bold; }}"
+            f"QPushButton:enabled:hover {{ background:{F1_WARNING}; color:{F1_DARK_BG}; }}")
+        btn_import.clicked.connect(self._import_ams)
+        v.addWidget(btn_import)
+
+        return box
+
+    # ── Session list helpers ──────────────────────────────────────────────────
+    def _refresh_sessions(self):
+        self._session_combo.clear()
+        sessions = rtt.list_excel_sessions()
+        if not sessions:
+            self._session_combo.addItem("(no sessions found)", None)
+            self._session_path = None
+            self._session_info.setText("No session files found in logs/.")
+            return
+        for s in sessions:
+            self._session_combo.addItem(s.name, str(s))
+        self._on_session_changed(0)
+
+    def _on_session_changed(self, idx: int):
+        path_str = self._session_combo.currentData()
+        if not path_str:
+            self._session_path = None
+            self._session_info.setText("")
+            return
+        p = Path(path_str)
+        self._session_path = p
+        try:
+            import os
+            size_kb = p.stat().st_size / 1024
+            # Count rows quickly
+            with open(p, 'r', errors='ignore') as f:
+                rows = sum(1 for _ in f) - 1  # minus header
+            self._session_info.setText(
+                f"{p}   |   {rows} rows   |   {size_kb:.1f} KB")
+        except Exception:
+            self._session_info.setText(str(p))
+
+    # ── File browse handlers ──────────────────────────────────────────────────
+    def _browse_gps(self):
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select NMEA GPS log file", "",
+            "NMEA / Text files (*.nmea *.txt *.log *.csv);;All files (*.*)")
+        if path:
+            self._gps_file_path = Path(path)
+            self._gps_file_lbl.setText(self._gps_file_path.name)
+            self._gps_file_lbl.setStyleSheet(
+                f"color:{F1_BLUE}; font-size:9px; font-family:'Courier New';")
+            self._gps_status.setText("File selected — click Import to merge.")
+            self._gps_status.setStyleSheet(
+                f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
+
+    def _browse_ams(self):
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select AMS temperature log file", "",
+            "CSV / Text files (*.csv *.txt *.log);;All files (*.*)")
+        if path:
+            self._ams_file_path = Path(path)
+            self._ams_file_lbl.setText(self._ams_file_path.name)
+            self._ams_file_lbl.setStyleSheet(
+                "color:#555; font-size:9px; font-family:'Courier New';")
+
+    # ── Import handlers ───────────────────────────────────────────────────────
+    def _import_gps(self):
+        if not self._session_path:
+            QMessageBox.warning(self, "No session", "Please select a session CSV first.")
+            return
+        if not self._gps_file_path:
+            QMessageBox.warning(self, "No GPS file", "Please browse to a GPS NMEA log file first.")
+            return
+
+        utc_off = self._UTC_OFFSETS[self._utc_offset_combo.currentIndex()][1]
+        self._log_append(
+            f"[GPS] Merging {self._gps_file_path.name} "
+            f"→ {self._session_path.name}  (UTC+{utc_off})")
+
+        self._gps_status.setText("Merging… please wait.")
+        self._gps_status.setStyleSheet(
+            f"color:{F1_WARNING}; font-size:9px; font-family:'Courier New';")
+        QApplication.processEvents()
+
+        ok, msg = rtt.merge_gps_into_session(
+            self._session_path, self._gps_file_path, utc_offset_hours=utc_off)
+
+        if ok:
+            self._gps_status.setText(f"✓  {msg}")
+            self._gps_status.setStyleSheet(
+                f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
+            self._log_append(f"[GPS] ✓ {msg}")
+            # Refresh session info (size/rows may have changed)
+            self._on_session_changed(self._session_combo.currentIndex())
+        else:
+            self._gps_status.setText(f"✗  {msg}")
+            self._gps_status.setStyleSheet(
+                f"color:{F1_ERROR}; font-size:9px; font-family:'Courier New';")
+            self._log_append(f"[GPS] ✗ {msg}")
+
+    def _import_ams(self):
+        if not self._session_path:
+            QMessageBox.warning(self, "No session", "Please select a session CSV first.")
+            return
+        if not self._ams_file_path:
+            QMessageBox.warning(self, "No AMS file", "Please browse to an AMS log file first.")
+            return
+
+        ok, msg = rtt.merge_ams_temps_into_session(self._session_path, self._ams_file_path)
+        self._ams_status.setText(f"{'✓' if ok else '✗'}  {msg}")
+        self._log_append(f"[AMS] {'✓' if ok else '✗'} {msg}")
+
+    def _log_append(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] {msg}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
@@ -799,8 +1239,8 @@ class MainWindow(QMainWindow):
         self.demo_mode    = self.settings["demo_mode"]
         self.is_receiving = False
         self.rx_thread: Optional[threading.Thread] = None
-        self._session_viewer: Optional[SessionViewerWindow] = None
-        self._settings_dlg:   Optional[SettingsDialog]      = None
+        self._post_race_win: Optional["PostRaceWindow"] = None
+        self._settings_dlg: Optional[SettingsDialog]    = None
         self._log: Optional[QTextEdit] = None
 
         icon = Path("isc_logo.ico")
@@ -895,10 +1335,10 @@ class MainWindow(QMainWindow):
 
         self._tabs = QTabWidget()
         self._tabs.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self._tabs.addTab(self._tab_overview(),   "▶  Overview")
-        self._tabs.addTab(self._tab_customize(),  "⚙  Customize")
-        self._tabs.addTab(self._tab_powertrain(), "⚡  Powertrain")
-        self._tabs.addTab(self._tab_dynamics(),   "🏎  Dynamics")
+        self._tabs.addTab(self._tab_overview(),   "Overview")
+        self._tabs.addTab(self._tab_customize(),  "Customize")
+        self._tabs.addTab(self._tab_powertrain(), "Powertrain")
+        self._tabs.addTab(self._tab_dynamics(),   "Dynamics")
         vbox.addWidget(self._tabs, stretch=10)
 
         vbox.addWidget(self._make_log_strip(), stretch=1)
@@ -971,26 +1411,26 @@ class MainWindow(QMainWindow):
 
         # Buttons
         bg = QGridLayout(); bg.setSpacing(4)
-        self._btn_start = QPushButton("▶ START")
+        self._btn_start = QPushButton("START")
         self._btn_start.setStyleSheet(self.get_button_style('accent'))
         self._btn_start.clicked.connect(self._start)
         bg.addWidget(self._btn_start, 0, 0)
 
-        self._btn_stop = QPushButton("■ STOP")
+        self._btn_stop = QPushButton("STOP")
         self._btn_stop.setStyleSheet(self.get_button_style())
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._stop)
         bg.addWidget(self._btn_stop, 0, 1)
 
-        self._btn_settings = QPushButton("⚙ Settings")
+        self._btn_settings = QPushButton("Settings")
         self._btn_settings.setStyleSheet(self.get_button_style())
         self._btn_settings.clicked.connect(self._open_settings)
         bg.addWidget(self._btn_settings, 1, 0)
 
-        btn_sess = QPushButton("📁 Sessions")
-        btn_sess.setStyleSheet(self.get_button_style())
-        btn_sess.clicked.connect(self._open_sessions)
-        bg.addWidget(btn_sess, 1, 1)
+        btn_post = QPushButton("Post-Race")
+        btn_post.setStyleSheet(self.get_button_style())
+        btn_post.clicked.connect(self._open_post_race)
+        bg.addWidget(btn_post, 1, 1)
         h.addLayout(bg)
         return bar
 
@@ -1003,10 +1443,10 @@ class MainWindow(QMainWindow):
         cr = QHBoxLayout(); cr.setSpacing(6)
         self._ov_rpm    = MetricCard("RPM",         "rpm",  ISC_GREEN)
         self._ov_vbus   = MetricCard("DC BUS",      "V",    ISC_GREEN)
-        self._ov_temp   = MetricCard("MAX TEMP",    "°C",   F1_ERROR)
-        self._ov_soc    = MetricCard("SOC",         "%",    F1_BLUE)
-        self._ov_torque = MetricCard("TORQUE",      "%",    ISC_GREEN)
-        self._ov_cur    = MetricCard("INV CURRENT", "A",    F1_PURPLE)
+        self._ov_temp   = MetricCard("MAX TEMP",    "degC", F1_ERROR)
+        self._ov_soc    = MetricCard("SOC (VTC6)",  "%",    F1_BLUE)
+        self._ov_torque = MetricCard("TORQUE REQ",  "%",    ISC_GREEN)
+        self._ov_cur    = MetricCard("MOTOR I",     "A",    F1_PURPLE)
         self._ov_vcell  = MetricCard("MIN CELL",    "mV",   F1_WARNING)
         self._ov_state  = MetricCard("INV STATE",   "",     ISC_GREEN)
         for c in (self._ov_rpm, self._ov_vbus, self._ov_temp, self._ov_soc,
@@ -1014,14 +1454,40 @@ class MainWindow(QMainWindow):
             cr.addWidget(c)
         v.addLayout(cr, stretch=2)
 
-        # Rolling plots (3)
+        # Rolling plots row: RPM | DC Bus | Max Temp | Throttle+Brake overlay
         pr = QHBoxLayout(); pr.setSpacing(6)
-        self._ov_plot_rpm  = MplCanvas("RPM History",           ISC_GREEN)
-        self._ov_plot_vbus = MplCanvas("DC Bus Voltage (V)",    F1_WARNING)
-        self._ov_plot_temp = MplCanvas("Max Battery Temp (°C)", F1_ERROR)
+        self._ov_plot_rpm  = MplCanvas("Motor Speed  [RPM]",      ISC_GREEN)
+        self._ov_plot_vbus = MplCanvas("DC Bus Voltage  [V]",     F1_WARNING)
+        self._ov_plot_temp = MplCanvas("Max Battery Temp  [degC]",F1_ERROR)
+
+        # Throttle + Brake dual-line canvas
+        self._ov_thr_hist: Deque[float] = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        self._ov_brk_hist: Deque[float] = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        fig_tb = Figure(figsize=(4, 2), tight_layout=True)
+        fig_tb.patch.set_facecolor(F1_PANEL_BG)
+        self._ax_tb = fig_tb.add_subplot(111)
+        self._line_thr, = self._ax_tb.plot([], [], color=ISC_GREEN,  linewidth=1.4, label='Throttle [%]')
+        self._line_brk, = self._ax_tb.plot([], [], color=F1_ERROR,   linewidth=1.4, label='Brake [%]')
+        self._ax_tb.set_facecolor(F1_DARK_BG)
+        self._ax_tb.set_title('Throttle / Brake  [%]', color=F1_WARNING,
+                               fontsize=8, fontweight='bold', pad=2)
+        self._ax_tb.set_ylim(-5, 105)
+        self._ax_tb.set_xlim(0, HISTORY_LEN)
+        self._ax_tb.tick_params(labelsize=6, colors='#555')
+        self._ax_tb.grid(True, alpha=0.3)
+        self._ax_tb.legend(fontsize=6, loc='upper left',
+                           facecolor=F1_PANEL_BG, labelcolor=F1_TEXT,
+                           edgecolor='#333', framealpha=0.8)
+        for sp in self._ax_tb.spines.values(): sp.set_color('#2a2a2a')
+        self._canvas_tb = FigureCanvas(fig_tb)
+        tb_widget = QWidget()
+        tb_lay = QVBoxLayout(tb_widget); tb_lay.setContentsMargins(0,0,0,0)
+        tb_lay.addWidget(self._canvas_tb)
+
         pr.addWidget(self._ov_plot_rpm)
         pr.addWidget(self._ov_plot_vbus)
         pr.addWidget(self._ov_plot_temp)
+        pr.addWidget(tb_widget)
         v.addLayout(pr, stretch=5)
 
         # State / indicator row
@@ -1100,12 +1566,12 @@ class MainWindow(QMainWindow):
         # Battery summary
         bsb = QGroupBox("BATTERY SUMMARY")
         bsg = QGridLayout(bsb)
-        self._pt_vbus  = MetricCard("DC Bus",    "V",    ISC_GREEN)
-        self._pt_soc   = MetricCard("SOC",       "%",    F1_BLUE)
-        self._pt_iaccu = MetricCard("Accu I",    "raw",  F1_PURPLE)
-        self._pt_idcdc = MetricCard("DCDC I",    "raw",  ISC_GREEN)
-        self._pt_vcell = MetricCard("Min Cell",  "mV",   F1_WARNING)
-        self._pt_ams   = MetricCard("AMS State", "",     ISC_GREEN)
+        self._pt_vbus  = MetricCard("DC Bus",       "",  ISC_GREEN)
+        self._pt_soc   = MetricCard("SOC (VTC6)",   "",  F1_BLUE)
+        self._pt_iaccu = MetricCard("Pack Current",  "",  F1_PURPLE)
+        self._pt_idcdc = MetricCard("DC-DC Current", "",  ISC_GREEN)
+        self._pt_vcell = MetricCard("Min Cell V",    "",  F1_WARNING)
+        self._pt_ams   = MetricCard("AMS State",     "",  ISC_GREEN)
         bsg.addWidget(self._pt_vbus,  0, 0); bsg.addWidget(self._pt_soc,   0, 1)
         bsg.addWidget(self._pt_iaccu, 1, 0); bsg.addWidget(self._pt_idcdc, 1, 1)
         bsg.addWidget(self._pt_vcell, 2, 0); bsg.addWidget(self._pt_ams,   2, 1)
@@ -1115,19 +1581,19 @@ class MainWindow(QMainWindow):
         # ── Bottom section: per-module bars ────────────────────────────────────
         bot = QHBoxLayout(); bot.setSpacing(8)
 
-        vbox_v = QGroupBox("PER-MODULE CELL VOLTAGE  (min → max mV)   ·   ⚠ < 3200 mV")
+        vbox_v = QGroupBox(f"PER-MODULE CELL VOLTAGE  [mV]   (min to max)   —   ALERT < {ALERT_CELL_MV} mV")
         vbv = QVBoxLayout(vbox_v)
         self._mod_v_bars: List[ModuleBarWidget] = []
         for i in range(5):
-            b = ModuleBarWidget(i, "mV", lo=2800, hi=4250, warn_lo=3200)
+            b = ModuleBarWidget(i, "mV", lo=2800, hi=4250, warn_lo=ALERT_CELL_MV)
             vbv.addWidget(b); self._mod_v_bars.append(b)
         bot.addWidget(vbox_v, stretch=1)
 
-        vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE (°C)   ·   ⚠ > {ALERT_TEMP_C:.0f} °C")
+        vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {ALERT_TEMP_C:.0f} degC")
         vbt = QVBoxLayout(vbox_t)
         self._mod_t_bars: List[ModuleBarWidget] = []
         for i in range(5):
-            b = ModuleBarWidget(i, "°C", lo=0, hi=80, warn_hi=ALERT_TEMP_C)
+            b = ModuleBarWidget(i, "degC", lo=0, hi=80, warn_hi=ALERT_TEMP_C)
             vbt.addWidget(b); self._mod_t_bars.append(b)
         bot.addWidget(vbox_t, stretch=1)
         v.addLayout(bot, stretch=3)
@@ -1204,13 +1670,17 @@ class MainWindow(QMainWindow):
         tmax = s.get('temp_max_modulo', [])
         valid_t = [t for t in tmax if t != 0]
         if valid_t and max(valid_t) > ALERT_TEMP_C:
-            alerts.append((f"⚠  BATTERY TEMP {max(valid_t):.0f}°C > {ALERT_TEMP_C:.0f}°C", 'critical'))
+            alerts.append((f"BATTERY TEMP {max(valid_t):.0f} degC > {ALERT_TEMP_C:.0f} degC", 'critical'))
         vbus = s.get('inv_dc_bus_V', 0)
         if 0 < vbus < ALERT_VOLT_V:
-            alerts.append((f"⚠  DC BUS {vbus} V < {ALERT_VOLT_V} V", 'warning'))
+            alerts.append((f"DC BUS {vbus} V < {ALERT_VOLT_V} V", 'warning'))
+        vcell = s.get('v_cell_min_mV', 0)
+        if 0 < vcell < ALERT_CELL_MV:
+            alerts.append((f"MIN CELL {vcell} mV < {ALERT_CELL_MV} mV", 'critical'))
         self._alert_banner.set_alerts(alerts)
-        self._ov_temp.set_alert(any(a[1] == 'critical' for a in alerts))
+        self._ov_temp.set_alert(any(a[1] == 'critical' and 'TEMP' in a[0] for a in alerts))
         self._ov_vbus.set_alert(any('DC BUS' in a[0] for a in alerts))
+        self._ov_vcell.set_alert(any('MIN CELL' in a[0] for a in alerts))
 
     # ── Main update loop ──────────────────────────────────────────────────────
     def _update(self):
@@ -1263,10 +1733,13 @@ class MainWindow(QMainWindow):
         tmax   = s.get('temp_max_modulo',  [0]*5)
         max_t  = max((t for t in tmax if t != 0), default=0)
 
+        # SoC from VTC6 OCV table (overrides raw ECU value if cell voltage available)
+        soc_vtc6 = soc_from_cell_mv(vcell) if vcell > 0 else float(soc)
+
         self._ov_rpm.set_value(f"{int(rpm):,}")
         self._ov_vbus.set_value(f"{vbus}")
         self._ov_temp.set_value(f"{max_t:.0f}")
-        self._ov_soc.set_value(f"{soc}")
+        self._ov_soc.set_value(f"{soc_vtc6:.1f}")
         self._ov_torque.set_value(f"{tpct}")
         self._ov_cur.set_value(f"{icur}")
         self._ov_vcell.set_value(f"{vcell}")
@@ -1274,11 +1747,25 @@ class MainWindow(QMainWindow):
 
         self._mini_rpm.setText(f"{int(rpm):,} rpm")
         self._mini_vbus.setText(f"{vbus} V")
-        self._mini_temp.setText(f"{max_t:.0f} °C")
+        self._mini_temp.setText(f"{max_t:.0f} degC")
 
         self._ov_plot_rpm.update_plot(rpm)
         self._ov_plot_vbus.update_plot(vbus)
         self._ov_plot_temp.update_plot(max_t)
+
+        # Throttle + Brake overlay plot
+        a1    = s.get('apps1_raw', 0)
+        a2    = s.get('apps2_raw', 0)
+        brk   = s.get('brake_raw', 0)
+        thr_pct = max(a1, a2) / ADC_MAX * 100.0
+        brk_pct = brk / ADC_MAX * 100.0
+        self._ov_thr_hist.append(thr_pct)
+        self._ov_brk_hist.append(brk_pct)
+        xt  = list(range(HISTORY_LEN))
+        self._line_thr.set_data(xt, list(self._ov_thr_hist))
+        self._line_brk.set_data(xt, list(self._ov_brk_hist))
+        self._ax_tb.set_xlim(0, HISTORY_LEN)
+        self._canvas_tb.draw_idle()
 
         def _ind(lbl, text, on):
             lbl.setText(f"● {text}")
@@ -1292,15 +1779,18 @@ class MainWindow(QMainWindow):
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
         self._pt_speed.set_value(str(s.get('inv_speed_actual', 0)))
-        self._pt_tm1.set_value(f"{s.get('inv_temp_motor1', 0)}")
-        self._pt_tpwr.set_value(f"{s.get('inv_temp_pwrstg', 0)}")
-        self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)}")
-        self._pt_tdcdc.set_value(f"{s.get('temp_dcdc', 0)}")
-        self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)}")
-        self._pt_soc.set_value(f"{s.get('soc', 0)}")
-        self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0)}")
-        self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0)}")
-        self._pt_vcell.set_value(f"{s.get('v_cell_min_mV', 0)}")
+        self._pt_tm1.set_value(f"{s.get('inv_temp_motor1', 0)} degC")
+        self._pt_tpwr.set_value(f"{s.get('inv_temp_pwrstg', 0)} degC")
+        self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)} degC")
+        self._pt_tdcdc.set_value(f"{s.get('temp_dcdc', 0)} degC")
+        self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)} V")
+        vcell_pt = s.get('v_cell_min_mV', 0)
+        soc_vtc6_pt = soc_from_cell_mv(vcell_pt) if vcell_pt > 0 else float(s.get('soc', 0))
+        self._pt_soc.set_value(f"{soc_vtc6_pt:.1f} %")
+        # corriente_accu is in dA; convert to A for display
+        self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0) / 10.0:.1f} A")
+        self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0) / 10.0:.1f} A")
+        self._pt_vcell.set_value(f"{vcell_pt} mV")
         self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
 
         vmin = s.get('vmin_modulo',      [0]*5)
@@ -1402,10 +1892,10 @@ class MainWindow(QMainWindow):
                 self._log_append(f"Demo mode {'ENABLED' if self.demo_mode else 'DISABLED'}")
             self._log_append(f"Settings: port={new['port']} baud={new['baud']} marple={new['use_influx']}")
 
-    def _open_sessions(self):
-        if self._session_viewer is None or not self._session_viewer.isVisible():
-            self._session_viewer = SessionViewerWindow()
-            self._session_viewer.show()
+    def _open_post_race(self):
+        if self._post_race_win is None or not self._post_race_win.isVisible():
+            self._post_race_win = PostRaceWindow()
+            self._post_race_win.show()
 
     def _log_append(self, msg: str):
         if self._log is None:
