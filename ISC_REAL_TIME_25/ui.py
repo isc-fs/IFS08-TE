@@ -1,1475 +1,1439 @@
 """
-ISCmetrics - ISC Formula Student Telemetry System
+ISCmetrics v2 — ISC Formula Student Telemetry System
 Developed by Andrés Sánchez de Ágreda © 2025/2026
-Modified for F1-style modern aesthetic and Marple Data Integration
+F1 / Grafana dark-mode visualization — Fragmented Snapshot Protocol
 """
 
 from __future__ import annotations
 import sys
-import os
 import threading
 import time
 import logging
+from collections import deque
 from datetime import datetime
-from typing import Optional
 from pathlib import Path
+from typing import Optional, Dict, List, Deque
 
 import numpy as np
-import pandas as pd
 import matplotlib
-import math
 matplotlib.use("Qt5Agg")
 
-from PyQt5 import QtCore, QtWidgets, QtGui
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap, QIcon
-from PyQt5.QtWidgets import QProgressBar
-from PyQt5.QtGui import QPainter
-
+from PyQt5.QtCore import (
+    QTimer, Qt, QMimeData, QObject, pyqtSignal, QPoint
+)
+from PyQt5.QtGui import (
+    QFont, QPalette, QColor, QPixmap, QIcon,
+    QPainter, QPen, QBrush, QLinearGradient, QDrag
+)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QWidget, QLabel, QPushButton, QLineEdit, QComboBox, QTextEdit,
-    QMessageBox, QTabWidget, QFrame, QGroupBox, QCheckBox, QFileDialog,
-    QListWidget, QSplitter, QScrollArea, QDialog
+    QMessageBox, QTabWidget, QFrame, QGroupBox, QCheckBox,
+    QListWidget, QListWidgetItem, QDialog, QSizePolicy
 )
-
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 import ISC_RTT_serial as rtt
-import ISC_RTT_demo as demo
 
-# ============== CONSTANTS ==============
-NUM_MODULES = 5
-TEMPS_PER_MODULE = 38
-CELLS_PER_MODULE = 19
+# ── Optional demo module ──────────────────────────────────────────────────────
+try:
+    import ISC_RTT_demo as demo
+    DEMO_AVAILABLE = True
+except ImportError:
+    DEMO_AVAILABLE = False
 
-# F1/MODERN COLOR SCHEME using Irish Green
-ISC_GREEN = '#008000'
-F1_DARK_BG = '#101010'
-F1_MID_BG = '#282828'
-F1_TEXT = '#FFFFFF'
-F1_ACCENT = ISC_GREEN
-F1_WARNING = '#FFFF00'
-F1_ERROR = '#FF3333'
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLOUR SCHEME  (ISC Green / Grafana dark)
+# ══════════════════════════════════════════════════════════════════════════════
+ISC_GREEN   = '#008000'
+F1_DARK_BG  = '#111111'
+F1_MID_BG   = '#1a1a1a'
+F1_PANEL_BG = '#222222'
+F1_TEXT     = '#e0e0e0'
+F1_ACCENT   = ISC_GREEN          # backward-compat alias
+F1_WARNING  = '#f0b429'
+F1_ERROR    = '#ef4444'
+F1_BLUE     = '#3b82f6'
+F1_PURPLE   = '#8b5cf6'
 
-PLOT_COLOR = ISC_GREEN
-PLOT_BG = F1_DARK_BG
-WIDGET_BG = F1_MID_BG
-TEXT_COLOR = F1_TEXT
-ACCENT_COLOR = F1_ACCENT
-WARNING_COLOR = F1_WARNING
-ERROR_COLOR = F1_ERROR
+# Alert thresholds
+ALERT_TEMP_C = 40.0   # °C  — any module max temp above this
+ALERT_VOLT_V = 380    # V   — DC bus below this
 
-current_settings = {
-    "port": rtt.DEFAULT_PORT,
-    "baud": rtt.DEFAULT_BAUD,
-    "use_influx": False, # Maps to Marple Upload
-    "debug": rtt.DEBUG_ENABLE_DEFAULT,
-    "demo_mode": False,
+HISTORY_LEN  = 120    # rolling plot sample depth
+ADC_MAX      = 4095   # 12-bit ADC full scale (pedal normalisation)
+RPM_MAX      = 6000
+
+# Snapshot channels available in the Customise tab
+SNAPSHOT_CHANNELS: Dict[str, str] = {
+    'inv_rpm':             'RPM',
+    'inv_dc_bus_V':        'DC Bus Voltage (V)',
+    'inv_temp_motor1':     'Motor Temp 1 (°C)',
+    'inv_temp_pwrstg':     'PWRSTG Temp (°C)',
+    'inv_temp_board':      'Board Temp (°C)',
+    'inv_current_actual':  'Inverter Current (A)',
+    'inv_speed_actual':    'Motor Speed (actual)',
+    'apps1_raw':           'APPS 1 (raw)',
+    'apps2_raw':           'APPS 2 (raw)',
+    'brake_raw':           'Brake Raw',
+    'torque_pct':          'Torque %',
+    'v_cell_min_mV':       'Min Cell Voltage (mV)',
+    'soc':                 'State of Charge (%)',
+    'corriente_accu':      'Accu Current (raw)',
+    'corriente_dcdc':      'DCDC Current (raw)',
+    'temp_dcdc':           'DCDC Temperature (°C)',
+    'tick_ms':             'RTOS Tick (ms)',
+    'seq':                 'Snapshot Sequence',
 }
 
-# ============== LOGGING OVERRIDE ==============
-class QtHandler(logging.Handler):
-    """Custom logging handler to emit PyQt signals."""
-    def __init__(self, signaler: 'Signaler'):
-        super().__init__()
-        self.signaler = signaler
-        
-    def emit(self, record):
-        msg = self.format(record)
-        self.signaler.log_message.emit(msg)
+plt.style.use('dark_background')
+plt.rcParams.update({
+    'axes.facecolor':   F1_DARK_BG,
+    'figure.facecolor': F1_DARK_BG,
+    'text.color':       F1_TEXT,
+    'axes.labelcolor':  F1_TEXT,
+    'xtick.color':      F1_TEXT,
+    'ytick.color':      F1_TEXT,
+    'axes.edgecolor':   '#333333',
+    'grid.color':       '#2a2a2a',
+    'grid.alpha':       1.0,
+})
 
-# ============== SIGNAL EMITTER ==============
+current_settings: dict = {
+    "port":       rtt.DEFAULT_PORT,
+    "baud":       rtt.DEFAULT_BAUD,
+    "use_influx": False,
+    "debug":      rtt.DEBUG_ENABLE_DEFAULT,
+    "demo_mode":  False,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIGNAL EMITTER
+# ══════════════════════════════════════════════════════════════════════════════
 class Signaler(QObject):
-    """Thread-safe signal emitter"""
-    new_data = pyqtSignal()
     log_message = pyqtSignal(str)
 
 signaler = Signaler()
 
-# Capture logs from both Serial and Marple modules
-logging.getLogger("ISC_RTT_USB").addHandler(QtHandler(signaler))
-logging.getLogger("ISC_MARPLE").addHandler(QtHandler(signaler))
+class _QtLogHandler(logging.Handler):
+    def __init__(self, sig: Signaler):
+        super().__init__()
+        self._sig = sig
+    def emit(self, record):
+        self._sig.log_message.emit(self.format(record))
 
-# ============== MATPLOTLIB F1 STYLE ==============
-plt.style.use('dark_background')
-plt.rcParams.update({
-    'axes.facecolor': PLOT_BG,
-    'figure.facecolor': PLOT_BG,
-    'text.color': F1_TEXT,
-    'axes.labelcolor': F1_TEXT,
-    'xtick.color': F1_TEXT,
-    'ytick.color': F1_TEXT,
-    'axes.edgecolor': ISC_GREEN,
-    'grid.color': F1_MID_BG,
-    'grid.alpha': 0.5,
-})
+logging.getLogger("ISC_RTT_USB").addHandler(_QtLogHandler(signaler))
 
-# ============== SETTINGS DIALOG ==============
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALERT BANNER
+# ══════════════════════════════════════════════════════════════════════════════
+class AlertBanner(QFrame):
+    """Flashing coloured strip shown when alert conditions are active."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._alerts: List[tuple] = []
+        self._flash  = False
+        self._base   = F1_ERROR
+        self.setFixedHeight(28)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.hide()
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 2, 10, 2)
+        self._lbl = QLabel("")
+        self._lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._lbl)
+
+        self._ftimer = QTimer(self)
+        self._ftimer.timeout.connect(self._toggle_flash)
+        self._ftimer.start(450)
+
+    def set_alerts(self, alerts: List[tuple]) -> None:
+        self._alerts = alerts
+        if not alerts:
+            self.hide()
+            return
+        self.show()
+        self._lbl.setText("   |   ".join(a[0] for a in alerts))
+        self._lbl.setStyleSheet(f"color: {F1_DARK_BG}; font-size: 11px; font-weight: bold;")
+        self._base = F1_ERROR if any(a[1] == 'critical' for a in alerts) else F1_WARNING
+
+    def _toggle_flash(self):
+        if not self._alerts:
+            return
+        self._flash = not self._flash
+        dim = '#5a0000' if self._base == F1_ERROR else '#5a3e00'
+        col = self._base if self._flash else dim
+        self.setStyleSheet(f"QFrame {{ background: {col}; border-radius: 2px; }}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROLLING PLOT CANVAS
+# ══════════════════════════════════════════════════════════════════════════════
+class MplCanvas(QWidget):
+    """Grafana-style rolling time-series plot embedded in a QWidget."""
+    def __init__(self, title: str = "", color: str = ISC_GREEN, parent=None):
+        super().__init__(parent)
+        self._color   = color
+        self._history: Deque[float] = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+
+        fig = Figure(figsize=(4, 2), tight_layout=True)
+        fig.patch.set_facecolor(F1_PANEL_BG)
+        self._ax = fig.add_subplot(111)
+        self._line, = self._ax.plot([], [], color=color, linewidth=1.4, antialiased=True)
+        self._ax.set_facecolor(F1_DARK_BG)
+        self._ax.set_title(title, color=color, fontsize=8, fontweight='bold', pad=2)
+        self._ax.tick_params(labelsize=6, colors='#555')
+        self._ax.grid(True, alpha=0.3)
+        for s in self._ax.spines.values():
+            s.set_color('#2a2a2a')
+
+        canvas = FigureCanvas(fig)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(canvas)
+        self._canvas = canvas
+
+    def update_plot(self, value: float) -> None:
+        self._history.append(float(value))
+        y = list(self._history)
+        x = list(range(len(y)))
+        self._line.set_data(x, y)
+        for coll in self._ax.collections:
+            coll.remove()
+        self._ax.fill_between(x, y, alpha=0.10, color=self._color)
+        lo, hi = min(y), max(y)
+        mg = max((hi - lo) * 0.1, 1.0)
+        self._ax.set_xlim(0, HISTORY_LEN)
+        self._ax.set_ylim(lo - mg, hi + mg)
+        self._canvas.draw_idle()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  METRIC CARD
+# ══════════════════════════════════════════════════════════════════════════════
+class MetricCard(QFrame):
+    """Grafana-style metric tile: title, large value, unit, alert highlight."""
+    def __init__(self, title: str, unit: str = "", color: str = ISC_GREEN, parent=None):
+        super().__init__(parent)
+        self._color   = color
+        self._alerting = False
+        self._set_border(color)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 5, 8, 5)
+        v.setSpacing(1)
+
+        self._title = QLabel(title)
+        self._title.setAlignment(Qt.AlignCenter)
+        self._title.setStyleSheet(f"color:{color}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+
+        self._value = QLabel("—")
+        self._value.setAlignment(Qt.AlignCenter)
+        self._value.setStyleSheet(f"color:{F1_TEXT}; font-size:19px; font-weight:bold; background:transparent; border:none;")
+
+        self._unit = QLabel(unit)
+        self._unit.setAlignment(Qt.AlignCenter)
+        self._unit.setStyleSheet("color:#555; font-size:8px; background:transparent; border:none;")
+
+        v.addWidget(self._title)
+        v.addWidget(self._value)
+        v.addWidget(self._unit)
+
+    def _set_border(self, color: str) -> None:
+        self.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px solid {color}; border-radius:3px; }}")
+
+    def set_value(self, text: str) -> None:
+        self._value.setText(text)
+
+    def set_alert(self, active: bool) -> None:
+        if active == self._alerting:
+            return
+        self._alerting = active
+        col = F1_ERROR if active else self._color
+        self.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:2px solid {col}; border-radius:3px; }}")
+        self._title.setStyleSheet(f"color:{col}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RPM GAUGE  (circular, QPainter)
+# ══════════════════════════════════════════════════════════════════════════════
+class RPMGauge(QWidget):
+    """Circular RPM gauge with green→yellow→red arc."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rpm = 0.0
+        self.setMinimumSize(180, 180)
+
+    def set_rpm(self, rpm: float) -> None:
+        self._rpm = max(0.0, min(float(rpm), RPM_MAX))
+        self.update()
+
+    def paintEvent(self, _ev):
+        w, h  = self.width(), self.height()
+        side  = min(w, h) - 12
+        cx, cy = w // 2, h // 2
+        r = side // 2
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Background disc
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(F1_PANEL_BG)))
+        p.drawEllipse(cx - r, cy - r, side, side)
+
+        # Track
+        track_w = max(8, r // 8)
+        pad = track_w + 6
+        rect_x, rect_y = cx - r + pad, cy - r + pad
+        diam = (r - pad) * 2
+        p.setPen(QPen(QColor('#2a2a2a'), track_w, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(rect_x, rect_y, diam, diam, 225 * 16, -270 * 16)
+
+        # Coloured arc
+        frac  = self._rpm / RPM_MAX
+        sweep = int(frac * 270 * 16)
+        col   = ISC_GREEN if frac < 0.60 else (F1_WARNING if frac < 0.85 else F1_ERROR)
+        p.setPen(QPen(QColor(col), track_w, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(rect_x, rect_y, diam, diam, 225 * 16, -sweep)
+
+        # RPM text
+        p.setPen(QColor(F1_TEXT))
+        p.setFont(QFont("Arial", max(10, r // 4), QFont.Bold))
+        p.drawText(cx - r, cy - r // 3, side, side // 2, Qt.AlignCenter, f"{int(self._rpm):,}")
+
+        p.setPen(QColor(col))
+        p.setFont(QFont("Arial", max(7, r // 9)))
+        p.drawText(cx - r, cy + r // 6, side, r // 2, Qt.AlignCenter, "RPM")
+        p.end()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PEDAL WIDGET  (vertical bar)
+# ══════════════════════════════════════════════════════════════════════════════
+class PedalWidget(QWidget):
+    """Vertical bar pedal indicator with gradient fill."""
+    def __init__(self, label: str, color: str = ISC_GREEN, parent=None):
+        super().__init__(parent)
+        self._label  = label
+        self._color  = color
+        self._norm   = 0.0   # 0.0 – 1.0
+        self._raw    = 0
+        self.setMinimumSize(90, 180)
+
+    def set_value(self, normalized: float, raw: int = 0) -> None:
+        self._norm = max(0.0, min(1.0, float(normalized)))
+        self._raw  = raw
+        self.update()
+
+    def paintEvent(self, _ev):
+        w, h = self.width(), self.height()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        bw = int(w * 0.38)
+        bh = int(h * 0.62)
+        bx = (w - bw) // 2
+        by = int(h * 0.10)
+
+        # Track
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor('#1e1e1e')))
+        p.drawRoundedRect(bx, by, bw, bh, 4, 4)
+
+        # Fill (bottom-up)
+        fh = int(bh * self._norm)
+        if fh > 0:
+            grad = QLinearGradient(bx, by + bh, bx, by)
+            grad.setColorAt(0.0, QColor(self._color))
+            grad.setColorAt(1.0, QColor(self._color).lighter(140))
+            p.setBrush(QBrush(grad))
+            p.drawRoundedRect(bx, by + bh - fh, bw, fh, 4, 4)
+
+        # Border
+        p.setPen(QPen(QColor(self._color), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(bx, by, bw, bh, 4, 4)
+
+        # Label (top)
+        p.setPen(QColor(self._color))
+        p.setFont(QFont("Arial", 8, QFont.Bold))
+        p.drawText(0, 0, w, by, Qt.AlignCenter | Qt.AlignVCenter, self._label)
+
+        # Percentage
+        p.setPen(QColor(F1_TEXT))
+        p.setFont(QFont("Arial", 13, QFont.Bold))
+        p.drawText(0, by + bh + 4, w, 22, Qt.AlignCenter, f"{int(self._norm * 100)}%")
+
+        # Raw
+        p.setPen(QColor('#555'))
+        p.setFont(QFont("Arial", 7))
+        p.drawText(0, by + bh + 26, w, 16, Qt.AlignCenter, f"raw {self._raw}")
+        p.end()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  G-FORCE CIRCLE
+# ══════════════════════════════════════════════════════════════════════════════
+class GCircleWidget(QWidget):
+    """Circular G-force display with tracking dot."""
+    MAX_G = 3.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._gx = 0.0   # lateral
+        self._gy = 0.0   # longitudinal
+        self.setMinimumSize(160, 160)
+
+    def set_g_force(self, g_long: float, g_lat: float) -> None:
+        self._gx = g_lat
+        self._gy = g_long
+        self.update()
+
+    def paintEvent(self, _ev):
+        w, h = self.width(), self.height()
+        r    = min(w, h) // 2 - 12
+        cx, cy = w // 2, h // 2
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Outer ring
+        p.setPen(QPen(QColor('#333'), 1))
+        p.setBrush(QBrush(QColor(F1_PANEL_BG)))
+        p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+
+        # Inner rings (1 G, 2 G)
+        for frac in (1/3, 2/3):
+            rr = int(r * frac)
+            p.setPen(QPen(QColor('#2a2a2a'), 1, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(cx - rr, cy - rr, rr * 2, rr * 2)
+
+        # Cross-hairs
+        p.setPen(QPen(QColor('#2a2a2a'), 1))
+        p.drawLine(cx - r, cy, cx + r, cy)
+        p.drawLine(cx, cy - r, cx, cy + r)
+
+        # G-dot
+        nx = max(-1.0, min(1.0, self._gx / self.MAX_G))
+        ny = max(-1.0, min(1.0, self._gy / self.MAX_G))
+        dot_x = int(cx + nx * r)
+        dot_y = int(cy - ny * r)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(ISC_GREEN)))
+        p.drawEllipse(dot_x - 6, dot_y - 6, 12, 12)
+
+        # Axis labels
+        p.setPen(QColor('#444'))
+        p.setFont(QFont("Arial", 7))
+        p.drawText(cx - r, cy + r + 3, r * 2, 14, Qt.AlignCenter, "← LAT →")
+        p.end()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULE BAR WIDGET
+# ══════════════════════════════════════════════════════════════════════════════
+class ModuleBarWidget(QWidget):
+    """Horizontal progress bar for per-module voltage or temperature."""
+    def __init__(self, module_id: int, unit: str = "mV",
+                 lo: float = 2800, hi: float = 4250,
+                 warn_lo: Optional[float] = None,
+                 warn_hi: Optional[float] = None,
+                 parent=None):
+        super().__init__(parent)
+        self._id       = module_id
+        self._unit     = unit
+        self._lo_range = lo
+        self._hi_range = hi
+        self._warn_lo  = warn_lo
+        self._warn_hi  = warn_hi
+        self._val_lo   = lo
+        self._val_hi   = lo
+        self.setFixedHeight(32)
+
+    def set_values(self, lo: float, hi: float) -> None:
+        self._val_lo = float(lo)
+        self._val_hi = float(hi)
+        self.update()
+
+    def _frac(self, v: float) -> float:
+        span = self._hi_range - self._lo_range
+        return (v - self._lo_range) / span if span else 0.0
+
+    def paintEvent(self, _ev):
+        w, h = self.width(), self.height()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        lw   = 58
+        vw   = 90
+        bx   = lw + 6
+        bw   = w - bx - vw - 4
+        bh   = 12
+        by   = (h - bh) // 2
+
+        # Module label
+        p.setPen(QColor(ISC_GREEN))
+        p.setFont(QFont("Arial", 8, QFont.Bold))
+        p.drawText(2, 0, lw, h, Qt.AlignVCenter | Qt.AlignLeft, f"MOD {self._id}")
+
+        # Track
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor('#1e1e1e')))
+        p.drawRoundedRect(bx, by, bw, bh, 3, 3)
+
+        # Filled range
+        alert = ((self._warn_hi is not None and self._val_hi > self._warn_hi) or
+                 (self._warn_lo is not None and self._val_lo < self._warn_lo))
+        col = QColor(F1_ERROR if alert else ISC_GREEN)
+
+        x0 = bx + int(max(0, min(1, self._frac(self._val_lo))) * bw)
+        x1 = bx + int(max(0, min(1, self._frac(self._val_hi))) * bw)
+        fill_w = max(4, x1 - x0)
+        p.setBrush(QBrush(col))
+        p.drawRoundedRect(x0, by, fill_w, bh, 3, 3)
+
+        # Threshold lines
+        for thresh, tcol in [(self._warn_hi, F1_WARNING), (self._warn_lo, F1_ERROR)]:
+            if thresh is not None:
+                tx = bx + int(max(0, min(1, self._frac(thresh))) * bw)
+                p.setPen(QPen(QColor(tcol), 2))
+                p.drawLine(tx, by - 3, tx, by + bh + 3)
+
+        # Value text
+        p.setPen(QColor(F1_TEXT))
+        p.setFont(QFont("Courier New", 8))
+        p.drawText(bx + bw + 6, 0, vw, h, Qt.AlignVCenter | Qt.AlignLeft,
+                   f"{self._val_lo:.0f}–{self._val_hi:.0f} {self._unit}")
+        p.end()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CUSTOMISABLE TAB — drag-and-drop channel list + droppable plot panels
+# ══════════════════════════════════════════════════════════════════════════════
+class ChannelListWidget(QListWidget):
+    """Drag-enabled list of snapshot channel names."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setDefaultDropAction(Qt.CopyAction)
+        self.setStyleSheet(f"""
+            QListWidget {{
+                background: {F1_PANEL_BG}; color: {F1_TEXT};
+                border: 1px solid #333; font-size: 10px;
+            }}
+            QListWidget::item:selected {{ background: {ISC_GREEN}; color: {F1_DARK_BG}; }}
+            QListWidget::item:hover    {{ background: #2a2a2a; }}
+        """)
+        for key, label in SNAPSHOT_CHANNELS.items():
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, key)
+            self.addItem(item)
+
+    def startDrag(self, _actions):
+        item = self.currentItem()
+        if not item:
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setText(item.data(Qt.UserRole))
+        drag.setMimeData(mime)
+        drag.exec_(Qt.CopyAction)
+
+
+class DroppablePlotPanel(QFrame):
+    """A panel that accepts a channel drop and shows a rolling plot."""
+    def __init__(self, idx: int, parent=None):
+        super().__init__(parent)
+        self._idx     = idx
+        self._channel: Optional[str] = None
+        self._history: Deque[float]  = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(155)
+        self._border_idle()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(2)
+
+        # Header
+        hdr = QHBoxLayout()
+        self._title_lbl = QLabel(f"Drop channel here  (panel {idx})")
+        self._title_lbl.setStyleSheet("color:#444; font-size:9px; background:transparent; border:none;")
+        hdr.addWidget(self._title_lbl)
+        hdr.addStretch()
+        btn_clr = QPushButton("✕")
+        btn_clr.setFixedSize(17, 17)
+        btn_clr.setStyleSheet(
+            f"QPushButton {{ background:#2a2a2a; color:#666; border:none; font-size:9px; border-radius:2px; }}"
+            f"QPushButton:hover {{ background:{F1_ERROR}; color:white; }}"
+        )
+        btn_clr.clicked.connect(self.clear_channel)
+        hdr.addWidget(btn_clr)
+        lay.addLayout(hdr)
+
+        # Matplotlib canvas
+        fig = Figure(figsize=(3, 1.4), tight_layout=True)
+        fig.patch.set_facecolor(F1_PANEL_BG)
+        self._ax = fig.add_subplot(111)
+        self._line, = self._ax.plot([], [], color=ISC_GREEN, linewidth=1.1)
+        self._ax.set_facecolor(F1_DARK_BG)
+        self._ax.tick_params(labelsize=6, colors='#444')
+        self._ax.grid(True, alpha=0.2)
+        for s in self._ax.spines.values():
+            s.set_color('#2a2a2a')
+        self._canvas = FigureCanvas(fig)
+        lay.addWidget(self._canvas)
+
+        # Current value
+        self._val_lbl = QLabel("—")
+        self._val_lbl.setAlignment(Qt.AlignCenter)
+        self._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
+        lay.addWidget(self._val_lbl)
+
+    # ── drag-drop events ──────────────────────────────────────────────────────
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasText():
+            self.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:2px solid {ISC_GREEN}; border-radius:4px; }}")
+            ev.acceptProposedAction()
+
+    def dragLeaveEvent(self, _ev):
+        self._border_idle()
+
+    def dropEvent(self, ev):
+        self.assign_channel(ev.mimeData().text())
+        self.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px solid {ISC_GREEN}; border-radius:4px; }}")
+        ev.acceptProposedAction()
+
+    def _border_idle(self):
+        self.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px dashed #333; border-radius:4px; }}")
+
+    # ── assignment ────────────────────────────────────────────────────────────
+    def assign_channel(self, key: str) -> None:
+        self._channel = key
+        self._title_lbl.setText(SNAPSHOT_CHANNELS.get(key, key))
+        self._title_lbl.setStyleSheet(
+            f"color:{ISC_GREEN}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+        self._history = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+
+    def clear_channel(self) -> None:
+        self._channel = None
+        self._title_lbl.setText(f"Drop channel here  (panel {self._idx})")
+        self._title_lbl.setStyleSheet("color:#444; font-size:9px; background:transparent; border:none;")
+        self._history  = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+        self._val_lbl.setText("—")
+        self._ax.cla()
+        self._ax.set_facecolor(F1_DARK_BG)
+        self._ax.tick_params(labelsize=6, colors='#444')
+        self._ax.grid(True, alpha=0.2)
+        for s in self._ax.spines.values():
+            s.set_color('#2a2a2a')
+        self._line, = self._ax.plot([], [], color=ISC_GREEN, linewidth=1.1)
+        self._canvas.draw_idle()
+        self._border_idle()
+
+    def update_value(self, snapshot: dict) -> None:
+        if not self._channel:
+            return
+        raw = snapshot.get(self._channel, 0)
+        val = float(raw[0] if isinstance(raw, list) else raw)
+        self._history.append(val)
+        y = list(self._history)
+        x = list(range(len(y)))
+        self._line.set_data(x, y)
+        lo, hi = min(y), max(y)
+        mg = max((hi - lo) * 0.1, 1.0)
+        self._ax.set_xlim(0, HISTORY_LEN)
+        self._ax.set_ylim(lo - mg, hi + mg)
+        self._canvas.draw_idle()
+        self._val_lbl.setText(f"{val:.1f}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
 class SettingsDialog(QDialog):
     def __init__(self, parent: 'MainWindow' = None):
         super().__init__(parent)
-        self.setWindowTitle("ISCmetrics - Ajustes (Settings)")
+        self.setWindowTitle("ISCmetrics — Ajustes")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setGeometry(200, 200, 450, 300)
-        
-        self.parent_ui = parent
-        self.apply_f1_theme()
-        
-        layout = QGridLayout()
-        layout.setSpacing(10)
-        
-        input_style = parent.get_input_style()
-        label_style = f"color: {F1_TEXT}; font-size: 11px; font-weight: bold;"
-        
-        lbl_port = QLabel("COM Port:")
-        lbl_port.setStyleSheet(label_style)
-        self.combo_port = QComboBox()
-        self.combo_port.setStyleSheet(input_style)
-        self.refresh_ports()
-        layout.addWidget(lbl_port, 0, 0)
-        layout.addWidget(self.combo_port, 0, 1)
-        
-        lbl_baud = QLabel("Baud Rate:")
-        lbl_baud.setStyleSheet(label_style)
-        self.input_baud = QLineEdit(str(rtt.DEFAULT_BAUD))
-        self.input_baud.setStyleSheet(input_style)
-        layout.addWidget(lbl_baud, 1, 0)
-        layout.addWidget(self.input_baud, 1, 1)
+        self.setGeometry(200, 200, 420, 270)
+        self._p = parent
+        self.setStyleSheet(f"QDialog {{ background:{F1_DARK_BG}; color:{F1_TEXT}; }}")
+        self._build()
 
-        # Updated Label for Marple
-        self.chk_marple = QCheckBox("Upload to Marple Data (Cloud)")
-        self.chk_marple.setStyleSheet(f"color: {F1_TEXT}; font-size: 11px;")
-        self.chk_marple.setChecked(self.parent_ui.settings["use_influx"])
-        layout.addWidget(self.chk_marple, 2, 0)
-        
-        self.chk_debug = QCheckBox("Enable Debug Output")
-        self.chk_debug.setStyleSheet(f"color: {F1_TEXT}; font-size: 11px;")
-        self.chk_debug.setChecked(self.parent_ui.settings["debug"])
-        layout.addWidget(self.chk_debug, 3, 0)
-        
-        self.chk_demo = QCheckBox("Enable Demo Mode (Simulated Data)")
-        self.chk_demo.setStyleSheet(f"color: {F1_ACCENT}; font-size: 11px; font-weight: bold;")
-        self.chk_demo.setChecked(self.parent_ui.settings["demo_mode"])
-        layout.addWidget(self.chk_demo, 4, 0, 1, 2)
-        
-        btn_layout = QHBoxLayout()
-        btn_ok = QPushButton("Apply & Close")
-        btn_ok.setStyleSheet(parent.get_button_style('accent'))
-        btn_ok.clicked.connect(self.accept)
-        btn_layout.addWidget(btn_ok)
-        
-        layout.addLayout(btn_layout, 5, 0, 1, 2)
-        self.setLayout(layout)
+    def _build(self):
+        g = QGridLayout(self)
+        g.setSpacing(10)
+        g.setContentsMargins(16, 16, 16, 16)
+        ls = f"color:{F1_TEXT}; font-size:11px; font-weight:bold;"
+        ins = self._p.get_input_style()
 
-    def apply_f1_theme(self):
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(F1_DARK_BG))
-        palette.setColor(QPalette.WindowText, QColor(F1_TEXT))
-        self.setPalette(palette)
-        self.setStyleSheet(f"QDialog {{ background-color: {F1_DARK_BG}; }}")
+        g.addWidget(self._lbl("COM Port:", ls), 0, 0)
+        self.combo_port = QComboBox(); self.combo_port.setStyleSheet(ins)
+        self._refresh_ports(); g.addWidget(self.combo_port, 0, 1)
 
-    def refresh_ports(self):
+        g.addWidget(self._lbl("Baud Rate:", ls), 1, 0)
+        self.input_baud = QLineEdit(str(rtt.DEFAULT_BAUD)); self.input_baud.setStyleSheet(ins)
+        g.addWidget(self.input_baud, 1, 1)
+
+        self.chk_marple = QCheckBox("Upload to Marple Data (cloud)")
+        self.chk_marple.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
+        self.chk_marple.setChecked(self._p.settings.get("use_influx", False))
+        g.addWidget(self.chk_marple, 2, 0, 1, 2)
+
+        self.chk_debug = QCheckBox("Enable debug output")
+        self.chk_debug.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
+        self.chk_debug.setChecked(self._p.settings.get("debug", False))
+        g.addWidget(self.chk_debug, 3, 0, 1, 2)
+
+        self.chk_demo = QCheckBox("Demo mode  (simulated data)")
+        self.chk_demo.setStyleSheet(f"color:{ISC_GREEN}; font-size:11px; font-weight:bold;")
+        self.chk_demo.setChecked(self._p.settings.get("demo_mode", False))
+        g.addWidget(self.chk_demo, 4, 0, 1, 2)
+
+        btn = QPushButton("Apply & Close")
+        btn.setStyleSheet(self._p.get_button_style('accent'))
+        btn.clicked.connect(self.accept)
+        g.addWidget(btn, 5, 0, 1, 2)
+
+    @staticmethod
+    def _lbl(t, s):
+        l = QLabel(t); l.setStyleSheet(s); return l
+
+    def _refresh_ports(self):
         self.combo_port.clear()
-        ports = rtt.list_serial_ports()
-        default_idx = -1
-        for i, (port, desc) in enumerate(ports):
-            display_text = f"{port} ({desc})"
-            self.combo_port.addItem(display_text, port)
-            if port == self.parent_ui.settings["port"]:
-                 default_idx = i
-        
-        if ports:
-            self.combo_port.setCurrentIndex(default_idx if default_idx != -1 else 0)
-        
-    def get_settings(self):
-        """Returns the current settings from the dialog fields"""
-        try:
-            baud = int(self.input_baud.text())
-        except ValueError:
-            baud = self.parent_ui.settings["baud"]
-        
+        cur = self._p.settings.get("port")
+        for i, (port, desc) in enumerate(rtt.list_serial_ports()):
+            self.combo_port.addItem(f"{port}  ({desc})", port)
+            if port == cur:
+                self.combo_port.setCurrentIndex(i)
+
+    def get_settings(self) -> dict:
+        try:    baud = int(self.input_baud.text())
+        except: baud = self._p.settings["baud"]
         return {
-            "port": self.combo_port.currentData(),
-            "baud": baud,
-            "use_influx": self.chk_marple.isChecked(), # Maps to use_marple
-            "debug": self.chk_debug.isChecked(),
-            "demo_mode": self.chk_demo.isChecked(),
+            "port":       self.combo_port.currentData(),
+            "baud":       baud,
+            "use_influx": self.chk_marple.isChecked(),
+            "debug":      self.chk_debug.isChecked(),
+            "demo_mode":  self.chk_demo.isChecked(),
         }
 
-# ============== MAIN WINDOW ==============
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION VIEWER
+# ══════════════════════════════════════════════════════════════════════════════
+class SessionViewerWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ISCmetrics — Session Viewer")
+        self.setGeometry(160, 160, 1100, 650)
+        self.setStyleSheet(f"background:{F1_DARK_BG}; color:{F1_TEXT};")
+        self._build()
+
+    def _build(self):
+        h = QHBoxLayout(self)
+        # Sidebar
+        side = QVBoxLayout()
+        hdr = QLabel("Saved Sessions")
+        hdr.setStyleSheet(f"color:{ISC_GREEN}; font-weight:bold; font-size:12px;")
+        side.addWidget(hdr)
+        self._list = QListWidget()
+        self._list.setStyleSheet(f"background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333;")
+        self._list.itemDoubleClicked.connect(self._load)
+        side.addWidget(self._list)
+        btn = QPushButton("Refresh")
+        btn.setStyleSheet(f"background:{F1_MID_BG}; color:{ISC_GREEN}; border:1px solid {ISC_GREEN}; padding:4px 8px;")
+        btn.clicked.connect(self._refresh)
+        side.addWidget(btn)
+        sw = QWidget(); sw.setLayout(side); sw.setFixedWidth(240)
+        h.addWidget(sw)
+        # Content
+        right = QVBoxLayout()
+        self._info = QLabel("Double-click a session to load.")
+        self._info.setStyleSheet("color:#555; padding:8px;")
+        right.addWidget(self._info)
+        self._txt = QTextEdit()
+        self._txt.setReadOnly(True)
+        self._txt.setStyleSheet(
+            f"background:{F1_PANEL_BG}; color:{F1_TEXT}; font-family:'Courier New'; font-size:9px;")
+        right.addWidget(self._txt)
+        rw = QWidget(); rw.setLayout(right)
+        h.addWidget(rw)
+        self._refresh()
+
+    def _refresh(self):
+        self._list.clear()
+        for f in rtt.list_excel_sessions():
+            item = QListWidgetItem(f.name)
+            item.setData(Qt.UserRole, str(f))
+            self._list.addItem(item)
+
+    def _load(self, item: QListWidgetItem):
+        data = rtt.load_excel_session(Path(item.data(Qt.UserRole)))
+        if 'Main' in data:
+            df = data['Main']
+            self._info.setText(f"{Path(item.data(Qt.UserRole)).name} — {len(df)} rows × {len(df.columns)} cols")
+            self._txt.setPlainText(df.to_string(max_rows=60))
+        else:
+            self._info.setText("Failed to load.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN WINDOW
+# ══════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ISCmetrics - Formula Student Telemetry")
-        self.setGeometry(100, 100, 1920, 1080) 
+        self.setWindowTitle("ISCmetrics — Formula Student Telemetry")
+        self.setGeometry(40, 40, 1600, 960)
 
-        self.settings = current_settings.copy()
-        self.demo_mode = self.settings["demo_mode"]
-        
-        icon_path_ico = Path("isc_logo.ico")
-        if icon_path_ico.exists():
-            self.setWindowIcon(QIcon(str(icon_path_ico)))
-
-        self.log_text: Optional[QTextEdit] = None 
-        
-        self.init_ui()
-        self.apply_f1_theme()
-        
-        self.rx_thread: Optional[threading.Thread] = None
+        self.settings     = current_settings.copy()
+        self.demo_mode    = self.settings["demo_mode"]
         self.is_receiving = False
-        
-        self.settings_dialog: Optional[SettingsDialog] = None
-        self.session_viewer: Optional['SessionViewerWindow'] = None
-        
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_displays)
-        
-        signaler.log_message.connect(self.append_log)
-        
-        self.append_log("UI Initialized. Ready to connect.")
-        
-        # Start demo if enabled in settings
-        if self.demo_mode:
-            self.activate_demo_mode()
-        
-        self.timer.start(500)
+        self.rx_thread: Optional[threading.Thread] = None
+        self._session_viewer: Optional[SessionViewerWindow] = None
+        self._settings_dlg:   Optional[SettingsDialog]      = None
+        self._log: Optional[QTextEdit] = None
 
-    def get_input_style(self):
-        """Reusable style for QLineEdit and QComboBox"""
-        return f"background: {F1_MID_BG}; color: {F1_TEXT}; border: 1px solid {F1_ACCENT}; font-size: 14px; padding: 4px; border-radius: 2px;"
+        icon = Path("isc_logo.ico")
+        if icon.exists():
+            self.setWindowIcon(QIcon(str(icon)))
 
-    def get_button_style(self, type='default'):
-        """Reusable style for QPushButton"""
-        if type == 'accent':
-            bg = F1_ACCENT
-            text_color = F1_DARK_BG
-            border_style = 'none'
+        self._build_ui()
+        self._apply_theme()
+
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._update)
+        self._timer.start(400)
+
+        signaler.log_message.connect(self._log_append)
+        self._log_append("ISCmetrics v2 ready.")
+
+    # ── style helpers ─────────────────────────────────────────────────────────
+    def get_input_style(self) -> str:
+        return (f"background:{F1_MID_BG}; color:{F1_TEXT}; "
+                f"border:1px solid {ISC_GREEN}; font-size:13px; padding:4px; border-radius:2px;")
+
+    def get_button_style(self, v: str = 'default') -> str:
+        if v == 'accent':
+            bg, fg, br, hbg = ISC_GREEN, F1_DARK_BG, 'none', '#009a00'
         else:
-            bg = F1_MID_BG
-            text_color = F1_ACCENT
-            border_style = f'1px solid {F1_ACCENT}'
-
+            bg, fg, br, hbg = F1_MID_BG, ISC_GREEN, f'1px solid {ISC_GREEN}', ISC_GREEN
         return f"""
-            QPushButton {{
-                background: {bg};
-                color: {text_color};
-                border: {border_style};
-                border-radius: 3px;
-                padding: 6px 12px;
-                font-size: 12px;
-                font-weight: bold;
-                min-width: 60px;
-            }}
-            QPushButton:hover {{
-                background: {'#009900' if type=='accent' else F1_ACCENT};
-                color: {F1_DARK_BG};
-            }}
-            QPushButton:disabled {{
-                background: {F1_MID_BG};
-                color: {F1_MID_BG};
-                border: 1px solid {F1_MID_BG};
-            }}
+            QPushButton {{ background:{bg}; color:{fg}; border:{br};
+                           border-radius:3px; padding:5px 11px;
+                           font-size:11px; font-weight:bold; }}
+            QPushButton:hover {{ background:{hbg}; color:{F1_DARK_BG}; }}
+            QPushButton:disabled {{ background:#222; color:#444; border:1px solid #333; }}
         """
-    
-    def apply_f1_theme(self):
-        """Apply F1-style modern theme using ISC Green"""
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(F1_DARK_BG))
-        palette.setColor(QPalette.WindowText, QColor(F1_TEXT))
-        palette.setColor(QPalette.Base, QColor(F1_MID_BG))
-        palette.setColor(QPalette.AlternateBase, QColor(F1_MID_BG))
-        palette.setColor(QPalette.Text, QColor(F1_TEXT))
-        palette.setColor(QPalette.Button, QColor(F1_MID_BG))
-        palette.setColor(QPalette.ButtonText, QColor(F1_ACCENT))
-        palette.setColor(QPalette.Highlight, QColor(F1_ACCENT))
-        palette.setColor(QPalette.HighlightedText, QColor(F1_DARK_BG))
-        self.setPalette(palette)
-        
+
+    @staticmethod
+    def _lbl(text: str, style: str) -> QLabel:
+        l = QLabel(text); l.setStyleSheet(style); return l
+
+    @staticmethod
+    def _vsep() -> QFrame:
+        f = QFrame(); f.setFrameShape(QFrame.VLine)
+        f.setStyleSheet("color:#2a2a2a; max-width:1px;"); return f
+
+    def _apply_theme(self):
+        pal = QPalette()
+        pal.setColor(QPalette.Window,          QColor(F1_DARK_BG))
+        pal.setColor(QPalette.WindowText,      QColor(F1_TEXT))
+        pal.setColor(QPalette.Base,            QColor(F1_MID_BG))
+        pal.setColor(QPalette.Text,            QColor(F1_TEXT))
+        pal.setColor(QPalette.Button,          QColor(F1_MID_BG))
+        pal.setColor(QPalette.ButtonText,      QColor(ISC_GREEN))
+        pal.setColor(QPalette.Highlight,       QColor(ISC_GREEN))
+        pal.setColor(QPalette.HighlightedText, QColor(F1_DARK_BG))
+        self.setPalette(pal)
         self.setStyleSheet(f"""
-            QMainWindow {{ background-color: {F1_DARK_BG}; }}
-            QTabWidget::pane {{ border: 2px solid {F1_ACCENT}; border-top: none; background: {F1_DARK_BG}; }}
+            QMainWindow {{ background:{F1_DARK_BG}; }}
+            QTabWidget::pane {{ border:1px solid {ISC_GREEN}; background:{F1_DARK_BG}; }}
             QTabBar::tab {{
-                background: {WIDGET_BG};
-                color: {F1_TEXT};
-                padding: 8px 20px;
-                margin-right: 1px;
-                border-top: 1px solid {F1_ACCENT};
-                border-left: 1px solid {F1_ACCENT};
-                border-right: 1px solid {F1_ACCENT};
+                background:{F1_MID_BG}; color:{F1_TEXT};
+                padding:8px 22px; margin-right:1px;
+                border-top:1px solid {ISC_GREEN};
+                border-left:1px solid {ISC_GREEN};
+                border-right:1px solid {ISC_GREEN};
+                font-size:11px;
             }}
-            QTabBar::tab:selected {{
-                background: {F1_ACCENT};
-                color: {F1_DARK_BG};
-                font-weight: bold;
+            QTabBar::tab:selected {{ background:{ISC_GREEN}; color:{F1_DARK_BG}; font-weight:bold; }}
+            QLabel {{ color:{F1_TEXT}; }}
+            QGroupBox {{
+                color:{ISC_GREEN}; border:1px solid #252525;
+                margin-top:14px; font-size:9px; font-weight:bold;
             }}
-            QLabel {{ color: {F1_TEXT}; }}
-            QGroupBox {{ color: {F1_ACCENT}; border: 1px solid {F1_MID_BG}; margin-top: 10px; }}
-            QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top center; padding: 0 3px; background-color: {F1_DARK_BG}; color: {F1_ACCENT}; font-size: 11px; }}
+            QGroupBox::title {{
+                subcontrol-origin:margin; subcontrol-position:top left;
+                padding:0 5px; color:{ISC_GREEN}; background:{F1_DARK_BG};
+            }}
+            QScrollBar:vertical {{ background:{F1_DARK_BG}; width:7px; }}
+            QScrollBar::handle:vertical {{ background:#333; border-radius:3px; }}
         """)
 
-    def init_ui(self):
-        """Initialize main UI layout with new structure"""
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setSpacing(5)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        
-        log_frame = self.create_single_log_frame()
-        
-        top_section = self.create_compact_top_section()
-        main_layout.addWidget(top_section, stretch=1) 
-        
-        self.tabs = QTabWidget()
-        self.tabs.setFont(QFont("Arial", 10, QFont.Bold))
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        vbox = QVBoxLayout(root)
+        vbox.setSpacing(4)
+        vbox.setContentsMargins(8, 8, 8, 8)
 
-        self.tabs.addTab(self.create_overview_tab(), "Overview")
-        self.tabs.addTab(self.create_ams_tab(), "AMS Modules")
-        self.tabs.addTab(self.create_motor_tab(), "Motor")
-        self.tabs.addTab(self.create_driver_tab(), "Driver")
-        self.tabs.addTab(self.create_accu_tab(), "Accumulator")
-        self.tabs.addTab(self.create_dynamics_tab(), "Dynamics")
+        vbox.addWidget(self._make_top_bar())
 
-        
-        main_layout.addWidget(self.tabs, stretch=8) 
-        main_layout.addWidget(log_frame, stretch=1)
-        
-        attribution = QLabel("Andrés Sánchez de Ágreda © 2025/2026 - ICAI Racing Formula Student")
-        attribution.setAlignment(Qt.AlignCenter)
-        attribution.setStyleSheet(f"color: {F1_MID_BG}; font-size: 8px; padding: 2px;")
-        main_layout.addWidget(attribution)
+        self._alert_banner = AlertBanner()
+        vbox.addWidget(self._alert_banner)
 
-    def create_compact_top_section(self):
-        """Create super compact top section."""
-        container = QFrame()
-        container.setStyleSheet(f"background: {F1_DARK_BG}; border: 1px solid {F1_MID_BG}; border-radius: 3px;")
-        container.setMaximumHeight(85)
-        
-        main_layout = QHBoxLayout(container)
-        main_layout.setSpacing(15)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        
-        logo_section = self.create_logo_section_compact()
-        main_layout.addWidget(logo_section, stretch=1) 
-        
-        config_section = self.create_session_config_section()
-        main_layout.addWidget(config_section, stretch=3)
-        
-        self.status_label = QLabel("IDLE")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setMinimumWidth(100)
-        self.status_label.setStyleSheet(f"""
-            background: {F1_MID_BG};
-            color: {F1_TEXT};
-            font-size: 16px;
-            font-weight: bold;
-            padding: 8px 15px;
-            border: 2px solid {F1_ACCENT};
-            border-radius: 4px;
-        """)
-        main_layout.addWidget(self.status_label)
-        
-        buttons_section = self.create_buttons_section_compact()
-        main_layout.addWidget(buttons_section, stretch=1)
-        
-        return container
-    
-    def create_logo_section_compact(self):
-        """Minimal logo section with image and mini-metrics."""
-        frame = QFrame()
-        frame.setMinimumWidth(180)
-        frame.setStyleSheet(f"background: {F1_DARK_BG}; border: none;")
-        
-        layout = QHBoxLayout(frame)
-        layout.setSpacing(5)
-        layout.setContentsMargins(3, 3, 3, 3)
-        
-        logo_label = QLabel()
+        self._tabs = QTabWidget()
+        self._tabs.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self._tabs.addTab(self._tab_overview(),   "▶  Overview")
+        self._tabs.addTab(self._tab_customize(),  "⚙  Customize")
+        self._tabs.addTab(self._tab_powertrain(), "⚡  Powertrain")
+        self._tabs.addTab(self._tab_dynamics(),   "🏎  Dynamics")
+        vbox.addWidget(self._tabs, stretch=10)
+
+        vbox.addWidget(self._make_log_strip(), stretch=1)
+
+        attr = QLabel("Andrés Sánchez de Ágreda © 2025/2026  —  ICAI Racing Formula Student")
+        attr.setAlignment(Qt.AlignCenter)
+        attr.setStyleSheet("color:#252525; font-size:8px;")
+        vbox.addWidget(attr)
+
+    # ── Top bar ───────────────────────────────────────────────────────────────
+    def _make_top_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setStyleSheet(f"QFrame {{ background:{F1_MID_BG}; border-radius:4px; }}")
+        bar.setFixedHeight(78)
+        h = QHBoxLayout(bar)
+        h.setSpacing(10)
+        h.setContentsMargins(8, 5, 8, 5)
+
+        # Logo
+        lf = QFrame(); lf.setStyleSheet("background:transparent; border:none;")
+        ll = QHBoxLayout(lf); ll.setContentsMargins(0,0,0,0); ll.setSpacing(6)
+        logo_lbl = QLabel()
         logo_path = Path(__file__).resolve().parent / "isc_logo.png"
-        
         if logo_path.exists():
-            pixmap = QPixmap(str(logo_path))
-            if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(50, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                logo_label.setPixmap(scaled_pixmap)
-                logo_label.setMinimumSize(50, 50)
-            else:
-                logo_label.setText("ISC")
-                logo_label.setStyleSheet(f"color: {F1_ACCENT}; font-size: 18px; font-weight: bold;")
-        
-        logo_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(logo_label)
-        
-        metrics_layout = QVBoxLayout()
-        metrics_layout.setSpacing(0)
-        
-        app_name = QLabel("ISCmetrics")
-        app_name.setStyleSheet(f"color: {F1_ACCENT}; font-size: 14px; font-weight: bold;")
-        metrics_layout.addWidget(app_name)
-        
-        self.mini_speed = QLabel("0.0 km/h")
-        self.mini_voltage = QLabel("0.0 V")
-        self.mini_temp = QLabel("0 °C")
-        
-        for lbl in [self.mini_speed, self.mini_voltage, self.mini_temp]:
-            lbl.setStyleSheet(f"color: {F1_TEXT}; font-size: 9px;")
-            metrics_layout.addWidget(lbl)
-        
-        layout.addLayout(metrics_layout)
-        return frame
+            px = QPixmap(str(logo_path))
+            if not px.isNull():
+                logo_lbl.setPixmap(px.scaled(52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if not logo_lbl.pixmap() or logo_lbl.pixmap().isNull():
+            logo_lbl.setText("ISC")
+            logo_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:20px; font-weight:bold;")
+        ll.addWidget(logo_lbl)
+        vn = QVBoxLayout()
+        vn.addWidget(self._lbl("ISCmetrics", f"color:{ISC_GREEN}; font-size:15px; font-weight:bold;"))
+        vn.addWidget(self._lbl("Formula Student Telemetry v2", "color:#666; font-size:9px;"))
+        ll.addLayout(vn)
+        h.addWidget(lf)
+        h.addWidget(self._vsep())
 
-    def create_session_config_section(self):
-        """Piloto/Circuito selection section"""
-        frame = QFrame()
-        layout = QGridLayout(frame)
-        layout.setSpacing(5)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        label_style = f"color: {F1_ACCENT}; font-size: 12px; font-weight: bold;"
-        
-        lbl_pilot = QLabel("PILOT:")
-        lbl_pilot.setStyleSheet(label_style)
-        layout.addWidget(lbl_pilot, 0, 0)
-        
-        self.input_pilot = QLineEdit("Piloto_Test")
-        self.input_pilot.setStyleSheet(self.get_input_style())
-        self.input_pilot.setMinimumWidth(200)
-        layout.addWidget(self.input_pilot, 0, 1)
-        
-        lbl_circuit = QLabel("CIRCUIT:")
-        lbl_circuit.setStyleSheet(label_style)
-        layout.addWidget(lbl_circuit, 1, 0)
-        
-        self.input_circuit = QLineEdit("Circuito_Test")
-        self.input_circuit.setStyleSheet(self.get_input_style())
-        self.input_circuit.setMinimumWidth(200)
-        layout.addWidget(self.input_circuit, 1, 1)
-        
-        return frame
+        # Pilot / Circuit
+        fg = QGridLayout(); fg.setSpacing(4)
+        ls = f"color:{ISC_GREEN}; font-size:11px; font-weight:bold;"
+        ins = self.get_input_style()
+        fg.addWidget(self._lbl("PILOT:",   ls), 0, 0)
+        self._inp_pilot = QLineEdit("Piloto_Test"); self._inp_pilot.setStyleSheet(ins)
+        self._inp_pilot.setMinimumWidth(170); fg.addWidget(self._inp_pilot, 0, 1)
+        fg.addWidget(self._lbl("CIRCUIT:", ls), 1, 0)
+        self._inp_circuit = QLineEdit("Circuito_Test"); self._inp_circuit.setStyleSheet(ins)
+        self._inp_circuit.setMinimumWidth(170); fg.addWidget(self._inp_circuit, 1, 1)
+        h.addLayout(fg)
+        h.addWidget(self._vsep())
 
-    def create_buttons_section_compact(self):
-        """MODIFIED: Compact action buttons without demo button"""
-        frame = QFrame()
-        layout = QGridLayout(frame)
-        layout.setSpacing(4)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.btn_start = QPushButton("START")
-        self.btn_start.setStyleSheet(self.get_button_style('accent'))
-        self.btn_start.clicked.connect(self.start_reception)
-        layout.addWidget(self.btn_start, 0, 0)
-        
-        self.btn_stop = QPushButton("STOP")
-        self.btn_stop.setStyleSheet(self.get_button_style())
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_reception)
-        layout.addWidget(self.btn_stop, 0, 1)
-        
-        self.btn_settings = QPushButton("Ajustes")
-        self.btn_settings.setStyleSheet(self.get_button_style())
-        self.btn_settings.clicked.connect(self.open_settings)
-        layout.addWidget(self.btn_settings, 1, 0)
-        
-        btn_sessions = QPushButton("Sessions")
-        btn_sessions.setStyleSheet(self.get_button_style())
-        btn_sessions.clicked.connect(self.open_session_viewer)
-        layout.addWidget(btn_sessions, 1, 1)
-        
-        return frame
+        # Mini metrics
+        mv = QVBoxLayout()
+        self._mini_rpm  = QLabel("0 rpm");  self._mini_rpm.setStyleSheet("color:#777; font-size:9px;")
+        self._mini_vbus = QLabel("0 V");    self._mini_vbus.setStyleSheet("color:#777; font-size:9px;")
+        self._mini_temp = QLabel("0 °C");   self._mini_temp.setStyleSheet("color:#777; font-size:9px;")
+        for l in (self._mini_rpm, self._mini_vbus, self._mini_temp): mv.addWidget(l)
+        h.addLayout(mv)
+        h.addStretch()
 
-    def activate_demo_mode(self):
-        """Activate demo mode"""
-        self.demo_mode = True
-        self.append_log("[DEMO] Demo mode ENABLED - Ready to record")
-        # Just init demo, don't start loop until REC is pressed to allow config
-        demo.start_demo(False) 
-        self.btn_start.setEnabled(True)
-        self.status_label.setText("TEST")
-        self.status_label.setStyleSheet(f"""
-            background: {F1_ACCENT}; 
-            color: {F1_DARK_BG}; 
-            font-size: 16px; 
-            font-weight: bold; 
-            padding: 8px 15px; 
-            border-radius: 4px;
-            border: 2px solid {F1_ACCENT};
-        """)
-    
-    def deactivate_demo_mode(self):
-        """Deactivate demo mode"""
-        self.demo_mode = False
-        self.append_log("[DEMO] Demo mode DISABLED - Ready for real data")
-        demo.stop_demo()
-        if not self.is_receiving:
-            self.btn_start.setEnabled(True)
-        self.status_label.setText("IDLE")
-        self.status_label.setStyleSheet(f"""
-            background: {F1_MID_BG}; 
-            color: {F1_TEXT}; 
-            font-size: 16px; 
-            font-weight: bold; 
-            padding: 8px 15px; 
-            border-radius: 4px;
-            border: 2px solid {F1_MID_BG};
-        """)
+        # Status badge
+        self._status_lbl = QLabel("IDLE")
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        self._status_lbl.setFixedWidth(88)
+        self._status_lbl.setStyleSheet(
+            f"background:{F1_MID_BG}; color:#555; font-size:14px; font-weight:bold;"
+            f"padding:8px 10px; border:2px solid #333; border-radius:4px;")
+        h.addWidget(self._status_lbl)
+        h.addWidget(self._vsep())
 
-    def open_settings(self):
-        """Opens the Settings dialog and updates internal settings."""
-        self.settings_dialog = SettingsDialog(self)
-        
-        if self.settings_dialog.exec_():
-            new_settings = self.settings_dialog.get_settings()
-            
-            # Check if demo mode changed
-            demo_changed = new_settings["demo_mode"] != self.settings["demo_mode"]
-            
-            self.settings.update(new_settings)
-            
-            global current_settings
-            current_settings.update(new_settings)
-            rtt.DEFAULT_PORT = new_settings['port']
-            rtt.DEFAULT_BAUD = new_settings['baud']
-            rtt.INFLUX_ENABLE_DEFAULT = new_settings['use_influx']
-            rtt.DEBUG_ENABLE_DEFAULT = new_settings['debug']
+        # Buttons
+        bg = QGridLayout(); bg.setSpacing(4)
+        self._btn_start = QPushButton("▶ START")
+        self._btn_start.setStyleSheet(self.get_button_style('accent'))
+        self._btn_start.clicked.connect(self._start)
+        bg.addWidget(self._btn_start, 0, 0)
 
-            self.append_log(f"Settings updated: Port={self.settings['port']}, UploadMarple={self.settings['use_influx']}, Demo={self.settings['demo_mode']}")
-            
-            # Handle demo mode changes
-            if demo_changed:
-                if new_settings["demo_mode"]:
-                    self.activate_demo_mode()
-                else:
-                    self.deactivate_demo_mode()
+        self._btn_stop = QPushButton("■ STOP")
+        self._btn_stop.setStyleSheet(self.get_button_style())
+        self._btn_stop.setEnabled(False)
+        self._btn_stop.clicked.connect(self._stop)
+        bg.addWidget(self._btn_stop, 0, 1)
 
-    def create_overview_tab(self):
-        """Create overview dashboard with greater vertical space for graphs."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(6)
-        
-        self.lbl_dc_bus = self.create_metric_label("DC BUS", "--- V", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_dc_bus, 0, 0)
-        self.lbl_rpm = self.create_metric_label("RPM", "---", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_rpm, 0, 1)
-        self.lbl_torque = self.create_metric_label("TORQUE", "--- Nm", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_torque, 0, 2)
-        self.lbl_current = self.create_metric_label("CURRENT", "--- A", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_current, 0, 3)
-        
-        self.lbl_min_cell = self.create_metric_label("MIN CELL V", "--- mV", F1_WARNING, compact=True)
-        metrics_grid.addWidget(self.lbl_min_cell, 1, 0)
-        self.lbl_stack = self.create_metric_label("STACK V", "--- V", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_stack, 1, 1)
-        self.lbl_max_temp = self.create_metric_label("MAX TEMP", "--- °C", F1_ERROR, compact=True)
-        metrics_grid.addWidget(self.lbl_max_temp, 1, 2)
-        self.lbl_throttle = self.create_metric_label("THROTTLE", "--- %", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.lbl_throttle, 1, 3)
-        
-        layout.addLayout(metrics_grid, stretch=2) 
-        
-        plot_layout = QHBoxLayout()
-        self.plot_rpm = MplCanvas(title="RPM History", color=F1_ACCENT)
-        plot_layout.addWidget(self.plot_rpm)
-        self.plot_voltage = MplCanvas(title="Min Cell Voltage (mV)", color=F1_WARNING)
-        plot_layout.addWidget(self.plot_voltage)
-        self.plot_temp = MplCanvas(title="Max Temperature (°C)", color=F1_ERROR)
-        plot_layout.addWidget(self.plot_temp)
-        layout.addLayout(plot_layout, stretch=5) 
-        
-        return widget
-    
-    def create_ams_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout()
-        
-        global_stats = QGroupBox("GLOBAL BATTERY METRICS")
-        global_layout = QGridLayout()
-        
-        self.lbl_global_min = QLabel("Global Min: --- mV")
-        self.lbl_global_max = QLabel("Global Max: --- mV")
-        self.lbl_stack_total = QLabel("Stack Total: --- V")
-        self.lbl_ams_current = QLabel("Current: --- A")
-        
-        for lbl in [self.lbl_global_min, self.lbl_global_max, self.lbl_stack_total, self.lbl_ams_current]:
-             lbl.setStyleSheet(f"color: {F1_TEXT}; font-size: 12px; font-weight: bold; padding: 5px;")
-        
-        global_layout.addWidget(self.lbl_global_min, 0, 0)
-        global_layout.addWidget(self.lbl_global_max, 0, 1)
-        global_layout.addWidget(self.lbl_stack_total, 1, 0)
-        global_layout.addWidget(self.lbl_ams_current, 1, 1)
-        
-        global_stats.setLayout(global_layout)
-        layout.addWidget(global_stats)
-        
-        modules_group = QGroupBox("MODULE SUMMARY")
-        modules_layout = QHBoxLayout()
-        self.module_cards = []
-        
-        for i in range(NUM_MODULES):
-            card = self.create_module_card(i)
-            modules_layout.addWidget(card)
-            self.module_cards.append(card)
-        
-        modules_group.setLayout(modules_layout)
-        layout.addWidget(modules_group)
-        
-        widget.setLayout(layout)
-        return widget
-    
-    def create_module_card(self, module_id):
-        card = QGroupBox(f"MODULE {module_id}")
-        card.setStyleSheet(f"""
-            QGroupBox {{ font-size: 10px; color: {F1_ACCENT}; border: 1px solid {F1_ACCENT}; background: {F1_MID_BG}; }}
-            QGroupBox::title {{ color: {F1_ACCENT}; }}
-        """)
-        
-        layout = QVBoxLayout()
-        
-        lbl_min_v = QLabel("Min V: --- mV")
-        lbl_max_v = QLabel("Max V: --- mV")
-        lbl_min_t = QLabel("Min T: --- °C")
-        lbl_max_t = QLabel("Max T: --- °C")
-        lbl_age = QLabel("Age: ---")
-        
-        for lbl in [lbl_min_v, lbl_max_v, lbl_min_t, lbl_max_t, lbl_age]:
-            lbl.setStyleSheet(f"font-size: 10px; color: {F1_TEXT};")
-        
-        layout.addWidget(lbl_min_v)
-        layout.addWidget(lbl_max_v)
-        layout.addWidget(lbl_min_t)
-        layout.addWidget(lbl_max_t)
-        layout.addWidget(lbl_age)
-        
-        card.setLayout(layout)
-        
-        card.lbl_min_v = lbl_min_v
-        card.lbl_max_v = lbl_max_v
-        card.lbl_min_t = lbl_min_t
-        card.lbl_max_t = lbl_max_t
-        card.lbl_age = lbl_age
-        
-        return card
+        self._btn_settings = QPushButton("⚙ Settings")
+        self._btn_settings.setStyleSheet(self.get_button_style())
+        self._btn_settings.clicked.connect(self._open_settings)
+        bg.addWidget(self._btn_settings, 1, 0)
 
-    def create_motor_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(6)
-        
-        self.motor_lbl_rpm = self.create_metric_label("RPM", "---", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.motor_lbl_rpm, 0, 0)
-        self.motor_lbl_torque = self.create_metric_label("TORQUE REQ", "--- Nm", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.motor_lbl_torque, 0, 1)
-        self.motor_lbl_current = self.create_metric_label("ACTUAL CURRENT", "--- A", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.motor_lbl_current, 1, 0)
-        self.motor_lbl_temp = self.create_metric_label("MOTOR TEMP", "--- °C", F1_WARNING, compact=True)
-        metrics_grid.addWidget(self.motor_lbl_temp, 1, 1)
-        
-        layout.addLayout(metrics_grid, stretch=2)
-        
-        plot_layout = QHBoxLayout()
-        self.motor_plot_torque = MplCanvas(title="Total Torque (Nm)", color=F1_ACCENT)
-        self.motor_plot_current = MplCanvas(title="Actual Current (A)", color=F1_ACCENT)
-        plot_layout.addWidget(self.motor_plot_torque)
-        plot_layout.addWidget(self.motor_plot_current)
-        layout.addLayout(plot_layout, stretch=5)
-        
-        return widget
+        btn_sess = QPushButton("📁 Sessions")
+        btn_sess.setStyleSheet(self.get_button_style())
+        btn_sess.clicked.connect(self._open_sessions)
+        bg.addWidget(btn_sess, 1, 1)
+        h.addLayout(bg)
+        return bar
 
-    def create_driver_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(6)
-        
-        self.driver_lbl_throttle = self.create_metric_label("THROTTLE", "--- %", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.driver_lbl_throttle, 0, 0)
-        self.driver_lbl_brake = self.create_metric_label("BRAKE", "--- %", F1_ACCENT, compact=True)
-        metrics_grid.addWidget(self.driver_lbl_brake, 0, 1)
-        self.driver_lbl_s1 = self.create_metric_label("APPS 1 (Raw)", "---", F1_WARNING, compact=True)
-        metrics_grid.addWidget(self.driver_lbl_s1, 1, 0)
-        self.driver_lbl_s2 = self.create_metric_label("APPS 2 (Raw)", "---", F1_WARNING, compact=True)
-        metrics_grid.addWidget(self.driver_lbl_s2, 1, 1)
-        
-        layout.addLayout(metrics_grid, stretch=2)
-        
-        plot_layout = QHBoxLayout()
-        self.driver_plot_throttle = MplCanvas(title="Throttle Position %", color=F1_ACCENT)
-        self.driver_plot_brake = MplCanvas(title="Brake Pedal Position %", color=F1_ERROR)
-        plot_layout.addWidget(self.driver_plot_throttle)
-        plot_layout.addWidget(self.driver_plot_brake)
-        layout.addLayout(plot_layout, stretch=5)
-        
-        return widget
-    
-    def create_accu_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        stats_layout = QHBoxLayout()
-        self.accu_lbl_stack = self.create_metric_label("STACK V", "--- V", F1_ACCENT, compact=True)
-        self.accu_lbl_current = self.create_metric_label("CURRENT", "--- A", F1_ACCENT, compact=True)
-        self.accu_lbl_min_cell = self.create_metric_label("MIN CELL", "--- mV", F1_WARNING, compact=True)
-        self.accu_lbl_max_temp = self.create_metric_label("MAX TEMP", "--- °C", F1_ERROR, compact=True)
-        
-        stats_layout.addWidget(self.accu_lbl_stack)
-        stats_layout.addWidget(self.accu_lbl_current)
-        stats_layout.addWidget(self.accu_lbl_min_cell)
-        stats_layout.addWidget(self.accu_lbl_max_temp)
-        layout.addLayout(stats_layout, stretch=1)
-        
-        heatmap_layout = QGridLayout()
-        self.accu_heatmaps = []
-        for i in range(NUM_MODULES):
-            heatmap = HeatmapCanvas(title=f"MODULE {i}")
-            heatmap_layout.addWidget(heatmap, i // 3, i % 3)
-            self.accu_heatmaps.append(heatmap)
-        
-        layout.addLayout(heatmap_layout, stretch=4)
-        
-        return widget
-    
-    def create_dynamics_tab(self):
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        # G-force IMU Panel
-        gbox_g = QGroupBox("IMU G-Forces (Long / Lat)")
-        v_g = QVBoxLayout(gbox_g)
-        self.g_circle = GCircleWidget()
-        v_g.addWidget(self.g_circle)
-        self.g_long_label = QLabel("Longitudinal G: 0.00")
-        self.g_lat_label = QLabel("Lateral G: 0.00")
-        self.g_total_label = QLabel("Total G: 0.00")
-        for l in (self.g_long_label, self.g_lat_label, self.g_total_label):
-            l.setStyleSheet(f"color: {F1_ACCENT}; font-size: 12px;")
-            v_g.addWidget(l)
-        layout.addWidget(gbox_g, 1)
-        # Suspension
-        gbox_susp = QGroupBox("Suspension Forces & Travel")
-        v_s = QVBoxLayout(gbox_susp)
-        self.s_susp_force = []
-        self.s_susp_travel = []
-        for i, pos in enumerate(['FL','FR','RL','RR']):
-            bar1 = QProgressBar()
-            bar1.setMaximum(1000)
-            bar1.setStyleSheet("QProgressBar {background: #222; color: #90ee90; border-radius: 2px;}"
-                            "QProgressBar::chunk {background-color: #008000;}")
-            lbl1 = QLabel(f"{pos} Force: 0N")
-            v_s.addWidget(lbl1)
-            v_s.addWidget(bar1)
-            self.s_susp_force.append((lbl1, bar1))
-            bar2 = QProgressBar()
-            bar2.setMaximum(100)
-            bar2.setStyleSheet("QProgressBar {background: #222; color: #00d4ff; border-radius: 2px;}"
-                            "QProgressBar::chunk {background-color: #005580;}")
-            lbl2 = QLabel(f"{pos} Travel: 0mm")
-            v_s.addWidget(lbl2)
-            v_s.addWidget(bar2)
-            self.s_susp_travel.append((lbl2, bar2))
-        layout.addWidget(gbox_susp, 1)
-        # Brake temp
-        gbox_brake = QGroupBox("Brake Disc Temperatures (°C)")
-        v_b = QVBoxLayout(gbox_brake)
-        self.brake_temp_widgets = []
-        for i, pos in enumerate(['FL','FR','RL','RR']):
-            disc = BrakeDiscWidget()
-            temp_lbl = QLabel("0°C")
-            temp_lbl.setStyleSheet("font-size:14px;font-weight:bold;")
-            h_lay = QHBoxLayout()
-            h_lay.addWidget(QLabel(pos))
-            h_lay.addWidget(disc)
-            h_lay.addWidget(temp_lbl)
-            v_b.addLayout(h_lay)
-            self.brake_temp_widgets.append((disc, temp_lbl))
-        layout.addWidget(gbox_brake, 1)
-        return widget
+    # ── Tab 1 — Overview ──────────────────────────────────────────────────────
+    def _tab_overview(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w); v.setSpacing(6); v.setContentsMargins(8,8,8,8)
 
-    def create_metric_label(self, title, value, color, compact=False):
-        """Create a styled metric display label with F1 aesthetic"""
-        frame = QFrame()
-        frame.setStyleSheet(f"""
-            QFrame {{
-                background: {F1_MID_BG};
-                border: 2px solid {color};
-                border-radius: 4px;
-                padding: {'3px' if compact else '6px'};
-            }}
-        """)
-        
-        layout = QVBoxLayout()
-        layout.setSpacing(1)
-        
-        title_lbl = QLabel(title)
-        title_lbl.setAlignment(Qt.AlignCenter)
-        title_lbl.setStyleSheet(f"color: {color}; font-size: {'10px' if compact else '12px'}; font-weight: bold;")
-        
-        value_lbl = QLabel(value)
-        value_lbl.setAlignment(Qt.AlignCenter)
-        value_lbl.setStyleSheet(f"color: {F1_TEXT}; font-size: {'18px' if compact else '22px'}; font-weight: bold;")
-        
-        layout.addWidget(title_lbl)
-        layout.addWidget(value_lbl)
-        frame.setLayout(layout)
-        
-        frame.value_label = value_lbl
-        return frame
-    
-    def create_single_log_frame(self):
-        """Create single consolidated log frame at the bottom."""
-        frame = QGroupBox("SYSTEM LOG & DEBUG DATA")
-        frame.setStyleSheet(f"QGroupBox {{ font-size: 10px; color: {F1_ACCENT}; border: 1px solid {F1_ACCENT}; }}")
-        
-        layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(120)
-        self.log_text.setStyleSheet(f"""
-            background: {F1_DARK_BG}; 
-            color: {F1_TEXT}; 
-            font-family: 'Courier New'; 
-            font-size: 10px; 
-            border: 1px solid {F1_ACCENT};
-        """)
-        layout.addWidget(self.log_text)
-        
-        frame.setLayout(layout)
-        return frame
-    
-    def refresh_ports(self):
-        """Refreshes ports in the settings dialog (if open) and updates the default setting."""
-        ports = rtt.list_serial_ports()
-        
-        if ports:
-            if self.settings["port"] not in [p[0] for p in ports]:
-                self.settings["port"] = ports[0][0]
-                self.append_log(f"Port auto-selected: {self.settings['port']}")
-        
-        if self.settings_dialog and self.settings_dialog.isVisible():
-            self.settings_dialog.refresh_ports()
-        
-    def start_reception(self):
-        """Start data reception thread"""
-        if self.is_receiving: 
+        # Metric cards row (8 cards)
+        cr = QHBoxLayout(); cr.setSpacing(6)
+        self._ov_rpm    = MetricCard("RPM",         "rpm",  ISC_GREEN)
+        self._ov_vbus   = MetricCard("DC BUS",      "V",    ISC_GREEN)
+        self._ov_temp   = MetricCard("MAX TEMP",    "°C",   F1_ERROR)
+        self._ov_soc    = MetricCard("SOC",         "%",    F1_BLUE)
+        self._ov_torque = MetricCard("TORQUE",      "%",    ISC_GREEN)
+        self._ov_cur    = MetricCard("INV CURRENT", "A",    F1_PURPLE)
+        self._ov_vcell  = MetricCard("MIN CELL",    "mV",   F1_WARNING)
+        self._ov_state  = MetricCard("INV STATE",   "",     ISC_GREEN)
+        for c in (self._ov_rpm, self._ov_vbus, self._ov_temp, self._ov_soc,
+                  self._ov_torque, self._ov_cur, self._ov_vcell, self._ov_state):
+            cr.addWidget(c)
+        v.addLayout(cr, stretch=2)
+
+        # Rolling plots (3)
+        pr = QHBoxLayout(); pr.setSpacing(6)
+        self._ov_plot_rpm  = MplCanvas("RPM History",           ISC_GREEN)
+        self._ov_plot_vbus = MplCanvas("DC Bus Voltage (V)",    F1_WARNING)
+        self._ov_plot_temp = MplCanvas("Max Battery Temp (°C)", F1_ERROR)
+        pr.addWidget(self._ov_plot_rpm)
+        pr.addWidget(self._ov_plot_vbus)
+        pr.addWidget(self._ov_plot_temp)
+        v.addLayout(pr, stretch=5)
+
+        # State / indicator row
+        ir = QHBoxLayout(); ir.setSpacing(16)
+        self._ind_precharge = QLabel("● PRECHARGE")
+        self._ind_inv_ok    = QLabel("● INV OK")
+        self._ind_ams       = QLabel("● AMS")
+        self._lbl_seq       = QLabel("SEQ: —")
+        self._lbl_tick      = QLabel("TICK: —")
+        for l in (self._ind_precharge, self._ind_inv_ok, self._ind_ams):
+            l.setStyleSheet("color:#333; font-size:10px; font-weight:bold;")
+        for l in (self._lbl_seq, self._lbl_tick):
+            l.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
+        for w2 in (self._ind_precharge, self._ind_inv_ok, self._ind_ams,
+                   self._lbl_seq, self._lbl_tick):
+            ir.addWidget(w2)
+        ir.addStretch()
+        v.addLayout(ir, stretch=1)
+        return w
+
+    # ── Tab 2 — Customize ─────────────────────────────────────────────────────
+    def _tab_customize(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w); h.setSpacing(6); h.setContentsMargins(8,8,8,8)
+
+        # Left: channel list
+        lv = QVBoxLayout()
+        lv.addWidget(self._lbl("Available Channels",
+                                f"color:{ISC_GREEN}; font-size:11px; font-weight:bold;"))
+        lv.addWidget(self._lbl("Drag onto a panel to plot it.",
+                                "color:#444; font-size:9px;"))
+        self._ch_list = ChannelListWidget()
+        lv.addWidget(self._ch_list)
+        lw = QWidget(); lw.setLayout(lv); lw.setFixedWidth(196)
+        h.addWidget(lw)
+
+        # Right: 2 × 3 drop panels
+        self._drop_panels: List[DroppablePlotPanel] = []
+        gw = QWidget()
+        grid = QGridLayout(gw); grid.setSpacing(6)
+        for idx in range(6):
+            p = DroppablePlotPanel(idx)
+            self._drop_panels.append(p)
+            grid.addWidget(p, idx // 3, idx % 3)
+        h.addWidget(gw)
+        return w
+
+    # ── Tab 3 — Powertrain ────────────────────────────────────────────────────
+    def _tab_powertrain(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w); v.setSpacing(6); v.setContentsMargins(8,8,8,8)
+
+        # ── Top section ────────────────────────────────────────────────────────
+        top = QHBoxLayout(); top.setSpacing(8)
+
+        # RPM gauge
+        eng = QGroupBox("ENGINE")
+        ev = QVBoxLayout(eng)
+        self._rpm_gauge = RPMGauge()
+        ev.addWidget(self._rpm_gauge)
+        self._pt_speed = MetricCard("Speed (actual)", "", ISC_GREEN)
+        ev.addWidget(self._pt_speed)
+        top.addWidget(eng, stretch=2)
+
+        # Inverter temps
+        itb = QGroupBox("INVERTER TEMPERATURES")
+        itg = QGridLayout(itb)
+        self._pt_tm1   = MetricCard("Motor 1",   "°C", F1_WARNING)
+        self._pt_tpwr  = MetricCard("PWRSTG",    "°C", F1_WARNING)
+        self._pt_tbd   = MetricCard("Board",     "°C", ISC_GREEN)
+        self._pt_tdcdc = MetricCard("DC-DC",     "°C", ISC_GREEN)
+        itg.addWidget(self._pt_tm1,   0, 0); itg.addWidget(self._pt_tpwr, 0, 1)
+        itg.addWidget(self._pt_tbd,   1, 0); itg.addWidget(self._pt_tdcdc,1, 1)
+        top.addWidget(itb, stretch=2)
+
+        # Battery summary
+        bsb = QGroupBox("BATTERY SUMMARY")
+        bsg = QGridLayout(bsb)
+        self._pt_vbus  = MetricCard("DC Bus",    "V",    ISC_GREEN)
+        self._pt_soc   = MetricCard("SOC",       "%",    F1_BLUE)
+        self._pt_iaccu = MetricCard("Accu I",    "raw",  F1_PURPLE)
+        self._pt_idcdc = MetricCard("DCDC I",    "raw",  ISC_GREEN)
+        self._pt_vcell = MetricCard("Min Cell",  "mV",   F1_WARNING)
+        self._pt_ams   = MetricCard("AMS State", "",     ISC_GREEN)
+        bsg.addWidget(self._pt_vbus,  0, 0); bsg.addWidget(self._pt_soc,   0, 1)
+        bsg.addWidget(self._pt_iaccu, 1, 0); bsg.addWidget(self._pt_idcdc, 1, 1)
+        bsg.addWidget(self._pt_vcell, 2, 0); bsg.addWidget(self._pt_ams,   2, 1)
+        top.addWidget(bsb, stretch=2)
+        v.addLayout(top, stretch=3)
+
+        # ── Bottom section: per-module bars ────────────────────────────────────
+        bot = QHBoxLayout(); bot.setSpacing(8)
+
+        vbox_v = QGroupBox("PER-MODULE CELL VOLTAGE  (min → max mV)   ·   ⚠ < 3200 mV")
+        vbv = QVBoxLayout(vbox_v)
+        self._mod_v_bars: List[ModuleBarWidget] = []
+        for i in range(5):
+            b = ModuleBarWidget(i, "mV", lo=2800, hi=4250, warn_lo=3200)
+            vbv.addWidget(b); self._mod_v_bars.append(b)
+        bot.addWidget(vbox_v, stretch=1)
+
+        vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE (°C)   ·   ⚠ > {ALERT_TEMP_C:.0f} °C")
+        vbt = QVBoxLayout(vbox_t)
+        self._mod_t_bars: List[ModuleBarWidget] = []
+        for i in range(5):
+            b = ModuleBarWidget(i, "°C", lo=0, hi=80, warn_hi=ALERT_TEMP_C)
+            vbt.addWidget(b); self._mod_t_bars.append(b)
+        bot.addWidget(vbox_t, stretch=1)
+        v.addLayout(bot, stretch=3)
+        return w
+
+    # ── Tab 4 — Dynamics ──────────────────────────────────────────────────────
+    def _tab_dynamics(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w); h.setSpacing(8); h.setContentsMargins(8,8,8,8)
+
+        # Pedals
+        ped = QGroupBox("PEDAL INPUTS")
+        pv = QHBoxLayout(ped); pv.setSpacing(20)
+        self._ped_thr = PedalWidget("THROTTLE", ISC_GREEN)
+        self._ped_brk = PedalWidget("BRAKE",    F1_ERROR)
+        pv.addWidget(self._ped_thr); pv.addWidget(self._ped_brk)
+        h.addWidget(ped, stretch=1)
+
+        # Driver signals
+        dsb = QGroupBox("DRIVER & CONTROL SIGNALS")
+        dsv = QVBoxLayout(dsb); dsv.setSpacing(4)
+        def _mc(t, u="", c=ISC_GREEN):
+            card = MetricCard(t, u, c); dsv.addWidget(card); return card
+        self._dyn_apps1  = _mc("APPS 1 (raw)")
+        self._dyn_apps2  = _mc("APPS 2 (raw)")
+        self._dyn_brake  = _mc("Brake (raw)",   c=F1_ERROR)
+        self._dyn_torque = _mc("Torque %",      c=ISC_GREEN)
+        self._dyn_start  = _mc("Start Button",  c=ISC_GREEN)
+        self._dyn_ev23   = _mc("EV 2/3")
+        self._dyn_t11    = _mc("T11 8/9")
+        self._dyn_state  = _mc("Ctrl State",    c=F1_BLUE)
+        h.addWidget(dsb, stretch=1)
+
+        # G-force + IMU
+        gbox = QGroupBox("IMU G-FORCE")
+        gv   = QVBoxLayout(gbox); gv.setSpacing(6)
+        self._g_circle = GCircleWidget()
+        gv.addWidget(self._g_circle)
+        self._g_long = QLabel("Long G:   0.00")
+        self._g_lat  = QLabel("Lat  G:   0.00")
+        self._g_tot  = QLabel("Total G:  0.00")
+        for l in (self._g_long, self._g_lat, self._g_tot):
+            l.setStyleSheet(f"color:{ISC_GREEN}; font-size:11px; font-family:'Courier New';")
+            gv.addWidget(l)
+        gv.addStretch()
+        note = QLabel("IMU channels not yet in\nradio snapshot — placeholder.")
+        note.setStyleSheet("color:#333; font-size:9px;")
+        gv.addWidget(note)
+        h.addWidget(gbox, stretch=1)
+        return w
+
+    # ── Log strip ─────────────────────────────────────────────────────────────
+    def _make_log_strip(self) -> QGroupBox:
+        box = QGroupBox("SYSTEM LOG")
+        box.setStyleSheet(f"QGroupBox {{ color:{ISC_GREEN}; border:1px solid #222; }}")
+        v = QVBoxLayout(box); v.setContentsMargins(4, 4, 4, 4)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumHeight(80)
+        self._log.setStyleSheet(
+            f"background:{F1_DARK_BG}; color:{F1_TEXT}; "
+            f"font-family:'Courier New'; font-size:9px; border:none;")
+        v.addWidget(self._log)
+        return box
+
+    # ── Data access ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _snap() -> dict:
+        return rtt.get_latest_data().get('snapshot', {})
+
+    # ── Alert checking ────────────────────────────────────────────────────────
+    def _check_alerts(self, s: dict) -> None:
+        alerts = []
+        tmax = s.get('temp_max_modulo', [])
+        valid_t = [t for t in tmax if t != 0]
+        if valid_t and max(valid_t) > ALERT_TEMP_C:
+            alerts.append((f"⚠  BATTERY TEMP {max(valid_t):.0f}°C > {ALERT_TEMP_C:.0f}°C", 'critical'))
+        vbus = s.get('inv_dc_bus_V', 0)
+        if 0 < vbus < ALERT_VOLT_V:
+            alerts.append((f"⚠  DC BUS {vbus} V < {ALERT_VOLT_V} V", 'warning'))
+        self._alert_banner.set_alerts(alerts)
+        self._ov_temp.set_alert(any(a[1] == 'critical' for a in alerts))
+        self._ov_vbus.set_alert(any('DC BUS' in a[0] for a in alerts))
+
+    # ── Main update loop ──────────────────────────────────────────────────────
+    def _update(self):
+        snap = self._snap()
+        self._check_alerts(snap)
+        self._update_badge()
+        self._update_overview(snap)
+        self._update_powertrain(snap)
+        self._update_dynamics(snap)
+        self._update_customize(snap)
+        # Log new data strings
+        if rtt.new_data_flag == 1:
+            self._log_append(rtt.data_str)
+            rtt.new_data_flag = 0
+        # Detect dead RX thread
+        if self.is_receiving and not self.demo_mode:
+            if self.rx_thread and not self.rx_thread.is_alive():
+                self._stop()
+
+    def _update_badge(self):
+        st    = rtt.get_latest_data().get("__STATUS__", {})
+        badge = st.get("badge", "IDLE")
+        base  = "font-size:14px; font-weight:bold; padding:8px 10px; border-radius:4px;"
+        if badge == "LIVE":
+            self._status_lbl.setText("LIVE")
+            self._status_lbl.setStyleSheet(f"background:{ISC_GREEN}; color:{F1_DARK_BG}; {base} border:2px solid {ISC_GREEN};")
+        elif badge == "STALE":
+            self._status_lbl.setText("STALE")
+            self._status_lbl.setStyleSheet(f"background:{F1_MID_BG}; color:{F1_WARNING}; {base} border:2px solid {F1_WARNING};")
+        elif badge == "BAD":
+            self._status_lbl.setText("BAD")
+            self._status_lbl.setStyleSheet(f"background:{F1_MID_BG}; color:{F1_ERROR}; {base} border:2px solid {F1_ERROR};")
+        else:
+            self._status_lbl.setText("IDLE")
+            self._status_lbl.setStyleSheet(f"background:{F1_MID_BG}; color:#555; {base} border:2px solid #333;")
+
+    def _update_overview(self, s: dict):
+        rpm    = s.get('inv_rpm',           0)
+        vbus   = s.get('inv_dc_bus_V',      0)
+        vcell  = s.get('v_cell_min_mV',     0)
+        soc    = s.get('soc',               0)
+        tpct   = s.get('torque_pct',        0)
+        icur   = s.get('inv_current_actual',0)
+        istate = s.get('inv_state',         0)
+        pre    = s.get('ok_precharge',      0)
+        ams    = s.get('ams_fsm_state',     0)
+        ierr   = s.get('inv_error',         0)
+        seq    = s.get('seq',               0)
+        tick   = s.get('tick_ms',           0)
+        tmax   = s.get('temp_max_modulo',  [0]*5)
+        max_t  = max((t for t in tmax if t != 0), default=0)
+
+        self._ov_rpm.set_value(f"{int(rpm):,}")
+        self._ov_vbus.set_value(f"{vbus}")
+        self._ov_temp.set_value(f"{max_t:.0f}")
+        self._ov_soc.set_value(f"{soc}")
+        self._ov_torque.set_value(f"{tpct}")
+        self._ov_cur.set_value(f"{icur}")
+        self._ov_vcell.set_value(f"{vcell}")
+        self._ov_state.set_value(f"{istate}")
+
+        self._mini_rpm.setText(f"{int(rpm):,} rpm")
+        self._mini_vbus.setText(f"{vbus} V")
+        self._mini_temp.setText(f"{max_t:.0f} °C")
+
+        self._ov_plot_rpm.update_plot(rpm)
+        self._ov_plot_vbus.update_plot(vbus)
+        self._ov_plot_temp.update_plot(max_t)
+
+        def _ind(lbl, text, on):
+            lbl.setText(f"● {text}")
+            lbl.setStyleSheet(f"color:{'#00c853' if on else '#333'}; font-size:10px; font-weight:bold;")
+        _ind(self._ind_precharge, "PRECHARGE OK", bool(pre))
+        _ind(self._ind_inv_ok,    "INV OK",       ierr == 0 and istate > 0)
+        _ind(self._ind_ams,       f"AMS {ams}",   ams > 0)
+        self._lbl_seq.setText(f"SEQ: {seq}")
+        self._lbl_tick.setText(f"TICK: {tick} ms")
+
+    def _update_powertrain(self, s: dict):
+        self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
+        self._pt_speed.set_value(str(s.get('inv_speed_actual', 0)))
+        self._pt_tm1.set_value(f"{s.get('inv_temp_motor1', 0)}")
+        self._pt_tpwr.set_value(f"{s.get('inv_temp_pwrstg', 0)}")
+        self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)}")
+        self._pt_tdcdc.set_value(f"{s.get('temp_dcdc', 0)}")
+        self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)}")
+        self._pt_soc.set_value(f"{s.get('soc', 0)}")
+        self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0)}")
+        self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0)}")
+        self._pt_vcell.set_value(f"{s.get('v_cell_min_mV', 0)}")
+        self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
+
+        vmin = s.get('vmin_modulo',      [0]*5)
+        vmax = s.get('vmax_modulo',      [0]*5)
+        tmax = s.get('temp_max_modulo',  [0]*5)
+        for i, bar in enumerate(self._mod_v_bars):
+            bar.set_values(vmin[i] if i < len(vmin) else 0,
+                           vmax[i] if i < len(vmax) else 0)
+        for i, bar in enumerate(self._mod_t_bars):
+            t = tmax[i] if i < len(tmax) else 0
+            bar.set_values(0, t)
+
+    def _update_dynamics(self, s: dict):
+        a1    = s.get('apps1_raw',  0)
+        a2    = s.get('apps2_raw',  0)
+        brake = s.get('brake_raw',  0)
+        # Normalise — use max of both APPS sensors for throttle
+        self._ped_thr.set_value(max(a1, a2) / ADC_MAX, int(max(a1, a2)))
+        self._ped_brk.set_value(brake / ADC_MAX,        int(brake))
+
+        self._dyn_apps1.set_value(str(a1))
+        self._dyn_apps2.set_value(str(a2))
+        self._dyn_brake.set_value(str(brake))
+        self._dyn_torque.set_value(f"{s.get('torque_pct', 0)}")
+        self._dyn_start.set_value("ON" if s.get('start_button', 0) else "OFF")
+        self._dyn_ev23.set_value(str(s.get('ev_2_3', 0)))
+        self._dyn_t11.set_value(str(s.get('t11_8_9', 0)))
+        self._dyn_state.set_value(str(s.get('state', 0)))
+
+        # IMU — placeholder until IMU data lands in snapshot
+        self._g_circle.set_g_force(0.0, 0.0)
+
+    def _update_customize(self, s: dict):
+        for panel in self._drop_panels:
+            panel.update_value(s)
+
+    # ── Reception ─────────────────────────────────────────────────────────────
+    def _start(self):
+        if self.is_receiving:
             return
-        
-        piloto = self.input_pilot.text()
-        circuito = self.input_circuit.text()
-        port = self.settings["port"]
-        use_marple = self.settings["use_influx"] # Reused flag for Marple Upload
-        debug = self.settings["debug"]
-        
-        try:
-            baud = int(self.settings["baud"])
-        except ValueError:
-            QMessageBox.critical(self, "Error", "Invalid baudrate in settings.")
-            return
-        
-        self.is_receiving = True
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_settings.setEnabled(False)
-        
-        if self.demo_mode:
-            # En modo demo, paramos el loop de visualización y reiniciamos con logging
-            demo.stop_demo() 
-            demo.start_demo(use_marple=use_marple, piloto=piloto, circuito=circuito)
-            self.append_log(f"Recording DEMO. Upload to Marple: {use_marple}")
+        piloto   = self._inp_pilot.text()
+        circuito = self._inp_circuit.text()
+        port     = self.settings.get("port")
+        baud     = int(self.settings.get("baud", 115200))
+        use_mpl  = self.settings.get("use_influx", False)
+        debug    = self.settings.get("debug", False)
+
+        if self.demo_mode and DEMO_AVAILABLE:
+            demo.start_demo(use_marple=use_mpl, piloto=piloto, circuito=circuito)
+            self._log_append("[DEMO] Demo data feed started.")
         else:
             if not port:
-                QMessageBox.warning(self, "Error", "No COM port selected. Check Ajustes.")
-                self.is_receiving = False
-                self.btn_start.setEnabled(True)
-                self.btn_stop.setEnabled(False)
+                QMessageBox.warning(self, "No port", "No COM port selected. Open Settings.")
                 return
-
-            bucket_id = rtt.create_bucket(piloto, circuito)
-            self.append_log(f"Starting Serial: {port} @ {baud}. Upload Marple: {use_marple}")
-            self.append_log(f"Session ID: {bucket_id}")
-            
-            def rx_worker():
+            bucket = rtt.create_bucket(piloto, circuito)
+            self._log_append(f"Serial start: {port} @ {baud}  session={bucket}")
+            def _worker():
                 try:
-                    rtt.receive_data(
-                        bucket_id=bucket_id,
-                        piloto=piloto,
-                        circuito=circuito,
-                        port=port,
-                        baud=baud,
-                        use_influx=use_marple,
-                        debug=debug
-                    )
-                except Exception as e:
-                    signaler.log_message.emit(f"FATAL ERROR IN RX THREAD: {e}")
+                    rtt.receive_data(bucket_id=bucket, piloto=piloto, circuito=circuito,
+                                     port=port, baud=baud, use_influx=use_mpl, debug=debug)
+                except Exception as ex:
+                    signaler.log_message.emit(f"RX ERROR: {ex}")
                 finally:
                     self.is_receiving = False
-
-            self.rx_thread = threading.Thread(target=rx_worker, daemon=True)
+            self.rx_thread = threading.Thread(target=_worker, daemon=True)
             self.rx_thread.start()
-        
-    def stop_reception(self):
-        """Stop data reception"""
-        if not self.is_receiving: return
-        
-        self.append_log("Stopping reception...")
-        
-        if self.demo_mode:
+
+        self.is_receiving = True
+        self._btn_start.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._btn_settings.setEnabled(False)
+
+    def _stop(self):
+        if not self.is_receiving:
+            return
+        self._log_append("Stopping reception…")
+        if self.demo_mode and DEMO_AVAILABLE:
             demo.stop_demo()
-            self.is_receiving = False
         else:
             rtt.new_data_flag = -1
             if self.rx_thread and self.rx_thread.is_alive():
-                self.rx_thread.join(timeout=1.0)
-            self.is_receiving = False
-            
-        if not self.demo_mode:
-            self.btn_start.setEnabled(True)
-        
-        self.btn_stop.setEnabled(False)
-        self.btn_settings.setEnabled(True)
+                self.rx_thread.join(timeout=1.5)
+        self.is_receiving = False
+        self._btn_start.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._btn_settings.setEnabled(True)
 
-    def update_displays(self):
-        """Update all displays with latest data"""
-        
-        if self.demo_mode:
-            data = demo.get_latest_data()
-            status_info = {'badge': 'LIVE'}
-        else:
-            data = rtt.get_latest_data()
-            status_info = data.get("__STATUS__", {'badge': 'IDLE', 'reason': 'no data', 'ts': 0})
-        
-        # Check if serial thread died cleanly
-        if not self.demo_mode and self.is_receiving and not self.rx_thread.is_alive():
-             self.stop_reception()
-        
-        badge = status_info.get("badge", "IDLE" if not self.is_receiving and not self.demo_mode else "STALE")
-        style = f"background: {F1_MID_BG}; font-size: 16px; font-weight: bold; padding: 8px 15px; border-radius: 4px;"
-        
-        if badge == "LIVE" or self.demo_mode:
-            self.status_label.setText("LIVE" if not self.demo_mode else "DEMO")
-            self.status_label.setStyleSheet(style + f"color: {F1_ACCENT}; border: 2px solid {F1_ACCENT};")
-        elif badge == "STALE":
-            self.status_label.setText("STALE")
-            self.status_label.setStyleSheet(style + f"color: {F1_WARNING}; border: 2px solid {F1_WARNING};")
-        elif badge == "BAD":
-            self.status_label.setText("BAD")
-            self.status_label.setStyleSheet(style + f"color: {F1_ERROR}; border: 2px solid {F1_ERROR};")
-        else:
-             self.status_label.setText("IDLE")
-             self.status_label.setStyleSheet(style + f"color: {F1_TEXT}; border: 2px solid {F1_MID_BG};")
+    def _open_settings(self):
+        self._settings_dlg = SettingsDialog(self)
+        if self._settings_dlg.exec_():
+            new = self._settings_dlg.get_settings()
+            demo_changed = new["demo_mode"] != self.settings["demo_mode"]
+            self.settings.update(new)
+            current_settings.update(new)
+            rtt.DEFAULT_PORT = new["port"]
+            rtt.DEFAULT_BAUD = new["baud"]
+            if demo_changed:
+                self.demo_mode = new["demo_mode"]
+                self._log_append(f"Demo mode {'ENABLED' if self.demo_mode else 'DISABLED'}")
+            self._log_append(f"Settings: port={new['port']} baud={new['baud']} marple={new['use_influx']}")
 
-        if self.demo_mode:
-            data_600 = data.get(0x600, {})
-            data_610 = data.get(0x610, {})
-            data_620 = data.get(0x620, {})
-            data_630 = data.get(0x630, {})
-            data_201 = data.get(0x201, {})
-            data_202 = data.get(0x202, {})
-            data_208 = data.get(0x208, {})
-            
-            rpm = data_600.get('rpm', 0)
-            dc_bus = data_600.get('dcbusvoltage', 0)
-            torque = data_600.get('torquetotal', 0)
-            cell_min_v = data_600.get('cellminv', 0)
-            throttle = data_630.get('throttle', 0)
-            current = data_610.get('iactual', 0)
-            stack_mv = data_202.get('stacktotalmv', 0)
-            max_temp = data_208.get('maxtempc', 0)
-            brake = data_630.get('brake', 0)
-            s1_raw = data_620.get('s1raw', 0)
-            s2_raw = data_620.get('s2raw', 0)
-            motor_temp = data_610.get('motortemp', 0)
-            
-        else:
-            data_600 = data.get("0x600", {})
-            data_610 = data.get("0x610", {})
-            data_620 = data.get("0x620", {})
-            data_630 = data.get("0x630", {})
-            
-            rpm = data_600.get('rpm', 0)
-            dc_bus = data_600.get('dc_bus_voltage', 0)
-            torque = data_600.get('torque_total', 0)
-            cell_min_v = data_600.get('cell_min_v', 0)
-            throttle = data_630.get('throttle', 0)
-            current = data_610.get('i_actual', 0)
-            
-            ams_summary = data.get("ams_summary", {})
-            stack_mv = ams_summary.get('stack_mv', 0)
-            
-            ams_temp = data.get("ams_temp_summary", {})
-            max_temp = ams_temp.get('max_temp_c', 0)
-            
-            brake = data_630.get('brake', 0)
-            s1_raw = data_620.get('s1_raw', 0)
-            s2_raw = data_620.get('s2_raw', 0)
-            motor_temp = data_610.get('motor_temp', 0)
-        
-        self.lbl_dc_bus.value_label.setText(f"{dc_bus:.1f} V")
-        self.lbl_rpm.value_label.setText(f"{rpm:.0f}")
-        self.lbl_torque.value_label.setText(f"{torque:.1f} Nm")
-        self.lbl_min_cell.value_label.setText(f"{cell_min_v:.0f} mV")
-        self.lbl_throttle.value_label.setText(f"{throttle:.1f} %")
-        self.lbl_current.value_label.setText(f"{current:.1f} A")
-        self.lbl_stack.value_label.setText(f"{stack_mv / 1000:.1f} V")
-        self.lbl_max_temp.value_label.setText(f"{max_temp:.0f} °C")
-        
-        speed_kmh = rpm * 0.05
-        self.mini_speed.setText(f"{speed_kmh:.1f} km/h")
-        self.mini_voltage.setText(f"{dc_bus:.1f} V")
-        self.mini_temp.setText(f"{max_temp:.0f} °C")
-        
-        if self.demo_mode:
-            self.lbl_global_min.setText(f"Global Min: {data_202.get('mincellmv', 0):.0f} mV")
-            self.lbl_global_max.setText(f"Global Max: {data_202.get('maxcellmv', 0):.0f} mV")
-            self.lbl_stack_total.setText(f"Stack Total: {data_202.get('stacktotalmv', 0) / 1000:.1f} V")
-            self.lbl_ams_current.setText(f"Current: {data_201.get('currentdA', 0) / 10:.1f} A")
-        else:
-            self.lbl_global_min.setText(f"Global Min: {rtt.ams_global_min_mv} mV")
-            self.lbl_global_max.setText(f"Global Max: {rtt.ams_global_max_mv} mV")
-            self.lbl_stack_total.setText(f"Stack Total: {rtt.ams_stack_total_mv / 1000:.1f} V")
-            self.lbl_ams_current.setText(f"Current: {rtt.ams_current_dA / 10:.1f} A")
-        
-        now = time.time()
-        for i, card in enumerate(self.module_cards):
-            if self.demo_mode:
-                mod = demo.get_ams_module_data(i)
-                if mod:
-                    voltages = mod.get('voltages', [])
-                    temps = mod.get('tempsc', [])
-                    if voltages and temps:
-                        card.lbl_min_v.setText(f"Min: {min(voltages):.0f} mV")
-                        card.lbl_max_v.setText(f"Max: {max(voltages):.0f} mV")
-                        card.lbl_min_t.setText(f"Min T: {min(temps):.0f} °C")
-                        card.lbl_max_t.setText(f"Max T: {max(temps):.0f} °C")
-                        card.lbl_age.setText(f"Age: 0.0s")
-            else:
-                mod = rtt.get_ams_module_data(i)
-                if mod:
-                    card.lbl_min_v.setText(f"Min: {mod.min_cell_mv} mV")
-                    card.lbl_max_v.setText(f"Max: {mod.max_cell_mv} mV")
-                    card.lbl_min_t.setText(f"Min T: {mod.min_temp_c:.0f} °C")
-                    card.lbl_max_t.setText(f"Max T: {mod.max_temp_c:.0f} °C")
-                    age = now - mod.last_update_ts
-                    card.lbl_age.setText(f"Age: {age:.1f}s")
-        
-        self.motor_lbl_rpm.value_label.setText(f"{rpm:.0f}")
-        self.motor_lbl_torque.value_label.setText(f"{torque:.1f} Nm")
-        self.motor_lbl_current.value_label.setText(f"{current:.1f} A")
-        self.motor_lbl_temp.value_label.setText(f"{motor_temp:.0f} °C")
-        
-        self.driver_lbl_throttle.value_label.setText(f"{throttle:.1f} %")
-        self.driver_lbl_brake.value_label.setText(f"{brake:.1f} %")
-        self.driver_lbl_s1.value_label.setText(f"{s1_raw:.0f}")
-        self.driver_lbl_s2.value_label.setText(f"{s2_raw:.0f}")
-        
-        self.plot_rpm.update_plot(rpm)
-        self.plot_voltage.update_plot(cell_min_v)
-        self.plot_temp.update_plot(max_temp)
-        
-        self.motor_plot_torque.update_plot(torque)
-        self.motor_plot_current.update_plot(current)
-        
-        self.driver_plot_throttle.update_plot(throttle)
-        self.driver_plot_brake.update_plot(brake)
-        
-        self.accu_lbl_stack.value_label.setText(f"{stack_mv / 1000:.1f} V")
-        if self.demo_mode:
-            self.accu_lbl_current.value_label.setText(f"{data_201.get('currentdA', 0) / 10:.1f} A")
-            self.accu_lbl_min_cell.value_label.setText(f"{data_202.get('mincellmv', 0):.0f} mV")
-        else:
-            self.accu_lbl_current.value_label.setText(f"{rtt.ams_current_dA / 10:.1f} A")
-            self.accu_lbl_min_cell.value_label.setText(f"{rtt.ams_global_min_mv} mV")
-        self.accu_lbl_max_temp.value_label.setText(f"{max_temp:.0f} °C")
-        
-        for i, heatmap in enumerate(self.accu_heatmaps):
-            if self.demo_mode:
-                mod = demo.get_ams_module_data(i)
-                if mod:
-                    heatmap.update_heatmap(mod.get('tempsc', []))
-            else:
-                mod = rtt.get_ams_module_data(i)
-                if mod:
-                    heatmap.update_heatmap(mod.temps_c)
-        
-        if not self.demo_mode and rtt.new_data_flag == 1:
-            self.append_log(rtt.data_str)
-            rtt.new_data_flag = 0
-        # Dynamics GUI update
-        d_imu = data.get(0x700, {})
-        g_long = d_imu.get('g_long', 0.0)
-        g_lat = d_imu.get('g_lat', 0.0)
-        g_tot = d_imu.get('g_total', 0.0)
-        self.g_circle.set_g_force(g_long, g_lat)
-        self.g_long_label.setText(f"Longitudinal G: {g_long:+.2f}")
-        self.g_lat_label.setText(f"Lateral G: {g_lat:+.2f}")
-        self.g_total_label.setText(f"Total G: {g_tot:.2f}")
-        d_susp = data.get(0x710, {})
-        s_forces = d_susp.get('susp_forces', [0,0,0,0])
-        s_travel = d_susp.get('susp_travel', [0,0,0,0])
-        for i in range(4):
-            lbl, bar = self.s_susp_force[i]
-            lbl.setText(f"{['FL','FR','RL','RR'][i]} Force: {int(s_forces[i])}N")
-            bar.setValue(min(int(abs(s_forces[i])), 1000))
-            lbl2, bar2 = self.s_susp_travel[i]
-            lbl2.setText(f"{['FL','FR','RL','RR'][i]} Travel: {int(s_travel[i])}mm")
-            bar2.setValue(min(int(s_travel[i]), 100))
-        d_brake = data.get(0x720, {})
-        brake_temps = [
-            d_brake.get('brake_temp_fl', 0),
-            d_brake.get('brake_temp_fr', 0),
-            d_brake.get('brake_temp_rl', 0),
-            d_brake.get('brake_temp_rr', 0)
-        ]
-        for i, (disc, lbl) in enumerate(self.brake_temp_widgets):
-            disc.set_temp(brake_temps[i])
-            lbl.setText(f"{int(brake_temps[i])}°C")
+    def _open_sessions(self):
+        if self._session_viewer is None or not self._session_viewer.isVisible():
+            self._session_viewer = SessionViewerWindow()
+            self._session_viewer.show()
 
+    def _log_append(self, msg: str):
+        if self._log is None:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] {msg}")
+        doc = self._log.document()
+        while doc.blockCount() > 30:
+            cur = self._log.textCursor()
+            cur.movePosition(cur.Start)
+            cur.select(cur.BlockUnderCursor)
+            cur.removeSelectedText(); cur.deleteChar()
 
-                
-
-    def append_log(self, msg: str):
-        """Append message to log window"""
-        if self.log_text:
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.log_text.append(f"[{ts}] {msg}")
-            
-            doc = self.log_text.document()
-            max_blocks = 20
-            while doc.blockCount() > max_blocks:
-                cursor = self.log_text.textCursor()
-                cursor.movePosition(cursor.Start)
-                cursor.select(cursor.BlockUnderCursor)
-                cursor.removeSelectedText()
-                cursor.deleteChar()
-            
-    def open_log_viewer(self):
-        QMessageBox.information(self, "Log Viewer", "The system log and debug output are now consolidated at the bottom of the main window.")
-        
-    def open_session_viewer(self):
-        if self.session_viewer is None or not self.session_viewer.isVisible():
-            self.session_viewer = SessionViewerWindow()
-            self.session_viewer.show()
-    
-    def export_current_session(self):
-        QMessageBox.information(self, "Export", "Export feature coming soon!")
-    
-    def closeEvent(self, event):
+    def closeEvent(self, ev):
         if self.is_receiving:
-            self.stop_reception()
-            time.sleep(0.5)
-        if self.demo_mode:
-            demo.stop_demo()
-        event.accept()
-
-    
-
-# ============== SESSION VIEWER WINDOW ==============
-class SessionViewerWindow(QWidget):
-    """Window to view and analyze past Excel sessions"""
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Session Viewer")
-        self.setGeometry(150, 150, 1400, 800)
-        self.current_session_data = {}
-        
-        self.init_ui()
-        self.apply_f1_theme()
-        
-    def apply_f1_theme(self):
-         palette = QPalette()
-         palette.setColor(QPalette.Window, QColor(F1_DARK_BG))
-         palette.setColor(QPalette.WindowText, QColor(F1_TEXT))
-         self.setPalette(palette)
-         self.setStyleSheet(f"QWidget {{ background-color: {F1_DARK_BG}; color: {F1_TEXT}; }}")
-        
-    def init_ui(self):
-        layout = QHBoxLayout()
-        
-        left_panel = QWidget()
-        left_layout = QVBoxLayout()
-        
-        title = QLabel("Sessions")
-        title.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {F1_ACCENT}; padding: 8px;")
-        left_layout.addWidget(title)
-        
-        self.session_list = QListWidget()
-        self.session_list.setStyleSheet(f"background: {F1_MID_BG}; color: {F1_TEXT}; border: 1px solid {F1_ACCENT}; font-size: 10px;")
-        self.session_list.itemClicked.connect(self.load_session)
-        left_layout.addWidget(self.session_list)
-        
-        btn_refresh = QPushButton("Refresh")
-        btn_refresh.setStyleSheet(MainWindow.get_button_style(self, 'default'))
-        btn_refresh.clicked.connect(self.refresh_session_list)
-        left_layout.addWidget(btn_refresh)
-        
-        left_panel.setLayout(left_layout)
-        left_panel.setMaximumWidth(300)
-        
-        right_panel = QWidget()
-        right_layout = QVBoxLayout()
-        
-        self.session_info_label = QLabel("Select a session")
-        self.session_info_label.setStyleSheet(f"font-size: 12px; color: {F1_TEXT}; padding: 8px;")
-        right_layout.addWidget(self.session_info_label)
-        
-        self.data_tabs = QTabWidget()
-        self.data_tabs.setStyleSheet(f"""
-            QTabWidget::pane {{ border: 1px solid {F1_ACCENT}; background: {F1_DARK_BG}; }}
-            QTabBar::tab {{ background: {F1_MID_BG}; color: {F1_TEXT}; padding: 6px 12px; border: 1px solid {F1_ACCENT}; }}
-            QTabBar::tab:selected {{ background: {F1_ACCENT}; color: {F1_DARK_BG}; }}
-        """)
-        
-        right_layout.addWidget(self.data_tabs)
-        right_panel.setLayout(right_layout)
-        
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(1, 3)
-        
-        layout.addWidget(splitter)
-        self.setLayout(layout)
-        
-        self.refresh_session_list()
-    
-    def refresh_session_list(self):
-        self.session_list.clear()
-        sessions = rtt.list_excel_sessions()
-        
-        for session_file in sessions:
-            mod_time = datetime.fromtimestamp(session_file.stat().st_mtime)
-            display_text = f"{session_file.stem}\n  {mod_time.strftime('%Y-%m-%d %H:%M')}"
-            item = QtWidgets.QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, session_file)
-            self.session_list.addItem(item)
-    
-    def load_session(self, item):
-        session_file = item.data(Qt.UserRole)
-        
-        try:
-            self.session_info_label.setText(f"Loading: {session_file.name}...")
-            self.current_session_data = rtt.load_excel_session(session_file)
-            
-            if not self.current_session_data:
-                self.session_info_label.setText(f"Error loading")
-                return
-            
-            if 'Metadata' in self.current_session_data:
-                meta = self.current_session_data['Metadata']
-                if len(meta) > 0:
-                    info_text = f"{meta['Piloto'].iloc[0]} @ {meta['Circuito'].iloc[0]} ({meta['Duration (min)'].iloc[0]:.1f} min)"
-                    self.session_info_label.setText(info_text)
-            
-            self.data_tabs.clear()
-            
-            for sheet_name, df in self.current_session_data.items():
-                if sheet_name == 'Metadata':
-                    continue
-                tab = self.create_data_tab(sheet_name, df)
-                self.data_tabs.addTab(tab, sheet_name)
-        
-        except Exception as e:
-            self.session_info_label.setText(f"Error: {str(e)}")
-    
-    def create_data_tab(self, sheet_name, df):
-        widget = QWidget()
-        layout = QVBoxLayout()
-        
-        info = QLabel(f"{sheet_name}: {len(df)} records")
-        info.setStyleSheet(f"color: {F1_ACCENT}; font-size: 10px; padding: 3px;")
-        layout.addWidget(info)
-        
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            plot_layout = QGridLayout()
-            
-            numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col]) and col not in ['module_id']]
-            
-            if len(numeric_cols) >= 1:
-                canvas1 = self.create_timeseries_plot(df, numeric_cols[0], numeric_cols[0])
-                plot_layout.addWidget(canvas1, 0, 0)
-            
-            if len(numeric_cols) >= 2:
-                canvas2 = self.create_timeseries_plot(df, numeric_cols[1], numeric_cols[1])
-                plot_layout.addWidget(canvas2, 0, 1)
-
-            layout.addLayout(plot_layout)
-        
-        else:
-            text = QTextEdit()
-            text.setReadOnly(True)
-            text.setText(df.head(50).to_string())
-            text.setStyleSheet(f"background: {F1_DARK_BG}; color: {F1_TEXT}; font-family: monospace; font-size: 9px;")
-            layout.addWidget(text)
-        
-        widget.setLayout(layout)
-        return widget
-    
-    def create_timeseries_plot(self, df, column, title):
-        fig = Figure(figsize=(6, 3), facecolor=PLOT_BG)
-        ax = fig.add_subplot(111)
-        ax.set_facecolor(PLOT_BG)
-        ax.set_title(title, color=F1_TEXT, fontweight='bold', fontsize=10)
-        ax.tick_params(colors=F1_TEXT, labelsize=8)
-        
-        ax.plot(df['timestamp'], df[column], color=F1_ACCENT, linewidth=1.5)
-        ax.grid(True, alpha=0.3, color=F1_MID_BG)
-        ax.tick_params(axis='x', rotation=45)
-        for spine in ax.spines.values():
-            spine.set_color(F1_ACCENT)
-        fig.tight_layout()
-        
-        canvas = FigureCanvas(fig)
-        return canvas
-
-# ============== MATPLOTLIB CANVAS ==============
-class MplCanvas(FigureCanvas):
-    def __init__(self, title="Plot", max_points=100, color=F1_ACCENT):
-        figsize = (4, 2.2)
-        self.fig = Figure(figsize=figsize, facecolor=PLOT_BG)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor(PLOT_BG)
-        self.ax.set_title(title, color=F1_TEXT, fontweight='bold', fontsize=11)
-        self.ax.tick_params(colors=F1_TEXT, labelsize=9)
-        for spine in self.ax.spines.values():
-            spine.set_color(F1_ACCENT)
-        
-        super().__init__(self.fig)
-        
-        self.data = []
-        self.max_points = max_points
-        self.line, = self.ax.plot([], [], color=color, linewidth=1.5)
-        self.ax.grid(True, alpha=0.3, color=F1_MID_BG)
-        self.fig.tight_layout()
-    
-    def update_plot(self, value):
-        self.data.append(value)
-        if len(self.data) > self.max_points:
-            self.data.pop(0)
-        
-        self.line.set_data(range(len(self.data)), self.data)
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.draw()
-
-# ============== HEATMAP CANVAS ==============
-class HeatmapCanvas(FigureCanvas):
-    def __init__(self, title="Heatmap"):
-        self.fig = Figure(figsize=(3, 3), facecolor=PLOT_BG)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor(PLOT_BG)
-        self.ax.set_title(title, color=F1_TEXT, fontsize=10, fontweight='bold')
-        super().__init__(self.fig)
-        self.grid_data = np.zeros((7, 6)) 
-        self.im = self.ax.imshow(self.grid_data, cmap='viridis', vmin=20, vmax=60, aspect='auto')
-        
-        cbar = self.fig.colorbar(self.im, ax=self.ax)
-        cbar.set_label('°C', color=F1_TEXT)
-        cbar.ax.yaxis.set_tick_params(color=F1_TEXT)
-        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color=F1_TEXT)
-        
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.fig.tight_layout()
-    
-    def update_heatmap(self, temps):
-        temps_array = np.array(temps[:TEMPS_PER_MODULE])
-        temps_array = np.nan_to_num(temps_array, nan=20.0)
-        
-        target_size = 42
-        if len(temps_array) < target_size:
-             padded = np.pad(temps_array, (0, target_size - len(temps_array)), constant_values=20.0)
-        else:
-             padded = temps_array[:target_size]
-             
-        grid = padded.reshape((7, 6))
-        self.im.set_data(grid)
-        self.im.set_clim(vmin=max(20, grid[grid > 20].min() if grid[grid > 20].size > 0 else 20), 
-                         vmax=min(60, grid.max()))
-        self.draw()
-
-class GCircleWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.g_long = 0.0
-        self.g_lat = 0.0
-        self.setMinimumSize(160,160)
-        self.setMaximumSize(220,220)
-    def set_g_force(self, g_long, g_lat):
-        self.g_long = g_long
-        self.g_lat = g_lat
-        self.update()
-    def paintEvent(self, event):
-        qp = QPainter(self)
-        qp.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        radii = [1, 1.5, 2]
-        center = QtCore.QPointF(w/2,h/2)
-        scale = min(w, h) / 2.4
-        base_col = QColor(180,180,180)
-        accent_col = QColor(0,200,0)
-        qp.setPen(QtGui.QPen(base_col, 2))
-        for mult in radii:
-            qp.drawEllipse(center, scale*mult/2, scale*mult/2)
-        qp.drawEllipse(center, 5, 5)
-        qp.setPen(QtGui.QPen(accent_col, 5))
-        # Top
-        qp.drawLine(center, QtCore.QPointF(center.x(), center.y() - scale))
-        # Bottom
-        qp.drawLine(center, QtCore.QPointF(center.x(), center.y() + scale))
-        # Left
-        qp.drawLine(center, QtCore.QPointF(center.x() - scale, center.y()))
-        # Right
-        qp.drawLine(center, QtCore.QPointF(center.x() + scale, center.y()))
-        
-        point_x = center.x() + self.g_lat*scale
-        point_y = center.y() - self.g_long*scale
-        qp.setBrush(QtGui.QBrush(QColor(250,230,100)))
-        qp.setPen(QtGui.QPen(QColor(230,200,50), 7))
-        qp.drawEllipse(QtCore.QPointF(point_x, point_y), 12, 12)
-
-class BrakeDiscWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.temp = 40.0
-        self.setMinimumSize(36,36)
-        self.setMaximumSize(42,42)
-    def set_temp(self, temp):
-        self.temp = temp
-        self.update()
-    def paintEvent(self, event):
-        qp = QPainter(self)
-        qp.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        r = min(w,h)/2 - 3
-        center = QtCore.QPointF(w/2,h/2)
-        color = QtGui.QColor.fromHsvF(
-            min(0.15+max(self.temp-100,0)/700.0*0.9,1), 1.0, 1.0
-        )
-        qp.setPen(QtGui.QPen(QtGui.QColor(100,100,100), 2))
-        qp.setBrush(QtGui.QBrush(color))
-        qp.drawEllipse(center, r, r)
-        qp.setPen(QtGui.QPen(QtGui.QColor(20,20,20), 1))
-        for i in range(8):
-            angle = 2*math.pi*i/8
-            dx, dy = math.cos(angle)*r*0.6, math.sin(angle)*r*0.6
-            qp.drawEllipse(center+QtCore.QPointF(dx,dy), 2, 2)
+            self._stop(); time.sleep(0.3)
+        ev.accept()
 
 
-# ============== MAIN ==============
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    window = MainWindow()
-    window.show()
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 9))
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
