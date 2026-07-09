@@ -6,6 +6,7 @@ F1 / Grafana dark-mode visualization — Fragmented Snapshot Protocol
 
 from __future__ import annotations
 import sys
+import math
 import threading
 import time
 import logging
@@ -1106,11 +1107,12 @@ class PostRaceWindow(QWidget):
         v.addWidget(self._ams_status)
 
         btn_import = QPushButton("⬇  Import AMS Temperatures")
-        btn_import.setEnabled(False)
+        btn_import.setEnabled(True)
         btn_import.setStyleSheet(
-            f"QPushButton {{ background:#222; color:#444; border:1px solid #333; "
+            f"QPushButton {{ background:{F1_WARNING}; color:{F1_DARK_BG}; border:none; "
             f"border-radius:3px; padding:7px 14px; font-size:11px; font-weight:bold; }}"
-            f"QPushButton:enabled:hover {{ background:{F1_WARNING}; color:{F1_DARK_BG}; }}")
+            f"QPushButton:hover {{ background:#fbbf24; }}"
+            f"QPushButton:disabled {{ background:#5e3a00; color:#555; }}")
         btn_import.clicked.connect(self._import_ams)
         v.addWidget(btn_import)
 
@@ -1172,7 +1174,10 @@ class PostRaceWindow(QWidget):
             self._ams_file_path = Path(path)
             self._ams_file_lbl.setText(self._ams_file_path.name)
             self._ams_file_lbl.setStyleSheet(
-                "color:#555; font-size:9px; font-family:'Courier New';")
+                f"color:{F1_WARNING}; font-size:9px; font-family:'Courier New';")
+            self._ams_status.setText("File selected — click Import to merge.")
+            self._ams_status.setStyleSheet(
+                f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
 
     # ── Import handlers ───────────────────────────────────────────────────────
     def _import_gps(self):
@@ -1217,13 +1222,64 @@ class PostRaceWindow(QWidget):
             QMessageBox.warning(self, "No AMS file", "Please browse to an AMS log file first.")
             return
 
+        self._log_append(f"[AMS] Merging {self._ams_file_path.name} → {self._session_path.name}")
+        self._ams_status.setText("Merging… please wait.")
+        self._ams_status.setStyleSheet(
+            f"color:{F1_WARNING}; font-size:9px; font-family:'Courier New';")
+        QApplication.processEvents()
+
         ok, msg = rtt.merge_ams_temps_into_session(self._session_path, self._ams_file_path)
-        self._ams_status.setText(f"{'✓' if ok else '✗'}  {msg}")
-        self._log_append(f"[AMS] {'✓' if ok else '✗'} {msg}")
+
+        if ok:
+            self._ams_status.setText(f"✓  {msg}")
+            self._ams_status.setStyleSheet(
+                f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
+            self._log_append(f"[AMS] ✓ {msg}")
+            self._on_session_changed(self._session_combo.currentIndex())
+        else:
+            self._ams_status.setText(f"✗  {msg}")
+            self._ams_status.setStyleSheet(
+                f"color:{F1_ERROR}; font-size:9px; font-family:'Courier New';")
+            self._log_append(f"[AMS] ✗ {msg}")
 
     def _log_append(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self._log.append(f"[{ts}] {msg}")
+
+    def closeEvent(self, event):
+        # Automatically integrate selected files when closing the post-race window
+        if self._session_path:
+            merged_any = False
+            gps_msg = ""
+            ams_msg = ""
+            
+            if self._gps_file_path:
+                utc_off = self._UTC_OFFSETS[self._utc_offset_combo.currentIndex()][1]
+                ok, msg = rtt.merge_gps_into_session(
+                    self._session_path, self._gps_file_path, utc_offset_hours=utc_off)
+                if ok:
+                    merged_any = True
+                    gps_msg = f"GPS: {msg}\n"
+                    self._log_append(f"[AUTO-MERGE] GPS integrated: {msg}")
+                else:
+                    self._log_append(f"[AUTO-MERGE] GPS failed: {msg}")
+            
+            if self._ams_file_path:
+                ok, msg = rtt.merge_ams_temps_into_session(
+                    self._session_path, self._ams_file_path)
+                if ok:
+                    merged_any = True
+                    ams_msg = f"AMS: {msg}\n"
+                    self._log_append(f"[AUTO-MERGE] AMS integrated: {msg}")
+                else:
+                    self._log_append(f"[AUTO-MERGE] AMS failed: {msg}")
+                    
+            if merged_any:
+                QMessageBox.information(
+                    self, "Post-Race Integration Complete",
+                    f"Selected files have been integrated into: {self._session_path.name}\n\n"
+                    f"{gps_msg}{ams_msg}")
+        event.accept()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1820,8 +1876,13 @@ class MainWindow(QMainWindow):
         self._dyn_t11.set_value(str(s.get('t11_8_9', 0)))
         self._dyn_state.set_value(str(s.get('state', 0)))
 
-        # IMU — placeholder until IMU data lands in snapshot
-        self._g_circle.set_g_force(0.0, 0.0)
+        # IMU updates
+        ax = s.get('imu_ax_g', 0.0)
+        ay = s.get('imu_ay_g', 0.0)
+        self._g_circle.set_g_force(ax, ay)
+        self._g_long.setText(f"Long G:   {ax:+.2f}")
+        self._g_lat.setText(f"Lat  G:   {ay:+.2f}")
+        self._g_tot.setText(f"Total G:  {math.sqrt(ax**2 + ay**2):.2f}")
 
     def _update_customize(self, s: dict):
         for panel in self._drop_panels:

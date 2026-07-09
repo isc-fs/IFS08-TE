@@ -166,6 +166,10 @@ class SerialCSVLogger:
         "inv_dc_bus_V",
         "inv_temp_motor1", "inv_temp_pwrstg", "inv_temp_board",
         "inv_rpm", "inv_speed_actual", "inv_current_actual",
+        # ── IMU (simulated or parsed from bytes 82-101 of snapshot) ──────────
+        "imu_ax_g", "imu_ay_g", "imu_az_g",
+        "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
+        "imu_roll_deg", "imu_pitch_deg",
     ]
 
     def __init__(self, bucket_id: str, piloto: str, circuito: str, flush_every: int = 50):
@@ -213,6 +217,10 @@ class SerialCSVLogger:
             s.get('inv_temp_motor1',       0), s.get('inv_temp_pwrstg',   0),
             s.get('inv_temp_board',        0), s.get('inv_rpm',           0),
             s.get('inv_speed_actual',      0), s.get('inv_current_actual', 0),
+            # IMU columns
+            s.get('imu_ax_g',            0.0), s.get('imu_ay_g',         0.0), s.get('imu_az_g',            0.0),
+            s.get('imu_gx_dps',          0.0), s.get('imu_gy_dps',       0.0), s.get('imu_gz_dps',          0.0),
+            s.get('imu_roll_deg',        0.0), s.get('imu_pitch_deg',    0.0),
         ]
 
         self.writer.writerow(row)
@@ -433,11 +441,29 @@ def _decode_snapshot(data: bytes) -> dict:
     temp_dcdc       = arr[12]
     temp_max_modulo = list(arr[13:18])
 
-    # ── Tail: bytes 59..81 ───────────────────────────────────────────────────
+     # ── Tail: bytes 59..81 ───────────────────────────────────────────────────
     (inv_state, last_vconfig_tick, inv_error,
      inv_dc_bus_V,
      inv_temp_motor1, inv_temp_pwrstg, inv_temp_board,
      inv_rpm, inv_speed_actual, inv_current_actual) = _SNAP_FMT_TAIL.unpack_from(data, 59)
+
+    # ── IMU: bytes 82..97 (8 signed int16 values) ────────────────────────────
+    if len(data) >= 98:
+        (imu_ax, imu_ay, imu_az,
+         imu_gx, imu_gy, imu_gz,
+         imu_roll, imu_pitch) = struct.unpack_from('<8h', data, 82)
+    else:
+        (imu_ax, imu_ay, imu_az, imu_gx, imu_gy, imu_gz, imu_roll, imu_pitch) = (0,0,0,0,0,0,0,0)
+
+    # scale raw values
+    imu_ax_g      = imu_ax / 1000.0
+    imu_ay_g      = imu_ay / 1000.0
+    imu_az_g      = imu_az / 1000.0
+    imu_gx_dps    = imu_gx / 10.0
+    imu_gy_dps    = imu_gy / 10.0
+    imu_gz_dps    = imu_gz / 10.0
+    imu_roll_deg  = imu_roll / 100.0
+    imu_pitch_deg = imu_pitch / 100.0
 
     return {
         'tick_ms':            tick_ms,
@@ -470,6 +496,14 @@ def _decode_snapshot(data: bytes) -> dict:
         'inv_rpm':            inv_rpm,
         'inv_speed_actual':   inv_speed_actual,
         'inv_current_actual': inv_current_actual,
+        'imu_ax_g':           imu_ax_g,
+        'imu_ay_g':           imu_ay_g,
+        'imu_az_g':           imu_az_g,
+        'imu_gx_dps':         imu_gx_dps,
+        'imu_gy_dps':         imu_gy_dps,
+        'imu_gz_dps':         imu_gz_dps,
+        'imu_roll_deg':       imu_roll_deg,
+        'imu_pitch_deg':      imu_pitch_deg,
     }
 
 
@@ -758,21 +792,103 @@ def merge_ams_temps_into_session(
     ams_file_path: Path,
 ) -> Tuple[bool, str]:
     """
-    Inject per-cell AMS temperature data (19 cells × 5 modules) from a
-    micro-SD log file into the existing session CSV.
-
-    ┌─────────────────────────────────────────────────────────────┐
-    │  NOT YET IMPLEMENTED — AMS SD-card log format is TBD.       │
-    │  Expected columns once implemented: AMS_TEMP_COLS           │
-    │  (ams_t_mod{m}_cell{c}, m=0..4, c=0..18)                   │
-    └─────────────────────────────────────────────────────────────┘
+    Inject per-cell AMS temperature data (19 cells × 5 modules = 95 values)
+    from a micro-SD log file into the existing session CSV.
+    Searches for the optimal tick_ms offset to align the two streams.
     """
-    return False, (
-        "AMS temperature import is not yet implemented.\n"
-        "The on-car SD-card log format for per-cell temperatures is still TBD.\n"
-        f"When ready, {len(AMS_TEMP_COLS)} columns will be added: "
-        f"ams_t_mod0_cell0 … ams_t_mod4_cell18."
-    )
+    try:
+        if not session_path.exists():
+            return False, f"Session CSV not found: {session_path}"
+        if not ams_file_path.exists():
+            return False, f"AMS log file not found: {ams_file_path}"
+
+        session_df = pd.read_csv(session_path)
+        ams_df = pd.read_csv(ams_file_path)
+
+        if 'tick_ms' not in session_df.columns:
+            return False, "Session CSV missing 'tick_ms' column."
+        if 'tick_ms' not in ams_df.columns:
+            return False, "AMS SD-card log missing 'tick_ms' column."
+
+        s_ticks = session_df['tick_ms'].values
+        a_ticks = ams_df['tick_ms'].values
+
+        s_val = None
+        a_val = None
+
+        # Check for accumulator current or min cell voltage to use as alignment signal
+        if 'corriente_accu' in session_df.columns and 'I_filt_mA' in ams_df.columns:
+            s_val = session_df['corriente_accu'].values * 100.0  # dA to mA
+            a_val = ams_df['I_filt_mA'].values
+        elif 'v_cell_min_mV' in session_df.columns and 'vmin_mV' in ams_df.columns:
+            s_val = session_df['v_cell_min_mV'].values
+            a_val = ams_df['vmin_mV'].values
+
+        best_offset = 0
+        if s_val is not None and a_val is not None and len(s_val) > 0 and len(a_val) > 0:
+            min_mae = float('inf')
+            offsets = np.arange(-60000, 60000, 100)
+            for offset in offsets:
+                shifted_ticks = s_ticks + offset
+                interp_val = np.interp(shifted_ticks, a_ticks, a_val, left=a_val[0], right=a_val[-1])
+                mae = np.mean(np.abs(s_val - interp_val))
+                if mae < min_mae:
+                    min_mae = mae
+                    best_offset = offset
+            logger.info(f"[POST-RACE] Found best tick_ms offset: {best_offset} ms (MAE={min_mae:.2f})")
+        else:
+            logger.info("[POST-RACE] Common signal not found or empty. Assuming offset = 0.")
+
+        # Shift ams_df tick_ms by best_offset to align with session_df
+        ams_df['_aligned_tick'] = ams_df['tick_ms'] - best_offset
+
+        # Drop any previously injected AMS temperature columns to avoid duplicates
+        for col in AMS_TEMP_COLS:
+            if col in session_df.columns:
+                session_df.drop(columns=[col], inplace=True)
+
+        # Prepare ams_df columns to merge (map t{m}_{c} to ams_t_mod{m}_cell{c})
+        cols_to_merge = ['_aligned_tick']
+        rename_map = {}
+        for m in range(NUM_MODULES):
+            for c in range(CELLS_PER_MODULE):
+                src_col = f't{m}_{c}'
+                dest_col = f'ams_t_mod{m}_cell{c}'
+                if src_col in ams_df.columns:
+                    cols_to_merge.append(src_col)
+                    rename_map[src_col] = dest_col
+
+        ams_subset = ams_df[cols_to_merge].rename(columns=rename_map)
+        ams_subset.sort_values('_aligned_tick', inplace=True)
+
+        # Sort session_df by tick_ms for merge_asof
+        orig_order = session_df.index.copy()
+        session_df.sort_values('tick_ms', inplace=True)
+
+        # Nearest-neighbour join based on tick_ms (tolerance of 5 seconds = 5000 ms)
+        merged = pd.merge_asof(
+            session_df,
+            ams_subset,
+            left_on='tick_ms',
+            right_on='_aligned_tick',
+            direction='nearest',
+            tolerance=5000,
+        )
+
+        merged.drop(columns=['_aligned_tick'], inplace=True, errors='ignore')
+        # Restore original order
+        merged = merged.loc[orig_order.values]
+        merged.to_csv(session_path, index=False)
+
+        matched = int(merged[AMS_TEMP_COLS[0]].notna().sum()) if AMS_TEMP_COLS[0] in merged.columns else 0
+        return True, (
+            f"AMS Temps merged — Offset: {best_offset} ms. "
+            f"{matched}/{len(merged)} session rows matched (≤5 s)."
+        )
+
+    except Exception as exc:
+        logger.exception("[POST-RACE] AMS merge error")
+        return False, f"Error: {exc}"
 
 
 # ================== MAIN RECEIVE LOOP ==================

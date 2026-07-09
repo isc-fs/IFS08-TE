@@ -214,7 +214,7 @@ LOG_DIR.mkdir(exist_ok=True)
 class DemoCSVLogger:
     """
     Column layout exactly matches SerialCSVLogger.HEADERS (ISC_RTT_serial.py)
-    with GPS_MERGE_COLS appended so that post-race and demo sessions share
+    with GPS_MERGE_COLS and IMU fields appended so that post-race and demo sessions share
     one unified schema usable by Marple Data.
     """
     HEADERS = [
@@ -242,6 +242,10 @@ class DemoCSVLogger:
         # ── GPS (simulated — same columns added by merge_gps_into_session) ────
         "gps_lat_deg", "gps_lon_deg", "gps_sog_knots",
         "gps_cog_deg", "gps_sats", "gps_fix",
+        # ── IMU (simulated) ───────────────────────────────────────────────────
+        "imu_ax_g", "imu_ay_g", "imu_az_g",
+        "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
+        "imu_roll_deg", "imu_pitch_deg",
     ]
 
     def __init__(self, piloto: str, circuito: str):
@@ -254,6 +258,27 @@ class DemoCSVLogger:
         self.count    = 0
         self.writer.writerow(self.HEADERS)
         print(f"[DEMO] CSV: {self.filename}")
+
+        # Companion AMS SD log file (to test post-race merge flow)
+        self.ams_filename = LOG_DIR / f"ISC_DEMO_{ts}_{piloto}_{circuito}_AMS_SD.csv"
+        self.ams_file     = open(self.ams_filename, "w", newline="")
+        self.ams_writer   = csv.writer(self.ams_file)
+        
+        # Build AMS headers matching bench-microsd branch
+        self.ams_headers = [
+            "tick_ms", "fsm", "mode", "ams_ok", "fault", "detail", "tsms", "dash_chg", "mod_mask",
+            "pack_mV", "I_raw_mA", "I_filt_mA", "Idcdc_mA", "dcbus_V", "vmin_mV", "vmax_mV",
+            "tmin_C", "tmax_C", "tavg_C"
+        ]
+        for m in range(5):
+            for c in range(19):
+                self.ams_headers.append(f"c{m}_{c}")
+        for m in range(5):
+            for t in range(40):
+                self.ams_headers.append(f"t{m}_{t}")
+                
+        self.ams_writer.writerow(self.ams_headers)
+        print(f"[DEMO] AMS SD CSV: {self.ams_filename}")
 
     def log(self, snap: dict, elapsed: float, gps: dict) -> None:
         ts   = datetime.now().isoformat()
@@ -287,16 +312,73 @@ class DemoCSVLogger:
             f"{gps.get('cog',  0.0):.1f}",
             gps.get("sats",  8),
             gps.get("fix",   1),
+            # IMU columns
+            snap.get('imu_ax_g',       0.0),
+            snap.get('imu_ay_g',       0.0),
+            snap.get('imu_az_g',       0.0),
+            snap.get('imu_gx_dps',     0.0),
+            snap.get('imu_gy_dps',     0.0),
+            snap.get('imu_gz_dps',     0.0),
+            snap.get('imu_roll_deg',   0.0),
+            snap.get('imu_pitch_deg',  0.0),
         ]
         self.writer.writerow(row)
         self.count += 1
+
+        # Log to AMS SD file
+        tick = snap.get("tick_ms", 0)
+        fsm = snap.get("ams_fsm_state", 0)
+        mode = 1 # Car mode
+        ams_ok = 1
+        fault = 0
+        detail = 0
+        tsms = 1
+        dash_chg = 0
+        mod_mask = 31 # binary 11111 (all online)
+        pack_mv = int(snap.get("inv_dc_bus_V", 0) * 1000)
+        current_ma = int(snap.get("corriente_accu", 0) * 100) # dA to mA
+        dcdc_ma = int(snap.get("corriente_dcdc", 0) * 100)
+        dcbus_v = snap.get("inv_dc_bus_V", 0)
+        
+        vmin_mv = min(vmin) if vmin else 0
+        vmax_mv = max(vmax) if vmax else 0
+        tmin_c = min(tmax) if tmax else 0
+        tmax_c = max(tmax) if tmax else 0
+        tavg_c = int(sum(tmax) / len(tmax)) if tmax else 0
+        
+        ams_row = [
+            tick, fsm, mode, ams_ok, fault, detail, tsms, dash_chg, mod_mask,
+            pack_mv, current_ma, current_ma, dcdc_ma, dcbus_v, vmin_mv, vmax_mv,
+            tmin_c, tmax_c, tavg_c
+        ]
+        
+        # Generate cell voltages c{m}_{c} with slight cell-to-cell spread (±2mV)
+        for m in range(5):
+            base_v = vmin[m] if m < len(vmin) else 3800
+            for c in range(19):
+                spread = (c % 5) - 2 # -2 to +2 mV
+                ams_row.append(base_v + spread)
+        
+        # Generate cell temperatures t{m}_{t} (40 thermistors per module)
+        for m in range(5):
+            base_t = tmax[m] if m < len(tmax) else 25
+            for t in range(40):
+                spread = (t % 3) - 1 # -1 to +1 °C
+                ams_row.append(base_t + spread)
+                
+        self.ams_writer.writerow(ams_row)
+
         if self.count % 50 == 0:
             self.file.flush()
+            self.ams_file.flush()
 
     def close(self) -> Optional[str]:
         if self.file:
             self.file.close()
-            print(f"[DEMO] CSV closed — {self.count} rows → {self.filename}")
+            print(f"[DEMO] CSV closed - {self.count} rows -> {self.filename}")
+        if self.ams_file:
+            self.ams_file.close()
+            print(f"[DEMO] AMS SD CSV closed -> {self.ams_filename}")
             return str(self.filename)
         return None
 
@@ -366,6 +448,16 @@ class DemoDataGenerator:
         self.inv_state  = 0
         self.inv_error  = 0
 
+        # ── IMU state ─────────────────────────────────────────────────────
+        self.imu_ax_g = 0.0
+        self.imu_ay_g = 0.0
+        self.imu_az_g = 1.0
+        self.imu_gx_dps = 0.0
+        self.imu_gy_dps = 0.0
+        self.imu_gz_dps = 0.0
+        self.imu_roll_deg = 0.0
+        self.imu_pitch_deg = 0.0
+
     # ── Public API ─────────────────────────────────────────────────────────
     def start(self, use_marple: bool = False,
               piloto: str = "Demo", circuito: str = "Track") -> None:
@@ -389,8 +481,19 @@ class DemoDataGenerator:
             self.thread.join(timeout=2.0)
         if self.logger:
             fp = self.logger.close()
+            # Automatically merge the simulated AMS temperature data into the session CSV!
+            ams_fp = self.logger.ams_filename
+            if ams_fp.exists():
+                print("[DEMO] Automatically merging simulated AMS cell temperatures...")
+                rtt.merge_ams_temps_into_session(Path(fp), ams_fp)
+                try:
+                    ams_fp.unlink()
+                    print("[DEMO] Companion AMS SD CSV deleted.")
+                except Exception as e:
+                    print(f"[DEMO] Error deleting companion file: {e}")
+
             if self.use_marple and fp and _MARPLE_OK:
-                print("[DEMO] Uploading to Marple…")
+                print("[DEMO] Uploading to Marple...")
                 isc_marple.upload_session_csv(fp, {
                     "piloto":   self.logger.piloto,
                     "circuito": self.logger.circuito,
@@ -422,6 +525,14 @@ class DemoDataGenerator:
             for f in MOD_AGING
         ]
         self.vmax_mod = list(self.vmin_mod)
+        self.imu_ax_g = 0.0
+        self.imu_ay_g = 0.0
+        self.imu_az_g = 1.0
+        self.imu_gx_dps = 0.0
+        self.imu_gy_dps = 0.0
+        self.imu_gz_dps = 0.0
+        self.imu_roll_deg = 0.0
+        self.imu_pitch_deg = 0.0
 
     # ── Main physics loop ───────────────────────────────────────────────────
     def _loop(self) -> None:
@@ -586,6 +697,27 @@ class DemoDataGenerator:
                 "fix":  1,
             }
 
+            # 8b. IMU SIMULATION ──────────────────────────────────────────────
+            noise_g = lambda: random.gauss(0, 0.015)
+            self.imu_ax_g = self.g_long + noise_g()
+            self.imu_ay_g = self.g_lat + noise_g()
+            self.imu_az_g = 1.0 + noise_g()
+            
+            target_roll = -self.g_lat * 4.0
+            target_pitch = self.g_long * 2.5
+            self.imu_roll_deg += 0.25 * (target_roll - self.imu_roll_deg)
+            self.imu_pitch_deg += 0.25 * (target_pitch - self.imu_pitch_deg)
+            
+            self.imu_gx_dps = (target_roll - self.imu_roll_deg) / self.DT + random.gauss(0, 0.3)
+            self.imu_gy_dps = (target_pitch - self.imu_pitch_deg) / self.DT + random.gauss(0, 0.3)
+            
+            if radius > 0 and self.v > 0.5:
+                sign = 1 if int(self.dist / 60) % 2 == 0 else -1
+                yaw_rate_rads = self.v / radius
+                self.imu_gz_dps = sign * (yaw_rate_rads * 180.0 / math.pi) + random.gauss(0, 0.3)
+            else:
+                self.imu_gz_dps *= 0.80
+
             # 9. BUILD & PUBLISH SNAPSHOT ────────────────────────────────────
             snap = self._build_snapshot(motor_rpm)
             self._publish(snap, gps_dict)
@@ -713,6 +845,15 @@ class DemoDataGenerator:
             "inv_rpm":            int(motor_rpm),
             "inv_speed_actual":   int(self.v * 3.6),   # km/h
             "inv_current_actual": int(self.motor_I),
+            # Simulated IMU values in snapshot
+            "imu_ax_g":           self.imu_ax_g,
+            "imu_ay_g":           self.imu_ay_g,
+            "imu_az_g":           self.imu_az_g,
+            "imu_gx_dps":         self.imu_gx_dps,
+            "imu_gy_dps":         self.imu_gy_dps,
+            "imu_gz_dps":         self.imu_gz_dps,
+            "imu_roll_deg":       self.imu_roll_deg,
+            "imu_pitch_deg":      self.imu_pitch_deg,
         }
 
     # ── Publish snapshot into rtt module (same path as real radio data) ──────
