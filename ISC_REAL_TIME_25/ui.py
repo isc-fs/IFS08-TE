@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import logging
+import subprocess
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -169,6 +170,9 @@ current_settings: dict = {
     "use_influx": False,
     "debug":      rtt.DEBUG_ENABLE_DEFAULT,
     "demo_mode":  False,
+    "alert_temp_c":  ALERT_TEMP_C,
+    "alert_volt_v":  ALERT_VOLT_V,
+    "alert_cell_mv": ALERT_CELL_MV,
 }
 
 
@@ -750,7 +754,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ISCmetrics — Ajustes")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setGeometry(200, 200, 440, 300)
+        self.setGeometry(200, 200, 440, 360)
         self._p = parent
         self.setStyleSheet(f"QDialog {{ background:{F1_DARK_BG}; color:{F1_TEXT}; }}")
         self._build()
@@ -767,7 +771,7 @@ class SettingsDialog(QDialog):
         self._refresh_ports(); g.addWidget(self.combo_port, 0, 1)
 
         g.addWidget(self._lbl("Baud Rate:", ls), 1, 0)
-        self.input_baud = QLineEdit(str(rtt.DEFAULT_BAUD)); self.input_baud.setStyleSheet(ins)
+        self.input_baud = QLineEdit(str(self._p.settings.get("baud", rtt.DEFAULT_BAUD))); self.input_baud.setStyleSheet(ins)
         g.addWidget(self.input_baud, 1, 1)
 
         self.chk_marple = QCheckBox("Upload to Marple Data (cloud)")
@@ -785,10 +789,26 @@ class SettingsDialog(QDialog):
         self.chk_demo.setChecked(self._p.settings.get("demo_mode", False))
         g.addWidget(self.chk_demo, 4, 0, 1, 2)
 
+        # Alert thresholds
+        g.addWidget(self._lbl("Alert Max Temp (°C):", ls), 5, 0)
+        self.input_alert_temp = QLineEdit(str(self._p.settings.get("alert_temp_c", 40.0)))
+        self.input_alert_temp.setStyleSheet(ins)
+        g.addWidget(self.input_alert_temp, 5, 1)
+
+        g.addWidget(self._lbl("Alert Min DC Bus (V):", ls), 6, 0)
+        self.input_alert_volt = QLineEdit(str(self._p.settings.get("alert_volt_v", 380.0)))
+        self.input_alert_volt.setStyleSheet(ins)
+        g.addWidget(self.input_alert_volt, 6, 1)
+
+        g.addWidget(self._lbl("Alert Min Cell (mV):", ls), 7, 0)
+        self.input_alert_cell = QLineEdit(str(self._p.settings.get("alert_cell_mv", 3400.0)))
+        self.input_alert_cell.setStyleSheet(ins)
+        g.addWidget(self.input_alert_cell, 7, 1)
+
         btn = QPushButton("Apply & Close")
         btn.setStyleSheet(self._p.get_button_style('accent'))
         btn.clicked.connect(self.accept)
-        g.addWidget(btn, 5, 0, 1, 2)
+        g.addWidget(btn, 8, 0, 1, 2)
 
     @staticmethod
     def _lbl(t, s):
@@ -805,12 +825,21 @@ class SettingsDialog(QDialog):
     def get_settings(self) -> dict:
         try:    baud = int(self.input_baud.text())
         except: baud = self._p.settings["baud"]
+        try:    temp_c = float(self.input_alert_temp.text())
+        except: temp_c = self._p.settings.get("alert_temp_c", 40.0)
+        try:    volt_v = float(self.input_alert_volt.text())
+        except: volt_v = self._p.settings.get("alert_volt_v", 380.0)
+        try:    cell_mv = float(self.input_alert_cell.text())
+        except: cell_mv = self._p.settings.get("alert_cell_mv", 3400.0)
         return {
             "port":       self.combo_port.currentData(),
             "baud":       baud,
             "use_influx": self.chk_marple.isChecked(),
             "debug":      self.chk_debug.isChecked(),
             "demo_mode":  self.chk_demo.isChecked(),
+            "alert_temp_c":  temp_c,
+            "alert_volt_v":  volt_v,
+            "alert_cell_mv": cell_mv,
         }
 
 
@@ -1292,6 +1321,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(40, 40, 1600, 960)
 
         self.settings     = current_settings.copy()
+        self._load_settings_from_file()
         self.demo_mode    = self.settings["demo_mode"]
         self.is_receiving = False
         self.rx_thread: Optional[threading.Thread] = None
@@ -1305,6 +1335,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_theme()
+        self._update_widget_thresholds()
 
         self._timer = QTimer()
         self._timer.timeout.connect(self._update)
@@ -1553,12 +1584,13 @@ class MainWindow(QMainWindow):
         self._ind_ams       = QLabel("● AMS")
         self._lbl_seq       = QLabel("SEQ: —")
         self._lbl_tick      = QLabel("TICK: —")
+        self._lbl_lqi       = QLabel("LQI: —")
         for l in (self._ind_precharge, self._ind_inv_ok, self._ind_ams):
             l.setStyleSheet("color:#333; font-size:10px; font-weight:bold;")
-        for l in (self._lbl_seq, self._lbl_tick):
+        for l in (self._lbl_seq, self._lbl_tick, self._lbl_lqi):
             l.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
         for w2 in (self._ind_precharge, self._ind_inv_ok, self._ind_ams,
-                   self._lbl_seq, self._lbl_tick):
+                   self._lbl_seq, self._lbl_tick, self._lbl_lqi):
             ir.addWidget(w2)
         ir.addStretch()
         v.addLayout(ir, stretch=1)
@@ -1637,21 +1669,24 @@ class MainWindow(QMainWindow):
         # ── Bottom section: per-module bars ────────────────────────────────────
         bot = QHBoxLayout(); bot.setSpacing(8)
 
-        vbox_v = QGroupBox(f"PER-MODULE CELL VOLTAGE  [mV]   (min to max)   —   ALERT < {ALERT_CELL_MV} mV")
-        vbv = QVBoxLayout(vbox_v)
+        alert_temp = self.settings.get("alert_temp_c", 40.0)
+        alert_cell = self.settings.get("alert_cell_mv", 3400.0)
+
+        self._vbox_v = QGroupBox(f"PER-MODULE CELL VOLTAGE  [mV]   (min to max)   —   ALERT < {alert_cell:.0f} mV")
+        vbv = QVBoxLayout(self._vbox_v)
         self._mod_v_bars: List[ModuleBarWidget] = []
         for i in range(5):
-            b = ModuleBarWidget(i, "mV", lo=2800, hi=4250, warn_lo=ALERT_CELL_MV)
+            b = ModuleBarWidget(i, "mV", lo=2800, hi=4250, warn_lo=alert_cell)
             vbv.addWidget(b); self._mod_v_bars.append(b)
-        bot.addWidget(vbox_v, stretch=1)
+        bot.addWidget(self._vbox_v, stretch=1)
 
-        vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {ALERT_TEMP_C:.0f} degC")
-        vbt = QVBoxLayout(vbox_t)
+        self._vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {alert_temp:.0f} degC")
+        vbt = QVBoxLayout(self._vbox_t)
         self._mod_t_bars: List[ModuleBarWidget] = []
         for i in range(5):
-            b = ModuleBarWidget(i, "degC", lo=0, hi=80, warn_hi=ALERT_TEMP_C)
+            b = ModuleBarWidget(i, "degC", lo=0, hi=80, warn_hi=alert_temp)
             vbt.addWidget(b); self._mod_t_bars.append(b)
-        bot.addWidget(vbox_t, stretch=1)
+        bot.addWidget(self._vbox_t, stretch=1)
         v.addLayout(bot, stretch=3)
         return w
 
@@ -1723,20 +1758,44 @@ class MainWindow(QMainWindow):
     # ── Alert checking ────────────────────────────────────────────────────────
     def _check_alerts(self, s: dict) -> None:
         alerts = []
+
+        # Check receiver hardware/signal status from serial module
+        rx_status = rtt.get_latest_data().get("__RECEIVER_STATUS__", {})
+        hw_st = rx_status.get("hw_status", "OK")
+        if hw_st == "NO_RADIO_HW":
+            alerts.append(("RECEIVER HARDWARE FAULT: nRF24L01 module disconnected!", 'critical'))
+        elif hw_st == "NO_SIGNAL":
+            alerts.append(("RADIO SIGNAL LOST: No packets received from car!", 'warning'))
+
+        # Check USB serial connection state (reconectando)
+        st = rtt.get_latest_data().get("__STATUS__", {})
+        badge = st.get("badge", "IDLE")
+        reason = st.get("reason", "")
+        if badge == "STALE" and reason == "reconectando...":
+            alerts.append(("USB DISCONNECTED: Searching for RF-Nano receiver...", 'critical'))
+
+        alert_temp = self.settings.get("alert_temp_c", 40.0)
+        alert_volt = self.settings.get("alert_volt_v", 380.0)
+        alert_cell = self.settings.get("alert_cell_mv", 3400.0)
+
         tmax = s.get('temp_max_modulo', [])
         valid_t = [t for t in tmax if t != 0]
-        if valid_t and max(valid_t) > ALERT_TEMP_C:
-            alerts.append((f"BATTERY TEMP {max(valid_t):.0f} degC > {ALERT_TEMP_C:.0f} degC", 'critical'))
+        if valid_t and max(valid_t) > alert_temp:
+            alerts.append((f"BATTERY TEMP {max(valid_t):.0f} degC > {alert_temp:.0f} degC", 'critical'))
         vbus = s.get('inv_dc_bus_V', 0)
-        if 0 < vbus < ALERT_VOLT_V:
-            alerts.append((f"DC BUS {vbus} V < {ALERT_VOLT_V} V", 'warning'))
+        if 0 < vbus < alert_volt:
+            alerts.append((f"DC BUS {vbus} V < {alert_volt:.0f} V", 'warning'))
         vcell = s.get('v_cell_min_mV', 0)
-        if 0 < vcell < ALERT_CELL_MV:
-            alerts.append((f"MIN CELL {vcell} mV < {ALERT_CELL_MV} mV", 'critical'))
+        if 0 < vcell < alert_cell:
+            alerts.append((f"MIN CELL {vcell} mV < {alert_cell:.0f} mV", 'critical'))
         self._alert_banner.set_alerts(alerts)
         self._ov_temp.set_alert(any(a[1] == 'critical' and 'TEMP' in a[0] for a in alerts))
         self._ov_vbus.set_alert(any('DC BUS' in a[0] for a in alerts))
         self._ov_vcell.set_alert(any('MIN CELL' in a[0] for a in alerts))
+
+        # Speak alarms if active stream
+        if self.is_receiving or self.demo_mode:
+            self._process_tts_alerts(alerts)
 
     # ── Main update loop ──────────────────────────────────────────────────────
     def _update(self):
@@ -1831,6 +1890,14 @@ class MainWindow(QMainWindow):
         _ind(self._ind_ams,       f"AMS {ams}",   ams > 0)
         self._lbl_seq.setText(f"SEQ: {seq}")
         self._lbl_tick.setText(f"TICK: {tick} ms")
+        lqi = rtt.get_latest_data().get('lqi', 100.0)
+        self._lbl_lqi.setText(f"LQI: {lqi:.1f}%")
+        if lqi >= 85:
+            self._lbl_lqi.setStyleSheet("color:#00c853; font-size:9px; font-family:'Courier New';")
+        elif lqi >= 70:
+            self._lbl_lqi.setStyleSheet("color:#f0b429; font-size:9px; font-family:'Courier New';")
+        else:
+            self._lbl_lqi.setStyleSheet("color:#ef4444; font-size:9px; font-family:'Courier New';")
 
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
@@ -1948,10 +2015,61 @@ class MainWindow(QMainWindow):
             current_settings.update(new)
             rtt.DEFAULT_PORT = new["port"]
             rtt.DEFAULT_BAUD = new["baud"]
+
+            # Save settings to file
+            self._save_settings_to_file()
+            # Update warning thresholds in widgets
+            self._update_widget_thresholds()
+
             if demo_changed:
                 self.demo_mode = new["demo_mode"]
                 self._log_append(f"Demo mode {'ENABLED' if self.demo_mode else 'DISABLED'}")
-            self._log_append(f"Settings: port={new['port']} baud={new['baud']} marple={new['use_influx']}")
+            self._log_append(f"Settings: port={new['port']} baud={new['baud']} marple={new['use_influx']} temp={new['alert_temp_c']} cell={new['alert_cell_mv']}")
+
+    def _load_settings_from_file(self):
+        import json
+        settings_file = Path("settings.json")
+        if settings_file.exists():
+            try:
+                with open(settings_file, "r") as f:
+                    saved = json.load(f)
+                    current_settings.update(saved)
+                    self.settings.update(saved)
+            except Exception as e:
+                self._log_append(f"Error loading settings.json: {e}")
+
+    def _save_settings_to_file(self):
+        import json
+        settings_file = Path("settings.json")
+        try:
+            to_save = {
+                "port": self.settings.get("port"),
+                "baud": self.settings.get("baud"),
+                "use_influx": self.settings.get("use_influx"),
+                "debug": self.settings.get("debug"),
+                "demo_mode": self.settings.get("demo_mode"),
+                "alert_temp_c": self.settings.get("alert_temp_c"),
+                "alert_volt_v": self.settings.get("alert_volt_v"),
+                "alert_cell_mv": self.settings.get("alert_cell_mv"),
+            }
+            with open(settings_file, "w") as f:
+                json.dump(to_save, f, indent=4)
+        except Exception as e:
+            self._log_append(f"Error saving settings.json: {e}")
+
+    def _update_widget_thresholds(self):
+        temp_c = self.settings.get("alert_temp_c", 40.0)
+        cell_mv = self.settings.get("alert_cell_mv", 3400.0)
+        if hasattr(self, '_mod_v_bars') and self._mod_v_bars:
+            for bar in self._mod_v_bars:
+                bar._warn_lo = cell_mv
+        if hasattr(self, '_mod_t_bars') and self._mod_t_bars:
+            for bar in self._mod_t_bars:
+                bar._warn_hi = temp_c
+        if hasattr(self, '_vbox_v') and self._vbox_v:
+            self._vbox_v.setTitle(f"PER-MODULE CELL VOLTAGE  [mV]   (min to max)   —   ALERT < {cell_mv:.0f} mV")
+        if hasattr(self, '_vbox_t') and self._vbox_t:
+            self._vbox_t.setTitle(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {temp_c:.0f} degC")
 
     def _open_post_race(self):
         if self._post_race_win is None or not self._post_race_win.isVisible():
@@ -1969,6 +2087,57 @@ class MainWindow(QMainWindow):
             cur.movePosition(cur.Start)
             cur.select(cur.BlockUnderCursor)
             cur.removeSelectedText(); cur.deleteChar()
+
+    def _speak_alert(self, text: str):
+        # Run speech synthesis in a background daemon thread so it doesn't block PyQt GUI thread
+        def _speak():
+            try:
+                # 1. Try Windows native SAPI voice synthesis via win32com
+                import win32com.client
+                speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                speaker.Speak(text)
+            except Exception:
+                try:
+                    # 2. Fallback to PowerShell System.Speech (native on all Windows)
+                    safe_text = text.replace("'", "''")
+                    ps_cmd = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe_text}')"
+                    subprocess.run(["powershell", "-Command", ps_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+        threading.Thread(target=_speak, daemon=True).start()
+
+    def _process_tts_alerts(self, alerts: List[tuple]):
+        if not hasattr(self, '_spoken_alerts_timestamps'):
+            self._spoken_alerts_timestamps = {}
+        
+        now = time.time()
+        for alert_text, severity in alerts:
+            alert_key = alert_text
+            if "BATTERY TEMP" in alert_text:
+                alert_key = "BATTERY_TEMP_ALERT"
+            elif "DC BUS" in alert_text:
+                alert_key = "DC_BUS_ALERT"
+            elif "MIN CELL" in alert_text:
+                alert_key = "MIN_CELL_ALERT"
+            elif "RECEIVER HARDWARE" in alert_text:
+                alert_key = "RECEIVER_HW_ALERT"
+            elif "RADIO SIGNAL" in alert_text:
+                alert_key = "RADIO_SIGNAL_ALERT"
+            elif "USB DISCONNECTED" in alert_text:
+                alert_key = "USB_DISCONNECT_ALERT"
+
+            # Speak at most once every 20 seconds per warning type
+            last_time = self._spoken_alerts_timestamps.get(alert_key, 0.0)
+            if now - last_time > 20.0:
+                self._spoken_alerts_timestamps[alert_key] = now
+                friendly_text = alert_text
+                if "degC" in friendly_text:
+                    friendly_text = friendly_text.replace("degC", "degrees Celsius")
+                if "mV" in friendly_text:
+                    friendly_text = friendly_text.replace("mV", "millivolts")
+                if "V" in friendly_text:
+                    friendly_text = friendly_text.replace("V", "volts")
+                self._speak_alert(friendly_text)
 
     def closeEvent(self, ev):
         if self.is_receiving:

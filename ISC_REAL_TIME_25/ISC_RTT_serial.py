@@ -29,6 +29,7 @@ Post-race data injection:
 """
 
 from __future__ import annotations
+from collections import deque
 import csv
 import logging
 import struct
@@ -63,6 +64,7 @@ RF_EXPECTED = {
 MAGIC         = 0xEC   # buf[0]
 VERSION       = 0x03   # buf[1]
 KIND_SNAP     = 0x06   # buf[6]  kRadioKindSnapshot
+KIND_STATUS   = 0x99   # buf[6] custom status code from Arduino
 FRAG_TOTAL    = 5      # buf[3]  kRadioSnapshotFragmentCount
 HDR_SIZE      = 8      # bytes 0-7 are the fragment header
 DATA_SIZE     = 24     # bytes 8-31 are the data slice  (kRadioFragmentPayloadSize)
@@ -110,6 +112,9 @@ new_data_flag  = 0
 latest_data_dict: dict = {}
 
 _status: dict = {"badge": "STALE", "reason": "inicio", "ts": 0}
+_receiver_status: dict = {"hw_status": "OK", "last_update": 0.0}
+_last_received_snap_seq: Optional[int] = None
+_lqi_history: deque = deque(maxlen=50)
 _last_seq: Optional[int] = None
 _last_seq_advance_ts = 0.0
 _STALE_T = 0.20
@@ -337,7 +342,7 @@ def _read_frame(ser: serial.Serial, counters: Optional[dict] = None):
 # ================== FRAGMENT VALIDATION & REASSEMBLY ==================
 def _validate_fragment(payload: bytes) -> bool:
     """
-    Return True if the 32-byte payload is a valid snapshot fragment.
+    Return True if the 32-byte payload is a valid snapshot fragment or status packet.
     Checks: magic, version, kind, frag_tot, frag_idx bounds.
     """
     if len(payload) != PAYLOAD_LEN:
@@ -348,6 +353,8 @@ def _validate_fragment(payload: bytes) -> bool:
     if payload[1] != VERSION:
         logger.debug(f"[DROP] bad version: {payload[1]} (expected {VERSION})")
         return False
+    if payload[6] == KIND_STATUS:
+        return True
     if payload[6] != KIND_SNAP:
         logger.debug(f"[DROP] unknown kind: {payload[6]} (expected {KIND_SNAP})")
         return False
@@ -360,13 +367,36 @@ def _validate_fragment(payload: bytes) -> bool:
     return True
 
 
+def _handle_status_packet(payload: bytes) -> None:
+    global _receiver_status
+    status_code = payload[7]
+    ts = time.time()
+    if status_code == 0x01:
+        _receiver_status = {"hw_status": "NO_RADIO_HW", "last_update": ts}
+    elif status_code == 0x02:
+        _receiver_status = {"hw_status": "NO_SIGNAL", "last_update": ts}
+    else:
+        _receiver_status = {"hw_status": "OK", "last_update": ts}
+    latest_data_dict["__RECEIVER_STATUS__"] = _receiver_status
+
+
 def _process_fragment(payload: bytes) -> Optional[bytes]:
     """
     Store a validated fragment in the reassembly buffer keyed by seq.
     Returns the complete 102-byte snapshot bytes when all FRAG_TOTAL
     fragments for the same seq have arrived; otherwise returns None.
     """
-    global _frag_buffers
+    global _frag_buffers, _receiver_status
+
+    # Check for custom status frame
+    if payload[6] == KIND_STATUS:
+        _handle_status_packet(payload)
+        return None
+
+    # Reset status warning when actual radio fragments start arriving
+    if _receiver_status.get("hw_status") != "OK":
+        _receiver_status = {"hw_status": "OK", "last_update": time.time()}
+        latest_data_dict["__RECEIVER_STATUS__"] = _receiver_status
 
     frag_idx: int = payload[2]
     seq: int      = struct.unpack_from('<H', payload, 4)[0]
@@ -513,7 +543,7 @@ def parse_snapshot(snap: dict) -> None:
     Update latest_data_dict and AMSModule objects from a freshly decoded snapshot.
     Maintains backward-compatible keys so existing UI code keeps working.
     """
-    global data_str, ams_modules
+    global data_str, ams_modules, _last_received_snap_seq, _lqi_history
 
     if not snap:
         return
@@ -553,6 +583,23 @@ def parse_snapshot(snap: dict) -> None:
         'min_temp_c': tmax_min,
         'avg_temp_c': tmax_avg,
     }
+
+    # Calculate LQI rolling success rate
+    seq = snap.get('seq', 0)
+    if _last_received_snap_seq is not None:
+        diff = (seq - _last_received_snap_seq) & 0xFFFF
+        if 0 < diff < 100:
+            for _ in range(diff - 1):
+                _lqi_history.append(False)
+            _lqi_history.append(True)
+        else:
+            _lqi_history.append(True)
+    else:
+        _lqi_history.append(True)
+    _last_received_snap_seq = seq
+
+    lqi = (sum(_lqi_history) / len(_lqi_history) * 100.0) if _lqi_history else 100.0
+    latest_data_dict['lqi'] = round(lqi, 1)
 
     badge = _status.get('badge', '?')
     data_str = (
@@ -900,21 +947,17 @@ def receive_data(bucket_id: str,
                  use_influx: bool = False,
                  debug: bool = False) -> None:
 
-    global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT
+    global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT, _last_received_snap_seq, _lqi_history
+
+    _last_received_snap_seq = None
+    _lqi_history.clear()
+    latest_data_dict['lqi'] = 100.0
 
     DEBUG_ENABLE_DEFAULT = debug
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.info("Recepción USB-Serial iniciada (protocolo fragmentado v3). Marple Upload: %s", use_influx)
 
     _excel_logger = SerialCSVLogger(bucket_id, piloto, circuito)
-
-    if port is None:
-        port = _auto_detect_port()
-    if port is None:
-        raise RuntimeError("No se encontró un puerto serie RF-NANO.")
-
-    ser = _open_serial(port, baud)
-    logger.info("[CONFIG] port=%s  baud=%d  log=%s", port, baud, _excel_logger.filename)
 
     counters = {
         "rx":        0,
@@ -931,11 +974,42 @@ def receive_data(bucket_id: str,
 
     _set_badge("STALE", "esperando primer frame")
 
+    ser = None
     try:
         while new_data_flag != -1:
             now = time.time()
 
-            payload, err = _read_frame(ser, counters=counters)
+            # Attempt to establish / restore connection
+            if ser is None:
+                _set_badge("STALE", "reconectando...")
+                target_port = port if port else _auto_detect_port()
+                if target_port is None:
+                    logger.warning("[RECONNECT] No port detected. Retrying in 2.0s...")
+                    time.sleep(2.0)
+                    continue
+                try:
+                    logger.info("[RECONNECT] Attempting to open port %s @ %d...", target_port, baud)
+                    ser = _open_serial(target_port, baud)
+                    logger.info("[RECONNECT] Port %s opened successfully.", target_port)
+                    _set_badge("LIVE", "re-conectado")
+                except Exception as e:
+                    logger.warning("[RECONNECT] Failed to open port: %s. Retrying in 2.0s...", e)
+                    time.sleep(2.0)
+                    continue
+
+            # Read frame from active serial connection
+            try:
+                payload, err = _read_frame(ser, counters=counters)
+            except Exception as rx_ex:
+                logger.warning("[RX ERROR] Serial communication error: %s. Reconnecting...", rx_ex)
+                _set_badge("STALE", "reconectando...")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                time.sleep(1.0)
+                continue
 
             if err == "timeout":
                 if _last_seq is not None and (now - _last_seq_advance_ts) > _STALE_T:
@@ -1002,7 +1076,8 @@ def receive_data(bucket_id: str,
 
     finally:
         try:
-            ser.close()
+            if ser is not None:
+                ser.close()
         except Exception:
             pass
 

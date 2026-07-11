@@ -1,0 +1,10 @@
+{
+    "port": "COM3",
+    "baud": 115200,
+    "use_influx": false,
+    "debug": false,
+    "demo_mode": true,
+    "alert_temp_c": 40.0,
+    "alert_volt_v": 380.0,
+    "alert_cell_mv": 3400.0
+}
