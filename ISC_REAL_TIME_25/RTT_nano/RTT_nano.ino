@@ -1,22 +1,65 @@
-/* rtt_nano_rx.ino — RF-Nano / nRF24L01+ receiver for STM32 fragmented snapshot
+/* RTT_nano.ino — RF-Nano / nRF24L01+ receiver for IFS08-CE-ECU telemetry
  *
- * On-air packet format (32 bytes, little-endian):
+ * === TRANSMITTER PROTOCOL (feat/1, telemetry_task.cpp) ===
+ *
+ * ONE packet kind per 200 ms cycle (snapshot):
+ *   SNAPSHOT  version=0x03  kind=6  frag_tot=5  — full vehicle state, 102 bytes total
+ *
+ * Common 32-byte on-air header (bytes 0-7):
  *   [0]     magic      0xEC
  *   [1]     version    0x03
- *   [2]     frag_idx   0 … (FRAG_TOTAL-1)
- *   [3]     frag_tot   FRAG_TOTAL (5)
- *   [4..5]  seq        uint16_t LE  — snapshot sequence number
- *   [6]     kind       0x06 (kRadioKindSnapshot)
+ *   [2]     frag_idx   0 … (frag_tot-1)
+ *   [3]     frag_tot   5
+ *   [4..5]  seq        uint16_t LE
+ *   [6]     kind       6 (snapshot)
  *   [7]     reserved   0x00
- *   [8..31] data       24 bytes — slice of the 102-byte serialized snapshot
+ *   [8..31] data       24 bytes of snapshot slice
  *
- * For each valid fragment the sketch:
- *   - emits a framed binary record on Serial: AA 55 20 <32 bytes> <xor>
+ * Snapshot wire layout (102 bytes total, split across 5 × 24-byte fragments):
+ *   [0..3]   tick_ms         uint32_t LE
+ *   [4..5]   seq             uint16_t LE
+ *   [6]      start_button    uint8_t
+ *   [7..8]   apps1_raw       uint16_t LE
+ *   [9..10]  apps2_raw       uint16_t LE
+ *   [11..12] brake_raw       uint16_t LE
+ *   [13..14] torque_pct      uint16_t LE
+ *   [15]     ev_2_3          uint8_t
+ *   [16]     t11_8_9         uint8_t
+ *   [17]     ctrl_state      uint8_t
+ *   [18]     ok_precharge    uint8_t
+ *   [19]     ams_fsm_state   uint8_t
+ *   [20..21] v_cell_min_mV   uint16_t LE
+ *   [22]     soc             uint8_t
+ *   [23..32] vmin_modulo[5]  5 × uint16_t LE
+ *   [33..42] vmax_modulo[5]  5 × uint16_t LE
+ *   [43..44] corriente_accu  int16_t LE
+ *   [45..46] corriente_dcdc  int16_t LE
+ *   [47..48] temp_dcdc       int16_t LE
+ *   [49..58] temp_max_mod[5] 5 × int16_t LE
+ *   [59]     inv_state       uint8_t
+ *   [60]     vconfig_ready   uint8_t
+ *   [61]     inv_error       uint8_t
+ *   [62..63] inv_dc_bus_V    uint16_t LE
+ *   [64..65] inv_temp_motor1 uint16_t LE
+ *   [66..67] inv_temp_pwrstg uint16_t LE
+ *   [68..69] inv_temp_board  uint16_t LE
+ *   [70..73] inv_rpm         int32_t LE
+ *   [74..77] inv_speed_actual int32_t LE
+ *   [78..81] inv_current_actual int32_t LE
+ *   [82..101] (reserved / zero-padded)
  *
- * If the radio chip is disconnected or the connection is lost (no packets for 2s),
- * it sends a structured 1 Hz binary status update frame: AA 55 20 <status payload> <xor>
- * (kind = 0x99, status_code = 0x01 [no radio chip] | 0x02 [no transmitter]).
- * This prevents serial link spamming and high host CPU overhead.
+ * Radio config (matches nrf24.c in IFS08-CE-ECU exactly):
+ *   Channel  : 76 (0x4C)
+ *   Address  : ECU01  {0x45,0x43,0x55,0x30,0x31}
+ *   Payload  : 32 bytes fixed
+ *   Data rate: 1 Mbps
+ *   CRC      : 8-bit  (CONFIG=EN_CRC|PWR_UP, no CRCO bit)
+ *   PA level : 0 dBm  (RF_SETUP=0x06, PA_LOW)
+ *   AutoAck  : disabled
+ *   DynPD    : disabled
+ *
+ * VERBOSE 0: binary frames only  (use when connected to ISCmetrics host)
+ * VERBOSE 1: binary + human log  (use when monitoring with a serial terminal)
  */
 
 #include <SPI.h>
@@ -28,17 +71,26 @@ static const uint8_t PIN_CE  = 10;
 static const uint8_t PIN_CSN = 9;
 RF24 radio(PIN_CE, PIN_CSN);
 
-static const uint64_t PIPE_ADDR = 0xE7E7E7E7E7ULL; // 5-byte address
+// Pipe address: ECU01 = {'E','C','U','0','1'} = {0x45,0x43,0x55,0x30,0x31}
+// RF24 stores addresses LSB-first: uint64_t LE = 0x3130554345ULL
+static const uint64_t PIPE_ADDR = 0x3130554345ULL;
 static const uint8_t  CHANNEL   = 76;
-static const uint8_t  PAYLOAD   = 32;               // fixed payload size
+static const uint8_t  PAYLOAD   = 32;
 
-// ------------- Fragment protocol constants (must match STM32 TX) -------------
-static const uint8_t MAGIC      = 0xECu;
-static const uint8_t VERSION    = 0x03u;
-static const uint8_t KIND_SNAP  = 0x06u;
-static const uint8_t FRAG_TOTAL = 5u;
-static const uint8_t HDR_SIZE   = 8u;
-static const uint8_t DATA_SIZE  = 24u; // = PAYLOAD - HDR_SIZE
+// ------------- Protocol constants (must match telemetry_task.cpp) ------------
+static const uint8_t MAGIC              = 0xECu;
+
+// --- feat/1 (current) protocol ---
+static const uint8_t VERSION_SNAPSHOT   = 0x03u;
+static const uint8_t KIND_SNAPSHOT      = 6u;    // single snapshot kind
+static const uint8_t FRAG_SNAPSHOT      = 5u;    // 5 fragments × 24 bytes = 120 >= 102
+
+// --- Legacy feat/telemetry-port protocol (keep for backward compat) ---
+static const uint8_t VERSION_LEGACY     = 0x02u;
+static const uint8_t KIND_FAST          = 0x03u; // RF_FAST: 2 fragments
+static const uint8_t KIND_SLOW          = 0x04u; // RF_SLOW: 5 fragments
+static const uint8_t FRAG_FAST          = 2u;
+static const uint8_t FRAG_SLOW          = 5u;
 
 // ------------- Status protocol constants -------------
 static const uint8_t KIND_STATUS          = 0x99u;
@@ -51,7 +103,10 @@ static const uint8_t SOF1 = 0xAAu;
 static const uint8_t SOF2 = 0x55u;
 
 // ------------- Verbosity -------------
-#define VERBOSE 0  // 0: binary frames only, 1: human-readable print logs (slow)
+// 0 = binary frames only  (use this when connected to ISCmetrics host / Python UI)
+// 1 = binary frames + human-readable log prints on the same serial port
+//     (use this when monitoring with Arduino IDE serial monitor / PuTTY)
+#define VERBOSE 0
 
 // ------------- Globals -------------
 uint8_t buf[PAYLOAD];
@@ -72,23 +127,30 @@ static void dumpHex(const uint8_t* p, uint8_t n) {
 
 // Validate the 8-byte fragment header in buf[].
 // Returns true if the packet should be forwarded.
+// Handles both current (v0x03/kind=6) and legacy (v0x02/kind=0x03|0x04) protocols.
 static bool validateHeader() {
-    if (buf[0] != MAGIC) {
-        return false;
+    if (buf[0] != MAGIC) return false;
+
+    uint8_t ver  = buf[1];
+    uint8_t kind = buf[6];
+    uint8_t ftot = buf[3];
+    uint8_t fidx = buf[2];
+
+    // --- Current protocol: version 0x03, kind=6, 5 fragments ---
+    if (ver == VERSION_SNAPSHOT && kind == KIND_SNAPSHOT) {
+        return (ftot == FRAG_SNAPSHOT) && (fidx < FRAG_SNAPSHOT);
     }
-    if (buf[1] != VERSION) {
-        return false;
+
+    // --- Legacy protocol: version 0x02, kind=FAST(3) or SLOW(4) ---
+    if (ver == VERSION_LEGACY) {
+        if (kind == KIND_FAST) {
+            return (ftot == FRAG_FAST) && (fidx < FRAG_FAST);
+        } else if (kind == KIND_SLOW) {
+            return (ftot == FRAG_SLOW) && (fidx < FRAG_SLOW);
+        }
     }
-    if (buf[6] != KIND_SNAP) {
-        return false;
-    }
-    if (buf[3] != FRAG_TOTAL) {
-        return false;
-    }
-    if (buf[2] >= FRAG_TOTAL) {
-        return false;
-    }
-    return true;
+
+    return false;
 }
 
 // Send status packet over serial
@@ -96,7 +158,7 @@ static void sendStatusFrame(uint8_t status_code) {
     uint8_t status_packet[PAYLOAD];
     memset(status_packet, 0, PAYLOAD);
     status_packet[0] = MAGIC;
-    status_packet[1] = VERSION;
+    status_packet[1] = VERSION_SNAPSHOT;   // always use current version in status frames
     status_packet[2] = 0;
     status_packet[3] = 1;
     status_packet[4] = 0;
@@ -112,9 +174,17 @@ static void sendStatusFrame(uint8_t status_code) {
     Serial.write(PAYLOAD);
     Serial.write(status_packet, PAYLOAD);
     Serial.write(xorv);
+    Serial.flush();
+
+#if VERBOSE
+    Serial.print(F("[STATUS] "));
+    if      (status_code == STATUS_NO_RADIO_CHIP)  Serial.println(F("NO_RADIO_CHIP  (0x01) — nRF24L01 SPI not responding"));
+    else if (status_code == STATUS_NO_TRANSMITTER) Serial.println(F("NO_TRANSMITTER (0x02) — no packets received in >2s"));
+    else { Serial.print(F("UNKNOWN code=0x")); Serial.println(status_code, HEX); }
+#endif
 }
 
-// ------------- Setup -------------
+// ------------- Setup ---------------------------------------------------------
 void setup() {
     Serial.begin(115200);
 #if defined(USBCON) || defined(ARDUINO_AVR_LEONARDO)
@@ -129,18 +199,28 @@ void setup() {
         radio.setChannel(CHANNEL);
         radio.setAutoAck(false);
         radio.setDataRate(RF24_1MBPS);
-        radio.setCRCLength(RF24_CRC_16);
-        radio.setPALevel(RF24_PA_MAX);
+        radio.setCRCLength(RF24_CRC_8);      // TX CONFIG=EN_CRC|PWR_UP, no CRCO -> 8-bit
+        radio.setPALevel(RF24_PA_LOW);       // TX RF_SETUP=0x06 -> 0 dBm
         radio.disableDynamicPayloads();
         radio.setPayloadSize(PAYLOAD);
 
         radio.openReadingPipe(1, PIPE_ADDR);
         radio.startListening();
+
+#if VERBOSE
+        Serial.println(F("[RADIO] nRF24L01 OK — ch76, 1Mbps, CRC8, 0dBm, addr=ECU01"));
+        Serial.println(F("[PROTO] Accepting v0x03/kind=6 (snapshot) and v0x02/kind=3,4 (legacy)"));
+        radio.printDetails();
+#endif
+    } else {
+#if VERBOSE
+        Serial.println(F("[RADIO] ERROR — nRF24L01 not found! Check SPI wiring (CE=10, CSN=9)."));
+#endif
     }
     last_rx_time = millis();
 }
 
-// ------------- Loop -------------
+// ------------- Loop ----------------------------------------------------------
 void loop() {
     unsigned long now = millis();
     bool chip_connected = radio_ok && radio.isChipConnected();
@@ -167,7 +247,13 @@ void loop() {
             radio.read(buf, PAYLOAD);
 
             if (!validateHeader()) {
-                continue; // drop
+#if VERBOSE
+                // Print rejected header for debugging
+                Serial.print(F("[REJECT] "));
+                dumpHex(buf, 8);
+                Serial.println();
+#endif
+                continue;
             }
 
             last_rx_time = millis();
@@ -181,6 +267,24 @@ void loop() {
             Serial.write(PAYLOAD);       // 0x20
             Serial.write(buf, PAYLOAD);  // raw 32-byte fragment
             Serial.write(xorv);          // XOR checksum
+            Serial.flush();
+
+#if VERBOSE
+            uint16_t seq = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+            uint8_t  ver  = buf[1];
+            uint8_t  kind = buf[6];
+
+            if (ver == VERSION_SNAPSHOT && kind == KIND_SNAPSHOT) {
+                Serial.print(F("[SNAP]"));
+            } else if (kind == KIND_FAST) {
+                Serial.print(F("[FAST]"));
+            } else {
+                Serial.print(F("[SLOW]"));
+            }
+            Serial.print(F(" seq=")); Serial.print(seq);
+            Serial.print(F(" frag=")); Serial.print(buf[2]);
+            Serial.print(F("/")); Serial.println(buf[3]);
+#endif
         }
     }
 }

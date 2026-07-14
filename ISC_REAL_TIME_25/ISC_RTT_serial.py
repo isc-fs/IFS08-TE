@@ -55,20 +55,27 @@ RF_EXPECTED = {
     "PAYLOAD":   32,
     "DATA_RATE": "1Mbps",
     "AUTO_ACK":  False,
-    "CRC":       "CRC_16",
-    "PA":        "PA_MAX",
+    "CRC":       "CRC_8",   # TX CONFIG=EN_CRC|PWR_UP -> 8-bit
+    "PA":        "PA_LOW",  # TX RF_SETUP=0x06 -> 0 dBm
 }
 
 # ================== FRAGMENT PROTOCOL CONSTANTS ==================
-# Must mirror the STM32 TX (app_tasks.cpp)
-MAGIC         = 0xEC   # buf[0]
-VERSION       = 0x03   # buf[1]
-KIND_SNAP     = 0x06   # buf[6]  kRadioKindSnapshot
-KIND_STATUS   = 0x99   # buf[6] custom status code from Arduino
-FRAG_TOTAL    = 5      # buf[3]  kRadioSnapshotFragmentCount
+# Must mirror the STM32 TX (telemetry_task.cpp on feat/telemetry-port)
+MAGIC            = 0xEC   # buf[0]
+VERSION_LEGACY   = 0x02   # buf[1]
+VERSION_SNAPSHOT = 0x03   # buf[1]
+VERSION          = 0x02   # legacy expected version default
+KIND_FAST        = 0x03   # buf[6]
+KIND_SLOW        = 0x04   # buf[6]
+KIND_SNAPSHOT    = 0x06   # buf[6]
+KIND_STATUS      = 0x99   # buf[6] custom status code from Arduino
+FRAG_FAST        = 2
+FRAG_SLOW        = 5
+FRAG_SNAPSHOT    = 5
 HDR_SIZE      = 8      # bytes 0-7 are the fragment header
-DATA_SIZE     = 24     # bytes 8-31 are the data slice  (kRadioFragmentPayloadSize)
-SNAPSHOT_SIZE = 102    # kRadioSnapshotWireSize
+DATA_SIZE     = 24     # bytes 8-31 are the data slice
+SNAPSHOT_SIZE = 102    # backward compatibility for CSV headers/IMU
+
 
 # ================== SERIAL FRAMING CONSTANTS ==================
 SOF1        = 0xAA
@@ -350,21 +357,47 @@ def _validate_fragment(payload: bytes) -> bool:
     if payload[0] != MAGIC:
         logger.debug(f"[DROP] bad magic: 0x{payload[0]:02X} (expected 0x{MAGIC:02X})")
         return False
-    if payload[1] != VERSION:
-        logger.debug(f"[DROP] bad version: {payload[1]} (expected {VERSION})")
-        return False
-    if payload[6] == KIND_STATUS:
+    
+    ver  = payload[1]
+    kind = payload[6]
+    ftot = payload[3]
+    fidx = payload[2]
+
+    if kind == KIND_STATUS:
         return True
-    if payload[6] != KIND_SNAP:
-        logger.debug(f"[DROP] unknown kind: {payload[6]} (expected {KIND_SNAP})")
-        return False
-    if payload[3] != FRAG_TOTAL:
-        logger.debug(f"[DROP] unexpected frag_tot: {payload[3]} (expected {FRAG_TOTAL})")
-        return False
-    if payload[2] >= FRAG_TOTAL:
-        logger.debug(f"[DROP] frag_idx out of range: {payload[2]}")
-        return False
-    return True
+
+    # --- Current protocol: version 3, kind 6, 5 fragments ---
+    if ver == VERSION_SNAPSHOT and kind == KIND_SNAPSHOT:
+        if ftot != FRAG_SNAPSHOT:
+            logger.debug(f"[DROP] bad SNAPSHOT frag_tot: {ftot}")
+            return False
+        if fidx >= FRAG_SNAPSHOT:
+            logger.debug(f"[DROP] bad SNAPSHOT frag_idx: {fidx}")
+            return False
+        return True
+
+    # --- Legacy protocol: version 2, kind FAST/SLOW ---
+    if ver == VERSION_LEGACY:
+        if kind == KIND_FAST:
+            if ftot != FRAG_FAST:
+                logger.debug(f"[DROP] bad FRAG_FAST frag_tot: {ftot}")
+                return False
+            if fidx >= FRAG_FAST:
+                logger.debug(f"[DROP] bad FRAG_FAST frag_idx: {fidx}")
+                return False
+            return True
+        if kind == KIND_SLOW:
+            if ftot != FRAG_SLOW:
+                logger.debug(f"[DROP] bad FRAG_SLOW frag_tot: {ftot}")
+                return False
+            if fidx >= FRAG_SLOW:
+                logger.debug(f"[DROP] bad FRAG_SLOW frag_idx: {fidx}")
+                return False
+            return True
+
+    logger.debug(f"[DROP] unknown version/kind: ver={ver} kind={kind}")
+    return False
+
 
 
 def _handle_status_packet(payload: bytes) -> None:
@@ -380,11 +413,10 @@ def _handle_status_packet(payload: bytes) -> None:
     latest_data_dict["__RECEIVER_STATUS__"] = _receiver_status
 
 
-def _process_fragment(payload: bytes) -> Optional[bytes]:
+def _process_fragment(payload: bytes) -> Optional[Tuple[int, int, bytes]]:
     """
-    Store a validated fragment in the reassembly buffer keyed by seq.
-    Returns the complete 102-byte snapshot bytes when all FRAG_TOTAL
-    fragments for the same seq have arrived; otherwise returns None.
+    Store a validated fragment in the reassembly buffer.
+    Returns (kind, seq, snapshot_bytes) when complete; otherwise None.
     """
     global _frag_buffers, _receiver_status
 
@@ -398,147 +430,138 @@ def _process_fragment(payload: bytes) -> Optional[bytes]:
         _receiver_status = {"hw_status": "OK", "last_update": time.time()}
         latest_data_dict["__RECEIVER_STATUS__"] = _receiver_status
 
+    kind: int     = payload[6]
     frag_idx: int = payload[2]
+    frag_tot: int = payload[3]
     seq: int      = struct.unpack_from('<H', payload, 4)[0]
     data: bytes   = bytes(payload[HDR_SIZE: HDR_SIZE + DATA_SIZE])
 
-    if seq not in _frag_buffers and len(_frag_buffers) >= _MAX_PENDING_SEQS:
-        oldest = min(_frag_buffers.keys(), key=lambda s: _mod16_diff(seq, s))
-        del _frag_buffers[oldest]
-        logger.debug(f"[FRAG] evicted stale partial seq={oldest}")
+    key = (kind, seq)
+    if key not in _frag_buffers and len(_frag_buffers) >= _MAX_PENDING_SEQS:
+        oldest_key = min(_frag_buffers.keys(), key=lambda k: _mod16_diff(seq, k[1]))
+        del _frag_buffers[oldest_key]
+        logger.debug(f"[FRAG] evicted stale partial key={oldest_key}")
 
-    _frag_buffers.setdefault(seq, {})[frag_idx] = data
+    _frag_buffers.setdefault(key, {})[frag_idx] = data
 
-    if len(_frag_buffers[seq]) == FRAG_TOTAL:
-        buf = _frag_buffers.pop(seq)
-        snapshot = bytearray(SNAPSHOT_SIZE)
-        for idx in range(FRAG_TOTAL):
-            start    = idx * DATA_SIZE
-            chunk    = buf[idx]
-            copy_len = min(len(chunk), SNAPSHOT_SIZE - start)
+    if len(_frag_buffers[key]) == frag_tot:
+        buf_dict = _frag_buffers.pop(key)
+        assembled_size = frag_tot * DATA_SIZE
+        snapshot = bytearray(assembled_size)
+        for idx in range(frag_tot):
+            start = idx * DATA_SIZE
+            chunk = buf_dict[idx]
+            copy_len = min(len(chunk), assembled_size - start)
             if copy_len > 0:
                 snapshot[start: start + copy_len] = chunk[:copy_len]
-        return bytes(snapshot)
+        return kind, seq, bytes(snapshot)
 
     return None
 
 
 # ================== SNAPSHOT DECODER ==================
-# Pre-compiled struct formats for one-shot unpacking of the 102-byte snapshot.
-#
-# Head: bytes 0..22  (14 fields, 23 bytes)
-#   I  tick_ms, H  seq, B  start_button,
-#   H  apps1, H  apps2, H  brake,
-#   H  torque_pct, B  ev_2_3, B  t11_8_9, B  state,
-#   B  ok_precharge, B  ams_fsm_state,
-#   H  v_cell_min_mV, B  soc
-_SNAP_FMT_HEAD   = struct.Struct('<IHBHHHHBBBBBHB')   # 23 bytes
-
-# Arrays: bytes 23..58  (5+5+3+5 = 18 fields, 36 bytes)
-#   5H vmin, 5H vmax, h corriente_accu, h corriente_dcdc, h temp_dcdc, 5h temp_max
-_SNAP_FMT_ARRAYS = struct.Struct('<5H5Hhhh5h')         # 36 bytes
-
-# Tail: bytes 59..81  (10 fields, 23 bytes)
-#   B inv_state, B inv_vcfg, B inv_err,
-#   H inv_vbus, H inv_tm1, H inv_tpwr, H inv_tbd,
-#   i inv_rpm, i inv_spd, i inv_cur
-_SNAP_FMT_TAIL   = struct.Struct('<BBBHHHHiii')         # 23 bytes
+# Pre-compiled struct formats matching telemetry_task.cpp on feat/telemetry-port
+_SNAP_FMT_FAST = struct.Struct("<BBBBBBBBBHHHHHH3xHHHi14x")
+_SNAP_FMT_SLOW = struct.Struct("<Bhhh8xI5x24x5H14x5H14x5h14x")
 
 
-def _decode_snapshot(data: bytes) -> dict:
-    """
-    Parse a 102-byte serialised snapshot into a Python dict using
-    pre-compiled struct formats (3 bulk unpacks instead of ~20 calls).
-    Matches serialize_radio_snapshot() in app_tasks.cpp exactly.
-    """
-    if len(data) < SNAPSHOT_SIZE:
-        logger.warning(f"_decode_snapshot: short buffer ({len(data)} < {SNAPSHOT_SIZE})")
+def _decode_fast_snapshot(data: bytes, seq: int) -> dict:
+    if len(data) < 48:
+        logger.warning(f"_decode_fast_snapshot: short buffer ({len(data)} < 48)")
         return {}
-
-    # ── Head: bytes 0..22 ────────────────────────────────────────────────────
-    (tick_ms, seq, start_button,
-     apps1_raw, apps2_raw, brake_raw,
-     torque_pct, ev_2_3, t11_8_9, state,
-     ok_precharge, ams_fsm_state,
-     v_cell_min_mV, soc) = _SNAP_FMT_HEAD.unpack_from(data, 0)
-
-    # ── Arrays: bytes 23..58 ─────────────────────────────────────────────────
-    arr = _SNAP_FMT_ARRAYS.unpack_from(data, 23)
-    vmin_modulo     = list(arr[0:5])
-    vmax_modulo     = list(arr[5:10])
-    corriente_accu  = arr[10]
-    corriente_dcdc  = arr[11]
-    temp_dcdc       = arr[12]
-    temp_max_modulo = list(arr[13:18])
-
-     # ── Tail: bytes 59..81 ───────────────────────────────────────────────────
-    (inv_state, last_vconfig_tick, inv_error,
-     inv_dc_bus_V,
-     inv_temp_motor1, inv_temp_pwrstg, inv_temp_board,
-     inv_rpm, inv_speed_actual, inv_current_actual) = _SNAP_FMT_TAIL.unpack_from(data, 59)
-
-    # ── IMU: bytes 82..97 (8 signed int16 values) ────────────────────────────
-    if len(data) >= 98:
-        (imu_ax, imu_ay, imu_az,
-         imu_gx, imu_gy, imu_gz,
-         imu_roll, imu_pitch) = struct.unpack_from('<8h', data, 82)
-    else:
-        (imu_ax, imu_ay, imu_az, imu_gx, imu_gy, imu_gz, imu_roll, imu_pitch) = (0,0,0,0,0,0,0,0)
-
-    # scale raw values
-    imu_ax_g      = imu_ax / 1000.0
-    imu_ay_g      = imu_ay / 1000.0
-    imu_az_g      = imu_az / 1000.0
-    imu_gx_dps    = imu_gx / 10.0
-    imu_gy_dps    = imu_gy / 10.0
-    imu_gz_dps    = imu_gz / 10.0
-    imu_roll_deg  = imu_roll / 100.0
-    imu_pitch_deg = imu_pitch / 100.0
-
+    unpacked = _SNAP_FMT_FAST.unpack(data)
     return {
-        'tick_ms':            tick_ms,
-        'seq':                seq,
-        'start_button':       start_button,
-        'apps1_raw':          apps1_raw,
-        'apps2_raw':          apps2_raw,
-        'brake_raw':          brake_raw,
-        'torque_pct':         torque_pct,
-        'ev_2_3':             ev_2_3,
-        't11_8_9':            t11_8_9,
-        'state':              state,
-        'ok_precharge':       ok_precharge,
-        'ams_fsm_state':      ams_fsm_state,
-        'v_cell_min_mV':      v_cell_min_mV,
-        'soc':                soc,
-        'vmin_modulo':        vmin_modulo,
-        'vmax_modulo':        vmax_modulo,
-        'corriente_accu':     corriente_accu,
-        'corriente_dcdc':     corriente_dcdc,
-        'temp_dcdc':          temp_dcdc,
-        'temp_max_modulo':    temp_max_modulo,
-        'inv_state':          inv_state,
-        'last_vconfig_tick':  last_vconfig_tick,
-        'inv_error':          inv_error,
-        'inv_dc_bus_V':       inv_dc_bus_V,
-        'inv_temp_motor1':    inv_temp_motor1,
-        'inv_temp_pwrstg':    inv_temp_pwrstg,
-        'inv_temp_board':     inv_temp_board,
-        'inv_rpm':            inv_rpm,
-        'inv_speed_actual':   inv_speed_actual,
-        'inv_current_actual': inv_current_actual,
-        'imu_ax_g':           imu_ax_g,
-        'imu_ay_g':           imu_ay_g,
-        'imu_az_g':           imu_az_g,
-        'imu_gx_dps':         imu_gx_dps,
-        'imu_gy_dps':         imu_gy_dps,
-        'imu_gz_dps':         imu_gz_dps,
-        'imu_roll_deg':       imu_roll_deg,
-        'imu_pitch_deg':      imu_pitch_deg,
+        'seq': seq,
+        'ctrl_state':        unpacked[0],
+        'inv_state':         unpacked[1],
+        'ams_fsm_state':     unpacked[2],
+        'start_button':      unpacked[3],
+        'ok_precharge':      unpacked[4],
+        'ev_2_3':            unpacked[5],
+        't11_8_9':           unpacked[6],
+        'last_vconfig_tick': unpacked[7],
+        'inv_error':         unpacked[8],
+        'torque_pct':        unpacked[9],
+        'inv_dc_bus_V':      unpacked[10],
+        'v_cell_min_mV':     unpacked[11],
+        'apps1_raw':         unpacked[12],
+        'apps2_raw':         unpacked[13],
+        'brake_raw':         unpacked[14],
+        'inv_temp_motor1':   unpacked[15],
+        'inv_temp_pwrstg':   unpacked[16],
+        'inv_temp_board':    unpacked[17],
+        'inv_rpm':           unpacked[18],
     }
 
 
+def _decode_slow_snapshot(data: bytes, seq: int) -> dict:
+    if len(data) < 120:
+        logger.warning(f"_decode_slow_snapshot: short buffer ({len(data)} < 120)")
+        return {}
+    unpacked = _SNAP_FMT_SLOW.unpack(data)
+    return {
+        'seq': seq,
+        'soc':             unpacked[0],
+        'corriente_accu':  unpacked[1],
+        'corriente_dcdc':  unpacked[2],
+        'temp_dcdc':       unpacked[3],
+        'tick_ms':         unpacked[4],
+        'vmin_modulo':     list(unpacked[5:10]),
+        'vmax_modulo':     list(unpacked[10:15]),
+        'temp_max_modulo': list(unpacked[15:20]),
+    }
+
+
+_SNAP_FMT_FLAT = struct.Struct("<I H B H H H H B B B B B H B 5H 5H h h h 5h B B B H H H H i i i 20x")
+
+def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
+    if len(data) < 102:
+        logger.warning(f"_decode_flat_snapshot: short buffer ({len(data)} < 102)")
+        return {}
+    unpacked = _SNAP_FMT_FLAT.unpack(data[:102])
+    
+    # Extract list values
+    vmin_modulo = list(unpacked[14:19])
+    vmax_modulo = list(unpacked[19:24])
+    temp_max_modulo = list(unpacked[27:32])
+    
+    return {
+        'tick_ms':            unpacked[0],
+        'seq':                seq, # unpacked[1] is seq as well, but we pass it
+        'start_button':       unpacked[2],
+        'apps1_raw':          unpacked[3],
+        'apps2_raw':          unpacked[4],
+        'brake_raw':          unpacked[5],
+        'torque_pct':         unpacked[6],
+        'ev_2_3':             unpacked[7],
+        't11_8_9':            unpacked[8],
+        'ctrl_state':         unpacked[9], # mapping ctrl.state to ctrl_state
+        'ok_precharge':       unpacked[10],
+        'ams_fsm_state':      unpacked[11],
+        'v_cell_min_mV':      unpacked[12],
+        'soc':                unpacked[13],
+        'vmin_modulo':        vmin_modulo,
+        'vmax_modulo':        vmax_modulo,
+        'corriente_accu':     unpacked[24],
+        'corriente_dcdc':     unpacked[25],
+        'temp_dcdc':          unpacked[26],
+        'temp_max_modulo':    temp_max_modulo,
+        'inv_state':          unpacked[32],
+        'last_vconfig_tick':  unpacked[33],
+        'inv_error':          unpacked[34],
+        'inv_dc_bus_V':       unpacked[35],
+        'inv_temp_motor1':    unpacked[36],
+        'inv_temp_pwrstg':    unpacked[37],
+        'inv_temp_board':     unpacked[38],
+        'inv_rpm':            unpacked[39],
+        'inv_speed_actual':   unpacked[40],
+        'inv_current_actual': unpacked[41],
+    }
+
+
+
 # ================== SNAPSHOT → GLOBAL STATE ==================
-def parse_snapshot(snap: dict) -> None:
+def parse_snapshot(snap: dict, kind: Optional[int] = None) -> None:
     """
     Update latest_data_dict and AMSModule objects from a freshly decoded snapshot.
     Maintains backward-compatible keys so existing UI code keeps working.
@@ -584,19 +607,20 @@ def parse_snapshot(snap: dict) -> None:
         'avg_temp_c': tmax_avg,
     }
 
-    # Calculate LQI rolling success rate
-    seq = snap.get('seq', 0)
-    if _last_received_snap_seq is not None:
-        diff = (seq - _last_received_snap_seq) & 0xFFFF
-        if 0 < diff < 100:
-            for _ in range(diff - 1):
-                _lqi_history.append(False)
-            _lqi_history.append(True)
+    # Calculate LQI rolling success rate only for fast snapshots
+    if kind == KIND_FAST:
+        seq = snap.get('seq', 0)
+        if _last_received_snap_seq is not None:
+            diff = (seq - _last_received_snap_seq) & 0xFFFF
+            if 0 < diff < 100:
+                for _ in range(diff - 1):
+                    _lqi_history.append(False)
+                _lqi_history.append(True)
+            else:
+                _lqi_history.append(True)
         else:
             _lqi_history.append(True)
-    else:
-        _lqi_history.append(True)
-    _last_received_snap_seq = seq
+        _last_received_snap_seq = seq
 
     lqi = (sum(_lqi_history) / len(_lqi_history) * 100.0) if _lqi_history else 100.0
     latest_data_dict['lqi'] = round(lqi, 1)
@@ -952,6 +976,46 @@ def receive_data(bucket_id: str,
     _last_received_snap_seq = None
     _lqi_history.clear()
     latest_data_dict['lqi'] = 100.0
+    latest_data_dict['snapshot'] = {
+        'tick_ms':            0,
+        'seq':                0,
+        'start_button':       0,
+        'apps1_raw':          0,
+        'apps2_raw':          0,
+        'brake_raw':          0,
+        'torque_pct':         0,
+        'ev_2_3':             0,
+        't11_8_9':            0,
+        'state':              0,
+        'ok_precharge':       0,
+        'ams_fsm_state':      0,
+        'v_cell_min_mV':      0,
+        'soc':                0,
+        'vmin_modulo':        [0] * 5,
+        'vmax_modulo':        [0] * 5,
+        'corriente_accu':     0,
+        'corriente_dcdc':     0,
+        'temp_dcdc':          0,
+        'temp_max_modulo':    [0] * 5,
+        'inv_state':          0,
+        'last_vconfig_tick':  0,
+        'inv_error':          0,
+        'inv_dc_bus_V':       0,
+        'inv_temp_motor1':    0,
+        'inv_temp_pwrstg':    0,
+        'inv_temp_board':     0,
+        'inv_rpm':            0,
+        'inv_speed_actual':   0,
+        'inv_current_actual': 0,
+        'imu_ax_g':           0.0,
+        'imu_ay_g':           0.0,
+        'imu_az_g':           0.0,
+        'imu_gx_dps':         0.0,
+        'imu_gy_dps':         0.0,
+        'imu_gz_dps':         0.0,
+        'imu_roll_deg':       0.0,
+        'imu_pitch_deg':      0.0,
+    }
 
     DEBUG_ENABLE_DEFAULT = debug
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
@@ -1050,17 +1114,27 @@ def receive_data(bucket_id: str,
                 elif (now - _last_seq_advance_ts) > _STALE_T:
                     _set_badge("STALE", "SEQ detenido")
 
-            snapshot_bytes = _process_fragment(payload)
-            if snapshot_bytes is None:
+            result = _process_fragment(payload)
+            if result is None:
                 continue
 
+            kind, seq, snapshot_bytes = result
             counters["snapshot"] += 1
-            snap = _decode_snapshot(snapshot_bytes)
-            if not snap:
+
+            snap_update = {}
+            if kind == KIND_SNAPSHOT:
+                snap_update = _decode_flat_snapshot(snapshot_bytes, seq)
+            elif kind == KIND_FAST:
+                snap_update = _decode_fast_snapshot(snapshot_bytes, seq)
+            elif kind == KIND_SLOW:
+                snap_update = _decode_slow_snapshot(snapshot_bytes, seq)
+
+            if not snap_update:
                 _set_badge("BAD", "decode_fail")
                 continue
 
-            parse_snapshot(snap)
+            latest_data_dict['snapshot'].update(snap_update)
+            parse_snapshot(latest_data_dict['snapshot'], kind=kind)
             new_data_flag = 1
 
             if now - last_log_t >= 0.1:
