@@ -580,9 +580,73 @@ class ModuleBarWidget(QWidget):
         p.end()
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  CUSTOMISABLE TAB — drag-and-drop channel list + droppable plot panels
+#  SIGNAL BARS WIDGET  — WiFi-style link quality indicator
 # ══════════════════════════════════════════════════════════════════════════════
+class SignalBarsWidget(QWidget):
+    """
+    Draws 4 rising bars like a WiFi / mobile signal indicator.
+      lqi >= 85 %  → 4 bars, green
+      lqi >= 70 %  → 3 bars, green-yellow
+      lqi >= 50 %  → 2 bars, orange
+      lqi >= 25 %  → 1 bar,  red
+      lqi <  25 %  → 0 bars (all bars dim), red
+    """
+    _THRESHOLDS = [85, 70, 50, 25]   # 4,3,2,1 active bars
+    _COLOURS = {
+        4: "#00c853",  # green
+        3: "#8bc34a",  # yellow-green
+        2: "#f0b429",  # orange
+        1: "#ef4444",  # red
+        0: "#ef4444",  # red (all dim)
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lqi = 100.0
+        self.setFixedSize(36, 22)
+        self.setToolTip("Link Quality Indicator (packet success rate, last 50 snapshots)")
+
+    def set_lqi(self, lqi: float):
+        if lqi != self._lqi:
+            self._lqi = lqi
+            self.update()
+
+    def _active_bars(self) -> int:
+        for i, thr in enumerate(self._THRESHOLDS):
+            if self._lqi >= thr:
+                return 4 - i
+        return 0
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        n_active = self._active_bars()
+        colour   = QColor(self._COLOURS[n_active])
+        dim      = QColor("#2a2a2a")
+
+        num_bars  = 4
+        margin    = 2
+        w         = self.width()
+        h         = self.height()
+        bar_w     = max(4, (w - margin * (num_bars + 1)) // num_bars)
+        max_bar_h = h - margin * 2
+
+        for i in range(num_bars):
+            bar_h   = int(max_bar_h * (i + 1) / num_bars)
+            bx      = margin + i * (bar_w + margin)
+            by      = h - margin - bar_h
+            active  = i < n_active
+            p.setBrush(colour if active else dim)
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(bx, by, bar_w, bar_h, 2, 2)
+
+        p.end()
+
+
+
 class ChannelListWidget(QListWidget):
     """Drag-enabled list of snapshot channel names."""
     def __init__(self, parent=None):
@@ -1584,13 +1648,16 @@ class MainWindow(QMainWindow):
         self._ind_ams       = QLabel("● AMS")
         self._lbl_seq       = QLabel("SEQ: —")
         self._lbl_tick      = QLabel("TICK: —")
-        self._lbl_lqi       = QLabel("LQI: —")
+        # Signal-strength bar widget + percentage label
+        self._signal_bars   = SignalBarsWidget()
+        self._lbl_lqi       = QLabel("100%")
         for l in (self._ind_precharge, self._ind_inv_ok, self._ind_ams):
             l.setStyleSheet("color:#333; font-size:10px; font-weight:bold;")
-        for l in (self._lbl_seq, self._lbl_tick, self._lbl_lqi):
+        for l in (self._lbl_seq, self._lbl_tick):
             l.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
+        self._lbl_lqi.setStyleSheet("color:#00c853; font-size:9px; font-family:'Courier New';")
         for w2 in (self._ind_precharge, self._ind_inv_ok, self._ind_ams,
-                   self._lbl_seq, self._lbl_tick, self._lbl_lqi):
+                   self._lbl_seq, self._lbl_tick, self._signal_bars, self._lbl_lqi):
             ir.addWidget(w2)
         ir.addStretch()
         v.addLayout(ir, stretch=1)
@@ -1891,10 +1958,13 @@ class MainWindow(QMainWindow):
         self._lbl_seq.setText(f"SEQ: {seq}")
         self._lbl_tick.setText(f"TICK: {tick} ms")
         lqi = rtt.get_latest_data().get('lqi', 100.0)
-        self._lbl_lqi.setText(f"LQI: {lqi:.1f}%")
+        self._signal_bars.set_lqi(lqi)
+        self._lbl_lqi.setText(f"{lqi:.0f}%")
         if lqi >= 85:
             self._lbl_lqi.setStyleSheet("color:#00c853; font-size:9px; font-family:'Courier New';")
         elif lqi >= 70:
+            self._lbl_lqi.setStyleSheet("color:#8bc34a; font-size:9px; font-family:'Courier New';")
+        elif lqi >= 50:
             self._lbl_lqi.setStyleSheet("color:#f0b429; font-size:9px; font-family:'Courier New';")
         else:
             self._lbl_lqi.setStyleSheet("color:#ef4444; font-size:9px; font-family:'Courier New';")

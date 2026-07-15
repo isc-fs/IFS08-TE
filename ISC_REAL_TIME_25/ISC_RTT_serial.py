@@ -607,8 +607,8 @@ def parse_snapshot(snap: dict, kind: Optional[int] = None) -> None:
         'avg_temp_c': tmax_avg,
     }
 
-    # Calculate LQI rolling success rate only for fast snapshots
-    if kind == KIND_FAST:
+    # Calculate LQI rolling success rate for both fast and flat-snapshot packets
+    if kind in (KIND_FAST, KIND_SNAPSHOT):
         seq = snap.get('seq', 0)
         if _last_received_snap_seq is not None:
             diff = (seq - _last_received_snap_seq) & 0xFFFF
