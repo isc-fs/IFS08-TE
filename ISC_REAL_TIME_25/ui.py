@@ -56,7 +56,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 #  VERSION  — patched automatically by GitHub Actions on each release tag
 # ══════════════════════════════════════════════════════════════════════════════
-APP_VERSION    = "2.0.0"
+APP_VERSION    = "2.2.0"
 _RELEASES_URL  = "https://api.github.com/repos/MrAndy5/ISCmetrics/releases/latest"
 _RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
 
@@ -2544,7 +2544,7 @@ class MainWindow(QMainWindow):
                 w._title.setStyleSheet(f"color:{col}; font-size:9px; font-weight:bold; background:transparent; border:none;")
                 w.update()
                 
-            elif isinstance(w, MetricPanel):
+            elif isinstance(w, DroppablePlotPanel):
                 w._title_lbl.setStyleSheet(f"color:#444; font-size:9px; background:transparent; border:none;")
                 w._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
                 w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; }}")
