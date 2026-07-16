@@ -837,7 +837,40 @@ class SettingsDialog(QDialog):
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setGeometry(200, 200, 440, 360)
         self._p = parent
-        self.setStyleSheet(f"QDialog {{ background:{F1_DARK_BG}; color:{F1_TEXT}; }}")
+        if parent:
+            self.setPalette(parent.palette())
+        
+        # High-contrast premium style sheet with embedded vector checkmark
+        self.setStyleSheet(f"""
+            QDialog {{
+                background: {F1_DARK_BG};
+                color: {F1_TEXT};
+            }}
+            QCheckBox {{
+                color: {F1_TEXT};
+                font-size: 11px;
+                spacing: 8px;
+            }}
+            QCheckBox#chk_demo {{
+                color: {ISC_GREEN};
+                font-weight: bold;
+            }}
+            QCheckBox::indicator {{
+                width: 14px;
+                height: 14px;
+                border: 1.5px solid #555555;
+                background-color: {F1_MID_BG};
+                border-radius: 3px;
+            }}
+            QCheckBox::indicator:hover {{
+                border: 1.5px solid {ISC_GREEN};
+            }}
+            QCheckBox::indicator:checked {{
+                border: 1.5px solid #00c853;
+                background-color: {F1_MID_BG};
+                image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMiIgaGVpZ2h0PSIxMiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiMwMGM4NTMiIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cG9seWxpbmUgcG9pbnRzPSIyMCA2IDkgMTcgNCAxMiI+PC9wb2x5bGluZT48L3N2Zz4=);
+            }}
+        """)
         self._build()
 
     def _build(self):
@@ -856,18 +889,16 @@ class SettingsDialog(QDialog):
         g.addWidget(self.input_baud, 1, 1)
 
         self.chk_marple = QCheckBox("Upload to Marple Data (cloud)  🔒")
-        self.chk_marple.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
         self.chk_marple.setChecked(self._p.settings.get("use_influx", False))
         self.chk_marple.stateChanged.connect(self._on_marple_toggled)
         g.addWidget(self.chk_marple, 2, 0, 1, 2)
 
         self.chk_debug = QCheckBox("Enable debug output")
-        self.chk_debug.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
         self.chk_debug.setChecked(self._p.settings.get("debug", False))
         g.addWidget(self.chk_debug, 3, 0, 1, 2)
 
         self.chk_demo = QCheckBox("Demo mode  (simulated data)")
-        self.chk_demo.setStyleSheet(f"color:{ISC_GREEN}; font-size:11px; font-weight:bold;")
+        self.chk_demo.setObjectName("chk_demo")
         self.chk_demo.setChecked(self._p.settings.get("demo_mode", False))
         g.addWidget(self.chk_demo, 4, 0, 1, 2)
 

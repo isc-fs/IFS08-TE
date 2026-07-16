@@ -990,6 +990,7 @@ def receive_data(bucket_id: str,
 
     global new_data_flag, _last_seq, _last_seq_advance_ts, _excel_logger, DEBUG_ENABLE_DEFAULT, _last_received_snap_seq, _lqi_history
 
+    new_data_flag = 0
     _last_received_snap_seq = None
     _lqi_history.clear()
     latest_data_dict['lqi'] = 100.0
@@ -1179,10 +1180,16 @@ def receive_data(bucket_id: str,
         logger.info("Recepción USB-Serial finalizada. Snapshots: %d", counters["snapshot"])
 
         if use_influx and file_path:
-            logger.info("Iniciando subida a Marple Data...")
-            isc_marple.upload_session_csv(file_path, {
-                "piloto":   piloto,
-                "circuito": circuito,
-                "type":     "Real_Telemetry",
-                "date":     datetime.now().isoformat(),
-            })
+            logger.info("Iniciando subida a Marple Data en segundo plano...")
+            def _upload_bg():
+                try:
+                    isc_marple.upload_session_csv(file_path, {
+                        "piloto":   piloto,
+                        "circuito": circuito,
+                        "type":     "Real_Telemetry",
+                        "date":     datetime.now().isoformat(),
+                    })
+                except Exception as upload_err:
+                    logger.error("Error en la subida a Marple en segundo plano: %s", upload_err)
+
+            threading.Thread(target=_upload_bg, daemon=True).start()
