@@ -201,7 +201,9 @@ current_settings: dict = {
 # ══════════════════════════════════════════════════════════════════════════════
 class Signaler(QObject):
     log_message = pyqtSignal(str)
-    update_detected = pyqtSignal(str)
+    update_detected = pyqtSignal(str, str)    # version_tag, download_url
+    download_progress = pyqtSignal(int)
+    download_finished = pyqtSignal(str)     # filepath or error message starting with "ERR:"
 
 signaler = Signaler()
 
@@ -1499,7 +1501,6 @@ class MainWindow(QMainWindow):
         # Kick off a background update check (non-blocking)
         threading.Thread(target=self._check_for_update, daemon=True).start()
 
-    # ── Auto-update check ─────────────────────────────────────────────────────
     def _check_for_update(self):
         """Background thread: query GitHub for the latest release tag."""
         if not _REQUESTS_OK:
@@ -1523,12 +1524,23 @@ class MainWindow(QMainWindow):
                 
             logger.info("[UPDATE] Latest version: %s (Current version: %s)", tag, APP_VERSION)
             if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
+                # Find download URL for Windows setup EXE
+                download_url = None
+                for asset in resp.json().get("assets", []):
+                    name = asset.get("name", "")
+                    if name.endswith(".exe") and "Setup" in name:
+                        download_url = asset.get("browser_download_url")
+                        break
+                # Fallback if no specific setup EXE is found
+                if not download_url:
+                    download_url = resp.json().get("html_url", _RELEASES_PAGE)
+                
                 # Emit signal to thread-safely show the banner on the main GUI thread
-                signaler.update_detected.emit(tag)
+                signaler.update_detected.emit(tag, download_url)
         except Exception as e:
             logger.warning("[UPDATE] Check failed with exception: %s", e)
 
-    def _show_update_banner(self, new_version: str):
+    def _show_update_banner(self, new_version: str, download_url: str):
         """Show a non-blocking update banner at the top of the window."""
         if hasattr(self, "_update_banner") and self._update_banner is not None:
             return  # already shown
@@ -1543,7 +1555,7 @@ class MainWindow(QMainWindow):
         btn_dl = QPushButton("Download Update")
         btn_dl.setStyleSheet(self.get_button_style("accent"))
         btn_dl.setFixedWidth(140)
-        btn_dl.clicked.connect(lambda: webbrowser.open(_RELEASES_PAGE))
+        btn_dl.clicked.connect(lambda: self._start_automatic_update(new_version, download_url))
         btn_close = QPushButton("✕")
         btn_close.setStyleSheet(self.get_button_style())
         btn_close.setFixedWidth(28)
@@ -1558,7 +1570,96 @@ class MainWindow(QMainWindow):
             cw.layout().insertWidget(0, banner)
         banner.show()
         self._update_banner = banner
-        self._log_append(f"[UPDATE] ISCmetrics v{new_version} available at {_RELEASES_PAGE}")
+        self._log_append(f"[UPDATE] ISCmetrics v{new_version} available. Klik en 'Download Update' para instalar.")
+
+    def _start_automatic_update(self, new_version: str, download_url: str):
+        """Start the background download of the setup installer and show a progress dialog."""
+        from PyQt5.QtWidgets import QProgressDialog
+        
+        self._updater_dlg = QProgressDialog(f"Descargando actualización v{new_version}...", "Cancelar", 0, 100, self)
+        self._updater_dlg.setWindowTitle("Actualización de ISCmetrics")
+        self._updater_dlg.setWindowModality(Qt.WindowModal)
+        self._updater_dlg.setMinimumDuration(0)
+        self._updater_dlg.setValue(0)
+        
+        self._updater_cancelled = False
+        self._updater_dlg.canceled.connect(self._cancel_update)
+        
+        # Connect worker thread signals to main thread slots
+        signaler.download_progress.connect(self._on_update_download_progress)
+        signaler.download_finished.connect(self._on_update_download_finished)
+        
+        def _download_worker():
+            import tempfile
+            import os
+            try:
+                resp = _requests.get(download_url, stream=True, timeout=15)
+                if resp.status_code != 200:
+                    signaler.download_finished.emit(f"ERR: HTTP status {resp.status_code}")
+                    return
+                
+                total_size = int(resp.headers.get('content-length', 0))
+                if total_size <= 0:
+                    signaler.download_finished.emit("ERR: Invalid content length")
+                    return
+                
+                temp_dir = tempfile.gettempdir()
+                dest_path = os.path.join(temp_dir, f"ISCmetrics_Setup_v{new_version}.exe")
+                
+                downloaded = 0
+                with open(dest_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=131072):
+                        if self._updater_cancelled:
+                            return
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            pct = int((downloaded / total_size) * 100)
+                            signaler.download_progress.emit(pct)
+                
+                if not self._updater_cancelled:
+                    signaler.download_finished.emit(dest_path)
+            except Exception as e:
+                signaler.download_finished.emit(f"ERR: {e}")
+                
+        threading.Thread(target=_download_worker, daemon=True).start()
+
+    def _cancel_update(self):
+        self._updater_cancelled = True
+        self._log_append("[UPDATE] Descarga de la actualización cancelada.")
+
+    def _on_update_download_progress(self, val: int):
+        if hasattr(self, "_updater_dlg") and self._updater_dlg:
+            self._updater_dlg.setValue(val)
+
+    def _on_update_download_finished(self, result: str):
+        # Disconnect signals to prevent any cross-triggering
+        try:
+            signaler.download_progress.disconnect(self._on_update_download_progress)
+            signaler.download_finished.disconnect(self._on_update_download_finished)
+        except:
+            pass
+            
+        if hasattr(self, "_updater_dlg") and self._updater_dlg:
+            self._updater_dlg.close()
+            self._updater_dlg = None
+            
+        if result.startswith("ERR:"):
+            err_msg = result[4:]
+            QMessageBox.critical(self, "Error de descarga", 
+                                 f"No se pudo descargar la actualización automáticamente:\n{err_msg}\n\nPor favor, inténtelo de nuevo o instálela desde la web.")
+            webbrowser.open(_RELEASES_PAGE)
+        else:
+            self._log_append(f"[UPDATE] Descarga de actualización completada. Iniciando instalador: {result}")
+            try:
+                import os
+                # Execute the installer asynchronously
+                os.startfile(result)
+                # Close the application immediately so the installer can replace the files
+                self.close()
+            except Exception as install_err:
+                QMessageBox.critical(self, "Error de instalación", 
+                                     f"No se pudo iniciar el instalador descargado:\n{install_err}\n\nUbicación del archivo: {result}")
 
     def _dismiss_update_banner(self):
         if hasattr(self, "_update_banner") and self._update_banner:
