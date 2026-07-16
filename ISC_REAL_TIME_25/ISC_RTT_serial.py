@@ -103,8 +103,25 @@ AMS_TEMP_COLS: List[str] = [
 ]
 
 # ================== LOG DIR ==================
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+def get_user_dir() -> Path:
+    import os
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            CSIDL_PERSONAL = 5
+            SHGFP_TYPE_CURRENT = 0
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            ctypes.windll.shell32.SHGetFolderPathW(None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf)
+            if buf.value:
+                return Path(buf.value) / "ISCmetrics"
+    except Exception:
+        pass
+    return Path.home() / "Documents" / "ISCmetrics"
+
+USER_DIR = get_user_dir()
+LOG_DIR = USER_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ================== DEFAULTS ==================
 DEFAULT_BAUD = 115200

@@ -204,8 +204,11 @@ TRACK_SEGS = [
 ]
 TRACK_LEN = sum(s[0] for s in TRACK_SEGS)
 
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+try:
+    from ISC_RTT_serial import LOG_DIR
+except ImportError:
+    LOG_DIR = Path("logs")
+    LOG_DIR.mkdir(exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

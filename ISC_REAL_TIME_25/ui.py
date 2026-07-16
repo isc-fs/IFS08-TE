@@ -1440,7 +1440,7 @@ class MainWindow(QMainWindow):
         self._settings_dlg: Optional[SettingsDialog]    = None
         self._log: Optional[QTextEdit] = None
 
-        icon = Path("isc_logo.ico")
+        icon = Path(__file__).resolve().parent / "isc_logo.ico"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
 
@@ -2209,7 +2209,7 @@ class MainWindow(QMainWindow):
 
     def _load_settings_from_file(self):
         import json
-        settings_file = Path("settings.json")
+        settings_file = rtt.USER_DIR / "settings.json"
         if settings_file.exists():
             try:
                 with open(settings_file, "r") as f:
@@ -2221,7 +2221,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings_to_file(self):
         import json
-        settings_file = Path("settings.json")
+        settings_file = rtt.USER_DIR / "settings.json"
         try:
             to_save = {
                 "port": self.settings.get("port"),
