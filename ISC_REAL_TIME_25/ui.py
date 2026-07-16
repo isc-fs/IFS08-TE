@@ -60,6 +60,8 @@ APP_VERSION    = "2.0.0"
 _RELEASES_URL  = "https://api.github.com/repos/MrAndy5/ISCmetrics/releases/latest"
 _RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
 
+logger = logging.getLogger("ISC_RTT_USB")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR SCHEME  (ISC Green / Grafana dark)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1499,24 +1501,30 @@ class MainWindow(QMainWindow):
     def _check_for_update(self):
         """Background thread: query GitHub for the latest release tag."""
         if not _REQUESTS_OK:
+            logger.warning("[UPDATE] requests module is not available. Cannot check for updates.")
             return
         try:
+            logger.info("[UPDATE] Checking for updates at %s...", _RELEASES_URL)
             resp = _requests.get(_RELEASES_URL, timeout=5,
                                  headers={"Accept": "application/vnd.github+json"})
             if resp.status_code != 200:
+                logger.warning("[UPDATE] Failed check: HTTP status %d", resp.status_code)
                 return
             tag = resp.json().get("tag_name", "").lstrip("v")
             if not tag:
+                logger.warning("[UPDATE] Failed check: No tag_name in response")
                 return
-            # Simple semver comparison (major.minor.patch)
+            
             def _ver_tuple(s):
                 try:    return tuple(int(x) for x in s.split("."))
                 except: return (0, 0, 0)
+                
+            logger.info("[UPDATE] Latest version: %s (Current version: %s)", tag, APP_VERSION)
             if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
                 # Schedule banner on the main Qt thread via a one-shot timer
                 QTimer.singleShot(0, lambda: self._show_update_banner(tag))
-        except Exception:
-            pass  # network unavailable — silently ignore
+        except Exception as e:
+            logger.warning("[UPDATE] Check failed with exception: %s", e)
 
     def _show_update_banner(self, new_version: str):
         """Show a non-blocking update banner at the top of the window."""
