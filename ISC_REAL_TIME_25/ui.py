@@ -11,6 +11,13 @@ import threading
 import time
 import logging
 import subprocess
+import hashlib
+import webbrowser
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +38,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QWidget, QLabel, QPushButton, QLineEdit, QComboBox, QTextEdit,
     QMessageBox, QTabWidget, QFrame, QGroupBox, QCheckBox,
-    QListWidget, QListWidgetItem, QDialog, QSizePolicy
+    QListWidget, QListWidgetItem, QDialog, QSizePolicy, QInputDialog
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -47,6 +54,13 @@ except ImportError:
     DEMO_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  VERSION  — patched automatically by GitHub Actions on each release tag
+# ══════════════════════════════════════════════════════════════════════════════
+APP_VERSION    = "2.0.0"
+_RELEASES_URL  = "https://api.github.com/repos/MrAndy5/ISCmetrics/releases/latest"
+_RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR SCHEME  (ISC Green / Grafana dark)
 # ══════════════════════════════════════════════════════════════════════════════
 ISC_GREEN   = '#008000'
@@ -59,6 +73,9 @@ F1_WARNING  = '#f0b429'
 F1_ERROR    = '#ef4444'
 F1_BLUE     = '#3b82f6'
 F1_PURPLE   = '#8b5cf6'
+
+# ── Marple upload password (SHA-256 of 'ISC_telemetry_2026') ─────────────────
+_MARPLE_PASSWORD_HASH = hashlib.sha256(b"ISC_telemetry_2026").hexdigest()
 
 # Alert thresholds
 ALERT_TEMP_C   = 40.0   # °C   — any module max temp above this
@@ -838,9 +855,10 @@ class SettingsDialog(QDialog):
         self.input_baud = QLineEdit(str(self._p.settings.get("baud", rtt.DEFAULT_BAUD))); self.input_baud.setStyleSheet(ins)
         g.addWidget(self.input_baud, 1, 1)
 
-        self.chk_marple = QCheckBox("Upload to Marple Data (cloud)")
+        self.chk_marple = QCheckBox("Upload to Marple Data (cloud)  🔒")
         self.chk_marple.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
         self.chk_marple.setChecked(self._p.settings.get("use_influx", False))
+        self.chk_marple.stateChanged.connect(self._on_marple_toggled)
         g.addWidget(self.chk_marple, 2, 0, 1, 2)
 
         self.chk_debug = QCheckBox("Enable debug output")
@@ -873,6 +891,35 @@ class SettingsDialog(QDialog):
         btn.setStyleSheet(self._p.get_button_style('accent'))
         btn.clicked.connect(self.accept)
         g.addWidget(btn, 8, 0, 1, 2)
+
+    # ── Marple password gate ──────────────────────────────────────────────────
+    def _on_marple_toggled(self, state: int):
+        """Ask for the Marple API password whenever the checkbox is ticked on."""
+        if state == 0:
+            return  # unchecking — always allowed
+        # Prompt for password (echo mode hidden)
+        pwd, ok = QInputDialog.getText(
+            self,
+            "Marple Upload — Authentication Required",
+            "Enter the Marple API password:",
+            QLineEdit.Password,
+        )
+        if not ok:
+            # User cancelled → silently uncheck
+            self.chk_marple.blockSignals(True)
+            self.chk_marple.setChecked(False)
+            self.chk_marple.blockSignals(False)
+            return
+        entered_hash = hashlib.sha256(pwd.encode()).hexdigest()
+        if entered_hash != _MARPLE_PASSWORD_HASH:
+            QMessageBox.warning(
+                self,
+                "Access Denied",
+                "Incorrect password.\nMarple cloud upload has not been enabled.",
+            )
+            self.chk_marple.blockSignals(True)
+            self.chk_marple.setChecked(False)
+            self.chk_marple.blockSignals(False)
 
     @staticmethod
     def _lbl(t, s):
@@ -1406,7 +1453,71 @@ class MainWindow(QMainWindow):
         self._timer.start(400)
 
         signaler.log_message.connect(self._log_append)
-        self._log_append("ISCmetrics v2 ready.")
+        self._log_append(f"ISCmetrics v{APP_VERSION} ready.")
+
+        # Kick off a background update check (non-blocking)
+        threading.Thread(target=self._check_for_update, daemon=True).start()
+
+    # ── Auto-update check ─────────────────────────────────────────────────────
+    def _check_for_update(self):
+        """Background thread: query GitHub for the latest release tag."""
+        if not _REQUESTS_OK:
+            return
+        try:
+            resp = _requests.get(_RELEASES_URL, timeout=5,
+                                 headers={"Accept": "application/vnd.github+json"})
+            if resp.status_code != 200:
+                return
+            tag = resp.json().get("tag_name", "").lstrip("v")
+            if not tag:
+                return
+            # Simple semver comparison (major.minor.patch)
+            def _ver_tuple(s):
+                try:    return tuple(int(x) for x in s.split("."))
+                except: return (0, 0, 0)
+            if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
+                # Schedule banner on the main Qt thread via a one-shot timer
+                QTimer.singleShot(0, lambda: self._show_update_banner(tag))
+        except Exception:
+            pass  # network unavailable — silently ignore
+
+    def _show_update_banner(self, new_version: str):
+        """Show a non-blocking update banner at the top of the window."""
+        if hasattr(self, "_update_banner") and self._update_banner is not None:
+            return  # already shown
+        banner = QFrame(self)
+        banner.setStyleSheet(
+            f"background:#1a3a1a; border-bottom:2px solid {ISC_GREEN};"
+        )
+        bh = QHBoxLayout(banner)
+        bh.setContentsMargins(12, 6, 12, 6)
+        lbl = QLabel(f"🔄  ISCmetrics v{new_version} is available — you have v{APP_VERSION}")
+        lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:11px; font-weight:bold;")
+        btn_dl = QPushButton("Download Update")
+        btn_dl.setStyleSheet(self.get_button_style("accent"))
+        btn_dl.setFixedWidth(140)
+        btn_dl.clicked.connect(lambda: webbrowser.open(_RELEASES_PAGE))
+        btn_close = QPushButton("✕")
+        btn_close.setStyleSheet(self.get_button_style())
+        btn_close.setFixedWidth(28)
+        btn_close.clicked.connect(lambda: self._dismiss_update_banner())
+        bh.addWidget(lbl)
+        bh.addStretch()
+        bh.addWidget(btn_dl)
+        bh.addWidget(btn_close)
+        # Insert banner at the top of the central widget's layout
+        cw = self.centralWidget()
+        if cw and cw.layout():
+            cw.layout().insertWidget(0, banner)
+        banner.show()
+        self._update_banner = banner
+        self._log_append(f"[UPDATE] ISCmetrics v{new_version} available at {_RELEASES_PAGE}")
+
+    def _dismiss_update_banner(self):
+        if hasattr(self, "_update_banner") and self._update_banner:
+            self._update_banner.hide()
+            self._update_banner.setParent(None)
+            self._update_banner = None
 
     # ── style helpers ─────────────────────────────────────────────────────────
     def get_input_style(self) -> str:
