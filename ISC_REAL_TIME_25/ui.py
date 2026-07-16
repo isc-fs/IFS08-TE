@@ -1465,7 +1465,7 @@ class PostRaceWindow(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ISCmetrics — Formula Student Telemetry")
+        self.setWindowTitle(f"ISCmetrics v{APP_VERSION} — Formula Student Telemetry")
         self.setGeometry(40, 40, 1600, 960)
 
         self.settings     = current_settings.copy()
@@ -1671,7 +1671,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(logo_lbl)
         vn = QVBoxLayout()
         vn.addWidget(self._lbl("ISCmetrics", f"color:{ISC_GREEN}; font-size:15px; font-weight:bold;"))
-        vn.addWidget(self._lbl("Formula Student Telemetry v2", "color:#666; font-size:9px;"))
+        vn.addWidget(self._lbl(f"Formula Student Telemetry v{APP_VERSION}", "color:#666; font-size:9px;"))
         ll.addLayout(vn)
         h.addWidget(lf)
         h.addWidget(self._vsep())
