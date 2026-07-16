@@ -187,6 +187,7 @@ current_settings: dict = {
     "use_influx": False,
     "debug":      rtt.DEBUG_ENABLE_DEFAULT,
     "demo_mode":  False,
+    "enable_tts": True,
     "alert_temp_c":  ALERT_TEMP_C,
     "alert_volt_v":  ALERT_VOLT_V,
     "alert_cell_mv": ALERT_CELL_MV,
@@ -902,26 +903,30 @@ class SettingsDialog(QDialog):
         self.chk_demo.setChecked(self._p.settings.get("demo_mode", False))
         g.addWidget(self.chk_demo, 4, 0, 1, 2)
 
+        self.chk_tts = QCheckBox("Enable voice alerts (TTS)")
+        self.chk_tts.setChecked(self._p.settings.get("enable_tts", True))
+        g.addWidget(self.chk_tts, 5, 0, 1, 2)
+
         # Alert thresholds
-        g.addWidget(self._lbl("Alert Max Temp (°C):", ls), 5, 0)
+        g.addWidget(self._lbl("Alert Max Temp (°C):", ls), 6, 0)
         self.input_alert_temp = QLineEdit(str(self._p.settings.get("alert_temp_c", 40.0)))
         self.input_alert_temp.setStyleSheet(ins)
-        g.addWidget(self.input_alert_temp, 5, 1)
+        g.addWidget(self.input_alert_temp, 6, 1)
 
-        g.addWidget(self._lbl("Alert Min DC Bus (V):", ls), 6, 0)
+        g.addWidget(self._lbl("Alert Min DC Bus (V):", ls), 7, 0)
         self.input_alert_volt = QLineEdit(str(self._p.settings.get("alert_volt_v", 380.0)))
         self.input_alert_volt.setStyleSheet(ins)
-        g.addWidget(self.input_alert_volt, 6, 1)
+        g.addWidget(self.input_alert_volt, 7, 1)
 
-        g.addWidget(self._lbl("Alert Min Cell (mV):", ls), 7, 0)
+        g.addWidget(self._lbl("Alert Min Cell (mV):", ls), 8, 0)
         self.input_alert_cell = QLineEdit(str(self._p.settings.get("alert_cell_mv", 3400.0)))
         self.input_alert_cell.setStyleSheet(ins)
-        g.addWidget(self.input_alert_cell, 7, 1)
+        g.addWidget(self.input_alert_cell, 8, 1)
 
         btn = QPushButton("Apply & Close")
         btn.setStyleSheet(self._p.get_button_style('accent'))
         btn.clicked.connect(self.accept)
-        g.addWidget(btn, 8, 0, 1, 2)
+        g.addWidget(btn, 9, 0, 1, 2)
 
     # ── Marple password gate ──────────────────────────────────────────────────
     def _on_marple_toggled(self, state: int):
@@ -979,6 +984,7 @@ class SettingsDialog(QDialog):
             "use_influx": self.chk_marple.isChecked(),
             "debug":      self.chk_debug.isChecked(),
             "demo_mode":  self.chk_demo.isChecked(),
+            "enable_tts": self.chk_tts.isChecked(),
             "alert_temp_c":  temp_c,
             "alert_volt_v":  volt_v,
             "alert_cell_mv": cell_mv,
@@ -2307,18 +2313,43 @@ class MainWindow(QMainWindow):
                 # 1. Try Windows native SAPI voice synthesis via win32com
                 import win32com.client
                 speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                speaker.Rate = -2       # Slower rate makes it much more intelligible over background noise
+                speaker.Volume = 100
+                
+                # Prefer high-intelligibility female voices (Zira or Helena/Sabina)
+                voices = speaker.GetVoices()
+                for i in range(voices.Count):
+                    desc = voices.Item(i).GetDescription()
+                    if any(name in desc for name in ["Zira", "Hazel", "Helena", "Sabina"]):
+                        speaker.Voice = voices.Item(i)
+                        break
                 speaker.Speak(text)
             except Exception:
                 try:
                     # 2. Fallback to PowerShell System.Speech (native on all Windows)
+                    # Configures a slower speech rate, max volume, and selects Zira or Helena if available.
                     safe_text = text.replace("'", "''")
-                    ps_cmd = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe_text}')"
+                    ps_cmd = (
+                        "Add-Type -AssemblyName System.Speech; "
+                        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                        "$s.Rate = -2; "
+                        "$s.Volume = 100; "
+                        "$v = $s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo } | "
+                        "Where-Object { $_.Name -like '*Zira*' -or $_.Name -like '*Helena*' -or $_.Name -like '*Hazel*' } | "
+                        "Select-Object -First 1; "
+                        "if ($v) { $s.SelectVoice($v.Name) } else { "
+                        "try { $s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female) } catch {} }; "
+                        f"$s.Speak('{safe_text}')"
+                    )
                     subprocess.run(["powershell", "-Command", ps_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
         threading.Thread(target=_speak, daemon=True).start()
 
     def _process_tts_alerts(self, alerts: List[tuple]):
+        if not self.settings.get("enable_tts", True):
+            return
+            
         if not hasattr(self, '_spoken_alerts_timestamps'):
             self._spoken_alerts_timestamps = {}
         
