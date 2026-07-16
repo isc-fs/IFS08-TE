@@ -63,30 +63,16 @@ _RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
 logger = logging.getLogger("ISC_RTT_USB")
 
 INVERTER_ERRORS_MAP = {
-    0x0001: "Hardware Gate Driver Fault",
-    0x0002: "Over-Temperature (Motor/IGBT)",
-    0x0004: "DC Bus Over-Voltage",
-    0x0008: "DC Bus Under-Voltage",
-    0x0010: "Phase Over-Current",
-    0x0020: "Resolver/Encoder Fault",
-    0x0040: "CAN Communication Timeout",
-    0x0080: "Throttle APPS Plausibility Conflict",
-    0x0100: "Brake Plausibility Alert (Brake + APPS)",
-    0x0200: "Precharge Timeout / Failure",
-    0x0400: "Emergency Stop / Shutdown Circuit Open",
-    0x0800: "Inverter EEPROM / Memory Fault",
-    0x1000: "Low 12V Control Voltage Warning",
-    0x2000: "Discharge Active / Active Short Circuit",
+    1: "Lost Message (CAN Timeout)",
+    2: "Undervoltage Fault",
+    3: "Overtemperature Fault",
 }
 
 def decode_inverter_errors(error_code: int) -> list:
-    active_errors = []
-    for bit, desc in INVERTER_ERRORS_MAP.items():
-        if error_code & bit:
-            active_errors.append(desc)
-    if error_code > 0 and not active_errors:
-        active_errors.append(f"Unknown Fault (0x{error_code:04X})")
-    return active_errors
+    desc = INVERTER_ERRORS_MAP.get(error_code)
+    if desc:
+        return [desc]
+    return [f"Fault Code {error_code} (Check DeveLinkSTUDIO)"]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR SCHEME  (ISC Green / Grafana dark)
