@@ -2549,7 +2549,7 @@ class MainWindow(QMainWindow):
                 w._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
                 w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; }}")
                 w._ax.set_facecolor(F1_PANEL_BG)
-                w._fig.patch.set_facecolor(F1_PANEL_BG)
+                w._canvas.figure.patch.set_facecolor(F1_PANEL_BG)
                 w._ax.spines['bottom'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
                 w._ax.spines['left'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
                 w._ax.tick_params(colors='#1a1a1a' if F1_TEXT == '#1a1a1a' else '#e0e0e0')
