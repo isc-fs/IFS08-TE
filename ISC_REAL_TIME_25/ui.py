@@ -62,6 +62,32 @@ _RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
 
 logger = logging.getLogger("ISC_RTT_USB")
 
+INVERTER_ERRORS_MAP = {
+    0x0001: "Hardware Gate Driver Fault",
+    0x0002: "Over-Temperature (Motor/IGBT)",
+    0x0004: "DC Bus Over-Voltage",
+    0x0008: "DC Bus Under-Voltage",
+    0x0010: "Phase Over-Current",
+    0x0020: "Resolver/Encoder Fault",
+    0x0040: "CAN Communication Timeout",
+    0x0080: "Throttle APPS Plausibility Conflict",
+    0x0100: "Brake Plausibility Alert (Brake + APPS)",
+    0x0200: "Precharge Timeout / Failure",
+    0x0400: "Emergency Stop / Shutdown Circuit Open",
+    0x0800: "Inverter EEPROM / Memory Fault",
+    0x1000: "Low 12V Control Voltage Warning",
+    0x2000: "Discharge Active / Active Short Circuit",
+}
+
+def decode_inverter_errors(error_code: int) -> list:
+    active_errors = []
+    for bit, desc in INVERTER_ERRORS_MAP.items():
+        if error_code & bit:
+            active_errors.append(desc)
+    if error_code > 0 and not active_errors:
+        active_errors.append(f"Unknown Fault (0x{error_code:04X})")
+    return active_errors
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR SCHEME  (ISC Green / Grafana dark)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -478,11 +504,13 @@ class GCircleWidget(QWidget):
         super().__init__(parent)
         self._gx = 0.0   # lateral
         self._gy = 0.0   # longitudinal
+        self._trail = deque(maxlen=15)
         self.setMinimumSize(160, 160)
 
     def set_g_force(self, g_long: float, g_lat: float) -> None:
         self._gx = g_lat
         self._gy = g_long
+        self._trail.append((g_lat, g_long))
         self.update()
 
     def paintEvent(self, _ev):
@@ -509,7 +537,22 @@ class GCircleWidget(QWidget):
         p.drawLine(cx - r, cy, cx + r, cy)
         p.drawLine(cx, cy - r, cx, cy + r)
 
-        # G-dot
+        # G-Force vector trails
+        num_points = len(self._trail)
+        for idx, (gx, gy) in enumerate(self._trail):
+            nx = max(-1.0, min(1.0, gx / self.MAX_G))
+            ny = max(-1.0, min(1.0, gy / self.MAX_G))
+            tx = int(cx + nx * r)
+            ty = int(cy - ny * r)
+            
+            # Fading opacity and size for trailing path
+            alpha = int(((idx + 1) / (num_points + 1)) * 140)
+            dot_size = max(2, int(8 * ((idx + 1) / (num_points + 1))))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(239, 68, 68, alpha)))  # Red trail
+            p.drawEllipse(tx - dot_size // 2, ty - dot_size // 2, dot_size, dot_size)
+
+        # Main active G-dot
         nx = max(-1.0, min(1.0, self._gx / self.MAX_G))
         ny = max(-1.0, min(1.0, self._gy / self.MAX_G))
         dot_x = int(cx + nx * r)
@@ -1918,13 +1961,20 @@ class MainWindow(QMainWindow):
         # Signal-strength bar widget + percentage label
         self._signal_bars   = SignalBarsWidget()
         self._lbl_lqi       = QLabel("100%")
+        
+        # Live decoded fault label
+        self._lbl_inv_errors = QLabel("")
+        self._lbl_inv_errors.setStyleSheet("color:#ff3333; font-size:10px; font-weight:bold;")
+        self._lbl_inv_errors.hide()
+
         for l in (self._ind_precharge, self._ind_inv_ok, self._ind_ams):
             l.setStyleSheet("color:#333; font-size:10px; font-weight:bold;")
         for l in (self._lbl_seq, self._lbl_tick):
             l.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
         self._lbl_lqi.setStyleSheet("color:#00c853; font-size:9px; font-family:'Courier New';")
         for w2 in (self._ind_precharge, self._ind_inv_ok, self._ind_ams,
-                   self._lbl_seq, self._lbl_tick, self._signal_bars, self._lbl_lqi):
+                   self._lbl_seq, self._lbl_tick, self._signal_bars, self._lbl_lqi,
+                   self._lbl_inv_errors):
             ir.addWidget(w2)
         ir.addStretch()
         v.addLayout(ir, stretch=1)
@@ -2072,9 +2122,10 @@ class MainWindow(QMainWindow):
 
     # ── Log strip ─────────────────────────────────────────────────────────────
     def _make_log_strip(self) -> QGroupBox:
-        box = QGroupBox("SYSTEM LOG")
+        box = QGroupBox("SYSTEM LOG & PIT-WALL NOTES")
         box.setStyleSheet(f"QGroupBox {{ color:{ISC_GREEN}; border:1px solid #222; }}")
-        v = QVBoxLayout(box); v.setContentsMargins(4, 4, 4, 4)
+        v = QVBoxLayout(box); v.setContentsMargins(6, 6, 6, 6)
+        
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumHeight(80)
@@ -2082,6 +2133,24 @@ class MainWindow(QMainWindow):
             f"background:{F1_DARK_BG}; color:{F1_TEXT}; "
             f"font-family:'Courier New'; font-size:9px; border:none;")
         v.addWidget(self._log)
+        
+        # Pit-Wall Notes Entry Row
+        nh = QHBoxLayout()
+        nh.setSpacing(6)
+        
+        self._inp_note = QLineEdit()
+        self._inp_note.setPlaceholderText("Escriba una nota de telemetría (ej. 'Cambio de neumáticos') y pulse Enter para guardar...")
+        self._inp_note.setStyleSheet(self.get_input_style())
+        self._inp_note.returnPressed.connect(self._submit_note)
+        nh.addWidget(self._inp_note, stretch=8)
+        
+        self._btn_add_note = QPushButton("Add Note")
+        self._btn_add_note.setStyleSheet(self.get_button_style())
+        self._btn_add_note.setFixedWidth(100)
+        self._btn_add_note.clicked.connect(self._submit_note)
+        nh.addWidget(self._btn_add_note)
+        
+        v.addLayout(nh)
         return box
 
     # ── Data access ───────────────────────────────────────────────────────────
@@ -2222,6 +2291,16 @@ class MainWindow(QMainWindow):
         _ind(self._ind_precharge, "PRECHARGE OK", bool(pre))
         _ind(self._ind_inv_ok,    "INV OK",       ierr == 0 and istate > 0)
         _ind(self._ind_ams,       f"AMS {ams}",   ams > 0)
+
+        # Inverter fault decoder
+        if ierr > 0:
+            err_descs = decode_inverter_errors(ierr)
+            self._lbl_inv_errors.setText("❌ FAULTS: " + " | ".join(err_descs))
+            self._lbl_inv_errors.show()
+        else:
+            self._lbl_inv_errors.setText("")
+            self._lbl_inv_errors.hide()
+
         self._lbl_seq.setText(f"SEQ: {seq}")
         self._lbl_tick.setText(f"TICK: {tick} ms")
         lqi = rtt.get_latest_data().get('lqi', 100.0)
@@ -2466,9 +2545,6 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_speak, daemon=True).start()
 
     def _process_tts_alerts(self, alerts: List[tuple]):
-        if not self.settings.get("enable_tts", True):
-            return
-            
         if not hasattr(self, '_spoken_alerts_timestamps'):
             self._spoken_alerts_timestamps = {}
         
@@ -2488,18 +2564,24 @@ class MainWindow(QMainWindow):
             elif "USB DISCONNECTED" in alert_text:
                 alert_key = "USB_DISCONNECT_ALERT"
 
-            # Speak at most once every 20 seconds per warning type
+            # Trigger warnings/beeps at most once every 20 seconds per warning type
             last_time = self._spoken_alerts_timestamps.get(alert_key, 0.0)
             if now - last_time > 20.0:
                 self._spoken_alerts_timestamps[alert_key] = now
-                friendly_text = alert_text
-                if "degC" in friendly_text:
-                    friendly_text = friendly_text.replace("degC", "degrees Celsius")
-                if "mV" in friendly_text:
-                    friendly_text = friendly_text.replace("mV", "millivolts")
-                if "V" in friendly_text:
-                    friendly_text = friendly_text.replace("V", "volts")
-                self._speak_alert(friendly_text)
+                
+                # 1. Play the loud audible beep alarm (independent of TTS settings)
+                self._play_alarm_sound(alert_key)
+                
+                # 2. Text-to-speech announcement (if enabled)
+                if self.settings.get("enable_tts", True):
+                    friendly_text = alert_text
+                    if "degC" in friendly_text:
+                        friendly_text = friendly_text.replace("degC", "degrees Celsius")
+                    if "mV" in friendly_text:
+                        friendly_text = friendly_text.replace("mV", "millivolts")
+                    if "V" in friendly_text:
+                        friendly_text = friendly_text.replace("V", "volts")
+                    self._speak_alert(friendly_text)
 
     def closeEvent(self, ev):
         if self.is_receiving:
@@ -2587,6 +2669,64 @@ class MainWindow(QMainWindow):
                 _restyle(child)
                 
         _restyle(self)
+
+    def _submit_note(self):
+        text = self._inp_note.text().strip()
+        if not text:
+            return
+        
+        self._inp_note.clear()
+        self._log_append(f"🗒️ NOTE: {text}")
+        
+        import ISC_RTT_serial
+        import ISC_RTT_demo
+        written = False
+        
+        # Real-time Serial mode
+        if hasattr(ISC_RTT_serial, "_excel_logger") and ISC_RTT_serial._excel_logger is not None:
+            try:
+                ISC_RTT_serial._excel_logger.write_note(text)
+                written = True
+            except Exception as e:
+                logger.error(f"Failed writing real-time note: {e}")
+                
+        # Demo mode
+        if hasattr(ISC_RTT_demo, "_gen") and ISC_RTT_demo._gen is not None:
+            gen = ISC_RTT_demo._gen
+            if gen.running and gen.logger is not None:
+                try:
+                    gen.logger.write_note(text)
+                    written = True
+                except Exception as e:
+                    logger.error(f"Failed writing demo note: {e}")
+                    
+        if written:
+            self._log_append("✓ Note written to CSV log file.")
+        else:
+            self._log_append("⚠ Warning: No active logging session to save the note.")
+
+    def _play_alarm_sound(self, alert_key: str):
+        """Play distinct beep frequencies in a background thread to warn the engineer."""
+        import winsound
+        def _beep():
+            try:
+                if alert_key == "BATTERY_TEMP_ALERT":
+                    # High pitch fast warning beeps
+                    for _ in range(3):
+                        winsound.Beep(1800, 100)
+                        time.sleep(0.08)
+                elif alert_key in ("DC_BUS_ALERT", "MIN_CELL_ALERT"):
+                    # High-low alarm sirens
+                    winsound.Beep(1200, 180)
+                    winsound.Beep(900, 180)
+                elif alert_key in ("RADIO_SIGNAL_ALERT", "USB_DISCONNECT_ALERT", "RECEIVER_HW_ALERT"):
+                    # Low double beeps
+                    winsound.Beep(600, 120)
+                    time.sleep(0.05)
+                    winsound.Beep(450, 150)
+            except Exception as e:
+                logger.warning("[ALARM] Winsound beep failed: %s", e)
+        threading.Thread(target=_beep, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

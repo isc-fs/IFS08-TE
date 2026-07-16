@@ -199,6 +199,8 @@ class SerialCSVLogger:
         "imu_ax_g", "imu_ay_g", "imu_az_g",
         "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
         "imu_roll_deg", "imu_pitch_deg",
+        # ── Pit-Wall Notes ──────────────────────────────────────────────────
+        "notes",
     ]
 
     def __init__(self, bucket_id: str, piloto: str, circuito: str, flush_every: int = 50):
@@ -250,12 +252,25 @@ class SerialCSVLogger:
             s.get('imu_ax_g',            0.0), s.get('imu_ay_g',         0.0), s.get('imu_az_g',            0.0),
             s.get('imu_gx_dps',          0.0), s.get('imu_gy_dps',       0.0), s.get('imu_gz_dps',          0.0),
             s.get('imu_roll_deg',        0.0), s.get('imu_pitch_deg',    0.0),
+            "",  # Empty note for telemetry snapshots
         ]
 
         self.writer.writerow(row)
         self.record_count += 1
         if self.record_count % self.flush_every == 0:
             self.file.flush()
+
+    def write_note(self, text: str) -> None:
+        """Write a custom comment/note row into the CSV file."""
+        try:
+            current_ts = datetime.now().isoformat()
+            elapsed    = time.time() - self.start_time
+            # Create a row with timestamp and note, leaving all telemetry columns empty
+            row = [current_ts, f"{elapsed:.3f}"] + [""] * (len(self.HEADERS) - 3) + [text]
+            self.writer.writerow(row)
+            self.file.flush()
+        except Exception as e:
+            logger.error(f"Error writing note to CSV: {e}")
 
     def close(self) -> Optional[str]:
         if self.file:

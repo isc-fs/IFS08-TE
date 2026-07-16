@@ -249,16 +249,19 @@ class DemoCSVLogger:
         "imu_ax_g", "imu_ay_g", "imu_az_g",
         "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
         "imu_roll_deg", "imu_pitch_deg",
+        # ── Pit-Wall Notes ───────────────────────────────────────────────────
+        "notes",
     ]
 
     def __init__(self, piloto: str, circuito: str):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.piloto   = piloto
-        self.circuito = circuito
-        self.filename = LOG_DIR / f"ISC_DEMO_{ts}_{piloto}_{circuito}.csv"
-        self.file     = open(self.filename, "w", newline="")
-        self.writer   = csv.writer(self.file)
-        self.count    = 0
+        self.piloto     = piloto
+        self.circuito   = circuito
+        self.start_time = time.time()
+        self.filename   = LOG_DIR / f"ISC_DEMO_{ts}_{piloto}_{circuito}.csv"
+        self.file       = open(self.filename, "w", newline="")
+        self.writer     = csv.writer(self.file)
+        self.count      = 0
         self.writer.writerow(self.HEADERS)
         print(f"[DEMO] CSV: {self.filename}")
 
@@ -324,9 +327,21 @@ class DemoCSVLogger:
             snap.get('imu_gz_dps',     0.0),
             snap.get('imu_roll_deg',   0.0),
             snap.get('imu_pitch_deg',  0.0),
+            "",  # Empty note for telemetry snapshots
         ]
         self.writer.writerow(row)
         self.count += 1
+
+    def write_note(self, text: str) -> None:
+        """Write a custom comment/note row into the CSV file."""
+        try:
+            ts = datetime.now().isoformat()
+            elapsed = time.time() - self.start_time
+            row = [ts, f"{elapsed:.3f}"] + [""] * (len(self.HEADERS) - 3) + [text]
+            self.writer.writerow(row)
+            self.file.flush()
+        except Exception as e:
+            print(f"[DEMO] Error writing note to CSV: {e}")
 
         # Log to AMS SD file
         tick = snap.get("tick_ms", 0)
