@@ -433,7 +433,7 @@ class PedalWidget(QWidget):
 
         # Track
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor('#1e1e1e')))
+        p.setBrush(QBrush(QColor('#e0e0e0' if F1_TEXT == '#1a1a1a' else '#1e1e1e')))
         p.drawRoundedRect(bx, by, bw, bh, 4, 4)
 
         # Fill (bottom-up)
@@ -574,7 +574,7 @@ class ModuleBarWidget(QWidget):
 
         # Track
         p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor('#1e1e1e')))
+        p.setBrush(QBrush(QColor('#e0e0e0' if F1_TEXT == '#1a1a1a' else '#1e1e1e')))
         p.drawRoundedRect(bx, by, bw, bh, 3, 3)
 
         # Filled range
@@ -1472,6 +1472,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"ISCmetrics v{APP_VERSION} — Formula Student Telemetry")
         self.setGeometry(40, 40, 1600, 960)
+        self.theme_mode   = "dark"
 
         self.settings     = current_settings.copy()
         self._load_settings_from_file()
@@ -1761,8 +1762,9 @@ class MainWindow(QMainWindow):
     # ── Top bar ───────────────────────────────────────────────────────────────
     def _make_top_bar(self) -> QFrame:
         bar = QFrame()
+        self._top_bar = bar
         bar.setStyleSheet(f"QFrame {{ background:{F1_MID_BG}; border-radius:4px; }}")
-        bar.setFixedHeight(78)
+        bar.setFixedHeight(98)
         h = QHBoxLayout(bar)
         h.setSpacing(10)
         h.setContentsMargins(8, 5, 8, 5)
@@ -1841,6 +1843,12 @@ class MainWindow(QMainWindow):
         btn_post.setStyleSheet(self.get_button_style())
         btn_post.clicked.connect(self._open_post_race)
         bg.addWidget(btn_post, 1, 1)
+
+        self._btn_theme = QPushButton("☀️  Light" if self.theme_mode == "dark" else "🌙  Dark")
+        self._btn_theme.setStyleSheet(self.get_button_style())
+        self._btn_theme.clicked.connect(self._toggle_theme)
+        bg.addWidget(self._btn_theme, 2, 0, 1, 2)
+
         h.addLayout(bg)
         return bar
 
@@ -2497,6 +2505,88 @@ class MainWindow(QMainWindow):
         if self.is_receiving:
             self._stop(); time.sleep(0.3)
         ev.accept()
+
+    def _toggle_theme(self):
+        global F1_DARK_BG, F1_MID_BG, F1_PANEL_BG, F1_TEXT
+        if self.theme_mode == "dark":
+            self.theme_mode = "light"
+            F1_DARK_BG = '#f0f2f5'
+            F1_MID_BG = '#ffffff'
+            F1_PANEL_BG = '#f9f9fa'
+            F1_TEXT = '#1a1a1a'
+        else:
+            self.theme_mode = "dark"
+            F1_DARK_BG = '#111111'
+            F1_MID_BG = '#1a1a1a'
+            F1_PANEL_BG = '#222222'
+            F1_TEXT = '#e0e0e0'
+        
+        self._btn_theme.setText("☀️  Light" if self.theme_mode == "dark" else "🌙  Dark")
+        self._apply_theme_to_all()
+        self._log_append(f"[THEME] Switch to {self.theme_mode.upper()} mode.")
+
+    def _apply_theme_to_all(self):
+        # 1. Update the main window palette and stylesheet
+        self._apply_theme()
+        
+        # 2. Update top bar background and inputs
+        self._top_bar.setStyleSheet(f"QFrame {{ background:{F1_MID_BG}; border-radius:4px; }}")
+        ins = self.get_input_style()
+        self._inp_pilot.setStyleSheet(ins)
+        self._inp_circuit.setStyleSheet(ins)
+        
+        # 3. Recursively update all child widgets
+        def _restyle(w):
+            if isinstance(w, MetricCard):
+                w._value.setStyleSheet(f"color:{F1_TEXT}; font-size:19px; font-weight:bold; background:transparent; border:none;")
+                col = F1_ERROR if w._alerting else w._color
+                w._set_border(col)
+                w._title.setStyleSheet(f"color:{col}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+                w.update()
+                
+            elif isinstance(w, MetricPanel):
+                w._title_lbl.setStyleSheet(f"color:#444; font-size:9px; background:transparent; border:none;")
+                w._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
+                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; }}")
+                w._ax.set_facecolor(F1_PANEL_BG)
+                w._fig.patch.set_facecolor(F1_PANEL_BG)
+                w._ax.spines['bottom'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
+                w._ax.spines['left'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
+                w._ax.tick_params(colors='#1a1a1a' if F1_TEXT == '#1a1a1a' else '#e0e0e0')
+                w._canvas.draw_idle()
+                
+            elif isinstance(w, QTextEdit):
+                w.setStyleSheet(f"background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; font-family:'Courier New'; font-size:9px;")
+                
+            elif isinstance(w, QComboBox) or isinstance(w, QLineEdit):
+                w.setStyleSheet(self.get_input_style())
+                
+            elif isinstance(w, AlertBanner):
+                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px dashed #333; border-radius:4px; }}")
+                
+            elif isinstance(w, GCircleWidget):
+                w.update()
+                
+            elif isinstance(w, PedalWidget):
+                w.update()
+                
+            elif isinstance(w, RPMGauge):
+                w.update()
+                
+            elif isinstance(w, ModuleBarWidget):
+                w.update()
+                
+            # Restyle buttons
+            elif isinstance(w, QPushButton):
+                if w == self._btn_start:
+                    w.setStyleSheet(self.get_button_style('accent'))
+                else:
+                    w.setStyleSheet(self.get_button_style())
+                    
+            for child in w.findChildren(QWidget):
+                _restyle(child)
+                
+        _restyle(self)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
