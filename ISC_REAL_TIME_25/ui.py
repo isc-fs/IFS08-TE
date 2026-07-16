@@ -201,6 +201,7 @@ current_settings: dict = {
 # ══════════════════════════════════════════════════════════════════════════════
 class Signaler(QObject):
     log_message = pyqtSignal(str)
+    update_detected = pyqtSignal(str)
 
 signaler = Signaler()
 
@@ -1492,6 +1493,7 @@ class MainWindow(QMainWindow):
         self._timer.start(400)
 
         signaler.log_message.connect(self._log_append)
+        signaler.update_detected.connect(self._show_update_banner)
         self._log_append(f"ISCmetrics v{APP_VERSION} ready.")
 
         # Kick off a background update check (non-blocking)
@@ -1521,8 +1523,8 @@ class MainWindow(QMainWindow):
                 
             logger.info("[UPDATE] Latest version: %s (Current version: %s)", tag, APP_VERSION)
             if _ver_tuple(tag) > _ver_tuple(APP_VERSION):
-                # Schedule banner on the main Qt thread via a one-shot timer
-                QTimer.singleShot(0, lambda: self._show_update_banner(tag))
+                # Emit signal to thread-safely show the banner on the main GUI thread
+                signaler.update_detected.emit(tag)
         except Exception as e:
             logger.warning("[UPDATE] Check failed with exception: %s", e)
 
