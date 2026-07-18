@@ -18,6 +18,18 @@ try:
     _REQUESTS_OK = True
 except ImportError:
     _REQUESTS_OK = False
+
+_CAN_OK = False
+try:
+    import can
+    _CAN_OK = True
+except ImportError:
+    pass
+
+import struct
+import zlib
+import csv
+import io
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +40,7 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 
 from PyQt5.QtCore import (
-    QTimer, Qt, QMimeData, QObject, pyqtSignal, QPoint
+    QTimer, Qt, QMimeData, QObject, pyqtSignal, QPoint, QThread
 )
 from PyQt5.QtGui import (
     QFont, QPalette, QColor, QPixmap, QIcon,
@@ -38,7 +50,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QWidget, QLabel, QPushButton, QLineEdit, QComboBox, QTextEdit,
     QMessageBox, QTabWidget, QFrame, QGroupBox, QCheckBox,
-    QListWidget, QListWidgetItem, QDialog, QSizePolicy, QInputDialog
+    QListWidget, QListWidgetItem, QDialog, QSizePolicy, QInputDialog,
+    QProgressBar, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -1779,6 +1792,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._tab_customize(),  "Customize")
         self._tabs.addTab(self._tab_powertrain(), "Powertrain")
         self._tabs.addTab(self._tab_dynamics(),   "Dynamics")
+        self._tabs.addTab(self._tab_post_race(),  "Post-Race")
         vbox.addWidget(self._tabs, stretch=10)
 
         vbox.addWidget(self._make_log_strip(), stretch=1)
@@ -2146,6 +2160,12 @@ class MainWindow(QMainWindow):
 
     # ── Alert checking ────────────────────────────────────────────────────────
     def _check_alerts(self, s: dict) -> None:
+        if not (self.is_receiving or self.demo_mode):
+            self._alert_banner.set_alerts([])
+            self._ov_temp.set_alert(False)
+            self._ov_vbus.set_alert(False)
+            self._ov_vcell.set_alert(False)
+            return
         alerts = []
 
         # Check receiver hardware/signal status from serial module
@@ -2289,7 +2309,10 @@ class MainWindow(QMainWindow):
 
         self._lbl_seq.setText(f"SEQ: {seq}")
         self._lbl_tick.setText(f"TICK: {tick} ms")
-        lqi = rtt.get_latest_data().get('lqi', 100.0)
+        if not (self.is_receiving or self.demo_mode):
+            lqi = 0.0
+        else:
+            lqi = rtt.get_latest_data().get('lqi', 100.0)
         self._signal_bars.set_lqi(lqi)
         self._lbl_lqi.setText(f"{lqi:.0f}%")
         if lqi >= 85:
@@ -2713,6 +2736,808 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning("[ALARM] Winsound beep failed: %s", e)
         threading.Thread(target=_beep, daemon=True).start()
+
+    def _tab_post_race(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w); h.setSpacing(8); h.setContentsMargins(8,8,8,8)
+
+        # Left Column: Connection & Status
+        lv = QVBoxLayout()
+        
+        # Connection Group Box
+        conn_box = QGroupBox("CAN CONNECTION SETTINGS")
+        conn_box.setStyleSheet(f"QGroupBox {{ color:{ISC_GREEN}; font-weight:bold; }}")
+        cv = QVBoxLayout(conn_box); cv.setSpacing(6)
+        
+        cv.addWidget(self._lbl("CAN Interface:", "color:#888; font-size:10px;"))
+        self._pr_interface = QComboBox()
+        self._pr_interface.addItems(["pcan", "slcan", "vector", "socketcan", "virtual"])
+        self._pr_interface.setStyleSheet(self.get_input_style())
+        cv.addWidget(self._pr_interface)
+        
+        cv.addWidget(self._lbl("CAN Channel:", "color:#888; font-size:10px;"))
+        self._pr_channel = QLineEdit("PCAN_USBBUS1")
+        self._pr_channel.setStyleSheet(self.get_input_style())
+        cv.addWidget(self._pr_channel)
+        
+        cv.addWidget(self._lbl("Bitrate (bps):", "color:#888; font-size:10px;"))
+        self._pr_bitrate = QComboBox()
+        self._pr_bitrate.addItems(["500000", "250000", "1000000", "125000"])
+        self._pr_bitrate.setStyleSheet(self.get_input_style())
+        cv.addWidget(self._pr_bitrate)
+        
+        cv.addWidget(self._lbl("AMS Node ID (dec):", "color:#888; font-size:10px;"))
+        self._pr_node_id = QLineEdit("2")
+        self._pr_node_id.setStyleSheet(self.get_input_style())
+        cv.addWidget(self._pr_node_id)
+        
+        # Virtual Simulator Checkbox
+        self._pr_use_sim = QCheckBox("Enable Virtual Loopback Simulator")
+        self._pr_use_sim.setStyleSheet("color:#aaa; font-size:10px;")
+        self._pr_use_sim.toggled.connect(self._toggle_sim_mode)
+        cv.addWidget(self._pr_use_sim)
+        
+        self._pr_btn_connect = QPushButton("Connect to CAN")
+        self._pr_btn_connect.setStyleSheet(self.get_button_style())
+        self._pr_btn_connect.clicked.connect(self._on_post_race_connect)
+        cv.addWidget(self._pr_btn_connect)
+        
+        lv.addWidget(conn_box)
+        
+        # Status Box
+        status_box = QGroupBox("EXTRACTION STATUS")
+        status_box.setStyleSheet(f"QGroupBox {{ color:{ISC_GREEN}; font-weight:bold; }}")
+        sv = QVBoxLayout(status_box); sv.setSpacing(6)
+        
+        self._pr_lbl_status = QLabel("Disconnected")
+        self._pr_lbl_status.setStyleSheet("color:#aaa; font-size:11px; font-family:'Courier New';")
+        sv.addWidget(self._pr_lbl_status)
+        
+        # Progress Bar
+        self._pr_progress = QProgressBar()
+        self._pr_progress.setValue(0)
+        self._pr_progress.setStyleSheet(f"""
+            QProgressBar {{ background:{F1_DARK_BG}; border:1px solid #333; border-radius:3px; text-align:center; color:#fff; }}
+            QProgressBar::chunk {{ background:{ISC_GREEN}; }}
+        """)
+        sv.addWidget(self._pr_progress)
+        
+        lv.addWidget(status_box)
+        lv.addStretch()
+        
+        lw = QWidget(); lw.setLayout(lv); lw.setFixedWidth(220)
+        h.addWidget(lw)
+
+        # Right Column: Files list
+        rv = QVBoxLayout()
+        rv.addWidget(self._lbl("MicroSD Card File Log Directory", f"color:{ISC_GREEN}; font-size:12px; font-weight:bold;"))
+        
+        self._pr_table = QTableWidget(0, 4)
+        self._pr_table.setHorizontalHeaderLabels(["Index", "File Name", "Size (bytes)", "Action"])
+        self._pr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._pr_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._pr_table.setStyleSheet(f"""
+            QTableWidget {{ background:{F1_DARK_BG}; color:#fff; gridline-color:#222; border:1px solid #222; }}
+            QHeaderView::section {{ background:{F1_MID_BG}; color:{ISC_GREEN}; padding:4px; border:1px solid #222; }}
+        """)
+        self._pr_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        rv.addWidget(self._pr_table)
+        
+        self._pr_btn_refresh = QPushButton("Refresh File Directory")
+        self._pr_btn_refresh.setStyleSheet(self.get_button_style())
+        self._pr_btn_refresh.clicked.connect(self._on_post_race_refresh)
+        self._pr_btn_refresh.setEnabled(False)
+        rv.addWidget(self._pr_btn_refresh)
+        
+        rw = QWidget(); rw.setLayout(rv)
+        h.addWidget(rw)
+        
+        return w
+
+    def _toggle_sim_mode(self, enabled):
+        if enabled:
+            self._pr_interface.setCurrentText("virtual")
+            self._pr_channel.setText("test_channel")
+            self._pr_interface.setEnabled(False)
+            self._pr_channel.setEnabled(False)
+        else:
+            self._pr_interface.setEnabled(True)
+            self._pr_channel.setEnabled(True)
+            self._pr_interface.setCurrentText("pcan")
+            self._pr_channel.setText("PCAN_USBBUS1")
+
+    def _on_post_race_connect(self):
+        if not _CAN_OK:
+            QMessageBox.critical(self, "CAN Error", "python-can library is not installed or import failed.")
+            return
+            
+        if hasattr(self, "_pr_is_connected") and self._pr_is_connected:
+            # Disconnect
+            if hasattr(self, "_sim_thread") and self._sim_thread is not None:
+                self._sim_thread.running = False
+                self._sim_thread.wait()
+                self._sim_thread = None
+                
+            self._pr_is_connected = False
+            self._pr_btn_connect.setText("Connect to CAN")
+            self._pr_btn_refresh.setEnabled(False)
+            self._pr_lbl_status.setText("Disconnected")
+            self._pr_table.setRowCount(0)
+            return
+            
+        # Start connection process
+        interface = self._pr_interface.currentText()
+        channel = self._pr_channel.text()
+        bitrate = int(self._pr_bitrate.currentText())
+        try:
+            node_id = int(self._pr_node_id.text())
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "AMS Node ID must be an integer.")
+            return
+            
+        if self._pr_use_sim.isChecked():
+            # Start loopback simulator
+            self._sim_thread = AMSSimulatorThread(channel=channel)
+            self._sim_thread.start()
+            
+        self._pr_lbl_status.setText("Connecting...")
+        
+        # Start extraction list thread
+        self._pr_thread = AMSExtractionThread(
+            interface=interface,
+            channel=channel,
+            bitrate=bitrate,
+            ams_node_id=node_id,
+            action="list"
+        )
+        self._pr_thread.files_listed.connect(self._on_extraction_files_listed)
+        self._pr_thread.finished.connect(self._on_extraction_finished)
+        self._pr_thread.status.connect(self._on_extraction_status)
+        self._pr_thread.start()
+
+    def _on_post_race_refresh(self):
+        if not hasattr(self, "_pr_is_connected") or not self._pr_is_connected:
+            return
+        interface = self._pr_interface.currentText()
+        channel = self._pr_channel.text()
+        bitrate = int(self._pr_bitrate.currentText())
+        node_id = int(self._pr_node_id.text())
+        
+        self._pr_lbl_status.setText("Refreshing directory...")
+        self._pr_thread = AMSExtractionThread(
+            interface=interface,
+            channel=channel,
+            bitrate=bitrate,
+            ams_node_id=node_id,
+            action="list"
+        )
+        self._pr_thread.files_listed.connect(self._on_extraction_files_listed)
+        self._pr_thread.finished.connect(self._on_extraction_finished)
+        self._pr_thread.status.connect(self._on_extraction_status)
+        self._pr_thread.start()
+
+    def _on_extraction_files_listed(self, files):
+        self._pr_is_connected = True
+        self._pr_btn_connect.setText("Disconnect")
+        self._pr_btn_refresh.setEnabled(True)
+        self._pr_table.setRowCount(0)
+        
+        for file in files:
+            row = self._pr_table.rowCount()
+            self._pr_table.insertRow(row)
+            
+            # File Index
+            idx_item = QTableWidgetItem(str(file["index"]))
+            idx_item.setTextAlignment(Qt.AlignCenter)
+            self._pr_table.setItem(row, 0, idx_item)
+            
+            # File Name
+            name_item = QTableWidgetItem(file["name"])
+            name_item.setTextAlignment(Qt.AlignCenter)
+            self._pr_table.setItem(row, 1, name_item)
+            
+            # File Size
+            size_item = QTableWidgetItem(f"{file['size']:,}")
+            size_item.setTextAlignment(Qt.AlignCenter)
+            self._pr_table.setItem(row, 2, size_item)
+            
+            # Action Download Button
+            btn = QPushButton("Download")
+            btn.setStyleSheet(self.get_button_style())
+            file_idx = file["index"]
+            file_name = file["name"]
+            btn.clicked.connect(lambda checked=False, f_idx=file_idx, f_name=file_name: self._start_file_download(f_idx, f_name))
+            self._pr_table.setCellWidget(row, 3, btn)
+            
+        self._pr_lbl_status.setText(f"Connected. Found {len(files)} logs.")
+
+    def _start_file_download(self, file_idx, file_name):
+        interface = self._pr_interface.currentText()
+        channel = self._pr_channel.text()
+        bitrate = int(self._pr_bitrate.currentText())
+        node_id = int(self._pr_node_id.text())
+        
+        self._pr_lbl_status.setText(f"Starting download of {file_name}...")
+        self._pr_progress.setValue(0)
+        
+        self._pr_thread = AMSExtractionThread(
+            interface=interface,
+            channel=channel,
+            bitrate=bitrate,
+            ams_node_id=node_id,
+            action="download",
+            selected_file_index=file_idx,
+            selected_file_name=file_name
+        )
+        self._pr_thread.progress.connect(self._on_extraction_progress)
+        self._pr_thread.status.connect(self._on_extraction_status)
+        self._pr_thread.finished.connect(self._on_extraction_finished)
+        self._pr_thread.start()
+
+    def _on_extraction_progress(self, downloaded, total, speed):
+        pct = int(downloaded / total * 100) if total > 0 else 0
+        self._pr_progress.setValue(pct)
+        self._pr_lbl_status.setText(f"Downloading: {pct}% ({downloaded:,}/{total:,} B) - {speed:.1f} KB/s")
+
+    def _on_extraction_status(self, text):
+        self._pr_lbl_status.setText(text)
+
+    def _on_extraction_finished(self, success, result):
+        if success:
+            self._pr_progress.setValue(100)
+            self._pr_lbl_status.setText(f"Success! Saved to {Path(result).name}")
+            QMessageBox.information(self, "Extraction Complete", f"File downloaded and converted successfully:\n{result}")
+        else:
+            self._pr_lbl_status.setText(f"Error: {result}")
+            QMessageBox.critical(self, "Extraction Error", f"Extraction failed:\n{result}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CAN LOG EXTRACTION MODULE (LOGFS PROTOCOL CLIENT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def convert_card_csv_to_telemetry_csv(input_bytes: bytes, output_path: Path):
+    import csv
+    import io
+    from datetime import datetime
+    
+    text = input_bytes.decode('utf-8', errors='ignore')
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise Exception("Log file is empty or invalid CSV.")
+    
+    header = [name.strip() for name in rows[0]]
+    col_map = {name: idx for idx, name in enumerate(header)}
+    
+    headers = [
+        "time", "time_elapsed_s", "seq", "tick_ms", "start_button",
+        "apps1_raw", "apps2_raw", "brake_raw", "torque_pct", "ev_2_3",
+        "t11_8_9", "ctrl_state", "ok_precharge", "ams_fsm_state",
+        "v_cell_min_mV", "soc",
+        "vmin_mod0", "vmin_mod1", "vmin_mod2", "vmin_mod3", "vmin_mod4",
+        "vmax_mod0", "vmax_mod1", "vmax_mod2", "vmax_mod3", "vmax_mod4",
+        "corriente_accu", "corriente_dcdc", "temp_dcdc",
+        "tmax_mod0", "tmax_mod1", "tmax_mod2", "tmax_mod3", "tmax_mod4",
+        "inv_state", "inv_vconfig_active", "inv_error", "inv_dc_bus_V",
+        "inv_temp_motor1", "inv_temp_pwrstg", "inv_temp_board",
+        "inv_rpm", "inv_speed_actual", "inv_current_actual",
+        "imu_ax_g", "imu_ay_g", "imu_az_g", "imu_gx_dps", "imu_gy_dps",
+        "imu_gz_dps", "imu_roll_deg", "imu_pitch_deg", "notes"
+    ]
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        
+        start_tick = None
+        for i, row in enumerate(rows[1:]):
+            if not row or len(row) < len(col_map):
+                continue
+            
+            def get_val(col_name, default=0.0):
+                idx = col_map.get(col_name)
+                if idx is not None and idx < len(row):
+                    try:
+                        return float(row[idx])
+                    except ValueError:
+                        return default
+                return default
+
+            tick_ms = get_val("tick_ms")
+            if start_tick is None:
+                start_tick = tick_ms
+            elapsed = (tick_ms - start_tick) / 1000.0
+            
+            vmin = [0.0] * 5
+            vmax = [0.0] * 5
+            tmax = [0.0] * 5
+            
+            for m in range(5):
+                m_cells = []
+                for c in range(19):
+                    val = get_val(f"c{m}_{c}", None)
+                    if val is not None:
+                        m_cells.append(val)
+                if m_cells:
+                    vmin[m] = min(m_cells)
+                    vmax[m] = max(m_cells)
+                
+                m_temps = []
+                for t in range(40):
+                    val = get_val(f"t{m}_{t}", None)
+                    if val is not None:
+                        m_temps.append(val)
+                if m_temps:
+                    tmax[m] = max(m_temps)
+            
+            vmin_global = get_val("vmin_mV", 0.0)
+            soc_val = soc_from_cell_mv(vmin_global) if vmin_global > 0 else get_val("soc", 0.0)
+            
+            pack_current_mA = get_val("I_filt_mA", 0.0)
+            corriente_accu = pack_current_mA / 100.0
+            
+            dcdc_current_mA = get_val("Idcdc_mA", 0.0)
+            corriente_dcdc = dcdc_current_mA / 100.0
+            
+            out_row = [
+                datetime.now().isoformat(),
+                f"{elapsed:.3f}",
+                i,
+                int(tick_ms),
+                0,
+                0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                int(get_val("ams_ok", 0)),
+                int(get_val("fsm", 0)),
+                int(vmin_global),
+                f"{soc_val:.1f}",
+                vmin[0], vmin[1], vmin[2], vmin[3], vmin[4],
+                vmax[0], vmax[1], vmax[2], vmax[3], vmax[4],
+                f"{corriente_accu:.1f}",
+                f"{corriente_dcdc:.1f}",
+                0,
+                tmax[0], tmax[1], tmax[2], tmax[3], tmax[4],
+                0, 0, 0,
+                int(get_val("dcbus_V", 0)),
+                0, 0, 0,
+                0, 0, 0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0,
+                0.0, 0.0,
+                ""
+            ]
+            writer.writerow(out_row)
+
+
+class AMSExtractionThread(QThread):
+    progress = pyqtSignal(int, int, float)
+    status = pyqtSignal(str)
+    files_listed = pyqtSignal(list)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, interface, channel, bitrate, ams_node_id=2, action="list", selected_file_index=None, selected_file_name=None):
+        super().__init__()
+        self.interface = interface
+        self.channel = channel
+        self.bitrate = bitrate
+        self.ams_node_id = ams_node_id
+        self.action = action
+        self.selected_file_index = selected_file_index
+        self.selected_file_name = selected_file_name
+
+    def run(self):
+        if not _CAN_OK:
+            self.finished.emit(False, "python-can library is not installed.")
+            return
+            
+        bus = None
+        try:
+            self.status.emit("Opening CAN bus...")
+            bus = can.Bus(interface=self.interface, channel=self.channel, bitrate=self.bitrate)
+            
+            rx_id = 0x010 + self.ams_node_id
+            tx_id = 0x000 + self.ams_node_id
+            
+            self.status.emit("Establishing diagnostic session (CONNECT)...")
+            self.isotp_send(bus, tx_id, [0x00, 0x01])
+            resp = self.isotp_recv(bus, rx_id)
+            if not resp or resp[0] != 0x01 or resp[1] != 0x01:
+                raise Exception("Failed to connect to AMS diagnostic service.")
+                
+            if self.action == "list":
+                self.status.emit("Fetching file directory list...")
+                self.isotp_send(bus, tx_id, [0x00, 0x21, 0x00, 0x00])
+                resp = self.isotp_recv(bus, rx_id)
+                if not resp:
+                    raise Exception("No response to file listing request.")
+                if resp[0] == 0x02:
+                    raise Exception(f"LOGFS_LIST NACK received: code {resp[2] if len(resp) > 2 else 0}")
+                if resp[0] != 0x01 or resp[1] != 0x21:
+                    raise Exception("Invalid response to file listing request.")
+                    
+                next_cursor = struct.unpack("<H", resp[2:4])[0]
+                count = resp[4]
+                offset = 5
+                entries = []
+                
+                rem_len = len(resp) - offset
+                entry_size = 22
+                if count > 0:
+                    entry_size = rem_len // count
+                    
+                for _ in range(count):
+                    if offset + entry_size > len(resp):
+                        break
+                    entry_bytes = resp[offset : offset + entry_size]
+                    index = struct.unpack("<H", entry_bytes[0:2])[0]
+                    if entry_size >= 24:
+                        size = struct.unpack("<I", entry_bytes[4:8])[0]
+                        mtime = struct.unpack("<I", entry_bytes[8:12])[0]
+                        name_bytes = entry_bytes[12:24]
+                    else:
+                        size = struct.unpack("<I", entry_bytes[2:6])[0]
+                        mtime = struct.unpack("<I", entry_bytes[6:10])[0]
+                        name_bytes = entry_bytes[10:22]
+                    name = name_bytes.decode('utf-8', errors='ignore').split('\x00', 1)[0].strip()
+                    entries.append({
+                        "index": index,
+                        "size": size,
+                        "mtime": mtime,
+                        "name": name
+                    })
+                    offset += entry_size
+                
+                self.isotp_send(bus, tx_id, [0x00, 0x02])
+                self.isotp_recv(bus, rx_id)
+                
+                self.files_listed.emit(entries)
+                self.finished.emit(True, "Files listed successfully.")
+                
+            elif self.action == "download":
+                if self.selected_file_index is None:
+                    raise Exception("No file selected for download.")
+                
+                self.status.emit(f"Opening file index {self.selected_file_index}...")
+                self.isotp_send(bus, tx_id, struct.pack("<BBH", 0x00, 0x22, self.selected_file_index))
+                resp = self.isotp_recv(bus, rx_id)
+                if not resp or resp[0] != 0x01 or resp[1] != 0x22:
+                    if resp and resp[0] == 0x02:
+                        raise Exception(f"LOGFS_OPEN NACK received: code {resp[2] if len(resp) > 2 else 0}")
+                    raise Exception("Failed to open file on microSD card.")
+                    
+                handle = resp[2]
+                file_size = struct.unpack("<I", resp[3:7])[0]
+                expected_crc = struct.unpack("<I", resp[7:11])[0]
+                
+                self.status.emit(f"Downloading file content ({file_size:,} bytes)...")
+                file_bytes = bytearray()
+                offset = 0
+                block_size = 256
+                
+                start_time = time.time()
+                
+                while offset < file_size:
+                    req_payload = struct.pack("<BBBIH", 0x00, 0x23, handle, offset, block_size)
+                    self.isotp_send(bus, tx_id, req_payload)
+                    resp = self.isotp_recv(bus, rx_id)
+                    
+                    if not resp or resp[0] != 0x01 or resp[1] != 0x23:
+                        if resp and resp[0] == 0x02:
+                            raise Exception(f"LOGFS_READ NACK: code {resp[2] if len(resp) > 2 else 0}")
+                        raise Exception("Failed to read file block from CAN.")
+                        
+                    chunk = resp[2:]
+                    if not chunk:
+                        break
+                        
+                    file_bytes.extend(chunk)
+                    offset += len(chunk)
+                    
+                    elapsed = time.time() - start_time
+                    speed = (offset / 1024.0) / elapsed if elapsed > 0 else 0.0
+                    self.progress.emit(offset, file_size, speed)
+                    
+                self.isotp_send(bus, tx_id, [0x00, 0x25, handle])
+                self.isotp_recv(bus, rx_id)
+                
+                self.isotp_send(bus, tx_id, [0x00, 0x02])
+                self.isotp_recv(bus, rx_id)
+                
+                self.status.emit("Verifying file integrity...")
+                actual_crc = zlib.crc32(file_bytes)
+                if expected_crc != 0 and actual_crc != expected_crc:
+                    raise Exception(f"File integrity check failed! Expected CRC {expected_crc:08X}, got {actual_crc:08X}")
+                
+                self.status.emit("Converting data to telemetry CSV...")
+                logs_dir = Path("logs")
+                logs_dir.mkdir(exist_ok=True)
+                out_path = logs_dir / f"extracted_{self.selected_file_name or 'LOG.CSV'}"
+                
+                convert_card_csv_to_telemetry_csv(file_bytes, out_path)
+                self.finished.emit(True, str(out_path.resolve()))
+                
+        except Exception as e:
+            self.finished.emit(False, str(e))
+        finally:
+            if bus:
+                try:
+                    bus.shutdown()
+                except Exception:
+                    pass
+
+    def isotp_send(self, bus, tx_id, payload):
+        payload = bytes(payload)
+        if len(payload) <= 7:
+            data = bytearray(8)
+            data[0] = len(payload) & 0x0F
+            data[1:1+len(payload)] = payload
+            for idx in range(1+len(payload), 8):
+                data[idx] = 0xAA
+            msg = can.Message(arbitration_id=tx_id, data=data, is_extended_id=False)
+            bus.send(msg)
+        else:
+            data = bytearray(8)
+            data[0] = 0x10 | ((len(payload) >> 8) & 0x0F)
+            data[1] = len(payload) & 0xFF
+            data[2:8] = payload[0:6]
+            msg = can.Message(arbitration_id=tx_id, data=data, is_extended_id=False)
+            bus.send(msg)
+            
+            fc_received = False
+            rx_id = tx_id | 0x010
+            start_t = time.time()
+            while time.time() - start_t < 2.0:
+                rx_msg = bus.recv(timeout=0.1)
+                if rx_msg and rx_msg.arbitration_id == rx_id:
+                    if (rx_msg.data[0] & 0xF0) == 0x30:
+                        flow_status = rx_msg.data[0] & 0x0F
+                        if flow_status == 0:
+                            fc_received = True
+                            break
+                        elif flow_status == 2:
+                            raise Exception("ISO-TP Overflow received")
+            if not fc_received:
+                raise Exception("Timeout waiting for ISO-TP Flow Control frame")
+                
+            seq = 1
+            offset = 6
+            while offset < len(payload):
+                chunk = payload[offset : offset + 7]
+                cf_data = bytearray(8)
+                cf_data[0] = 0x20 | (seq & 0x0F)
+                cf_data[1:1+len(chunk)] = chunk
+                for idx in range(1+len(chunk), 8):
+                    cf_data[idx] = 0xAA
+                msg = can.Message(arbitration_id=tx_id, data=cf_data, is_extended_id=False)
+                bus.send(msg)
+                seq = (seq + 1) % 16
+                offset += len(chunk)
+                time.sleep(0.002)
+
+    def isotp_recv(self, bus, rx_id, timeout=2.5):
+        tx_id = rx_id & 0x00F
+        start_t = time.time()
+        buffer = bytearray()
+        total_len = 0
+        seq = 1
+        
+        while time.time() - start_t < timeout:
+            msg = bus.recv(timeout=0.1)
+            if not msg or msg.arbitration_id != rx_id:
+                continue
+                
+            pci = msg.data[0]
+            frame_type = pci & 0xF0
+            
+            if frame_type == 0x00 or pci <= 0x07:
+                length = pci & 0x0F
+                return bytes(msg.data[1:1+length])
+                
+            elif frame_type == 0x10:
+                total_len = ((pci & 0x0F) << 8) | msg.data[1]
+                buffer.extend(msg.data[2:8])
+                fc_data = [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+                fc_msg = can.Message(arbitration_id=tx_id, data=fc_data, is_extended_id=False)
+                bus.send(fc_msg)
+                seq = 1
+                
+            elif frame_type == 0x20:
+                if total_len == 0:
+                    continue
+                chunk = msg.data[1:8]
+                rem = total_len - len(buffer)
+                chunk_len = min(7, rem)
+                buffer.extend(chunk[:chunk_len])
+                if len(buffer) >= total_len:
+                    return bytes(buffer)
+                seq = (seq + 1) % 16
+                
+        raise Exception("ISO-TP receive timeout")
+
+
+class AMSSimulatorThread(QThread):
+    def __init__(self, channel="test_channel"):
+        super().__init__()
+        self.channel = channel
+        self.running = True
+
+    def run(self):
+        if not _CAN_OK:
+            return
+        try:
+            bus = can.Bus(interface='virtual', channel=self.channel)
+        except Exception:
+            return
+            
+        simulated_files = {
+            1: {
+                "name": "LOG0001.CSV",
+                "content": (
+                    "tick_ms,fsm,mode,ams_ok,fault,detail,tsms,dash_chg,mod_mask,pack_mV,I_raw_mA,I_filt_mA,Idcdc_mA,dcbus_V,vmin_mV,vmax_mV,tmin_C,tmax_C,tavg_C,"
+                    + ",".join(f"c0_{i}" for i in range(19)) + "," + ",".join(f"c1_{i}" for i in range(19)) + "," + ",".join(f"c2_{i}" for i in range(19)) + "," + ",".join(f"c3_{i}" for i in range(19)) + "," + ",".join(f"c4_{i}" for i in range(19)) + ","
+                    + ",".join(f"t0_{i}" for i in range(40)) + "," + ",".join(f"t1_{i}" for i in range(40)) + "," + ",".join(f"t2_{i}" for i in range(40)) + "," + ",".join(f"t3_{i}" for i in range(40)) + "," + ",".join(f"t4_{i}" for i in range(40)) + "\n"
+                    + "1000,2,1,1,0,0,1,0,31,380000,-15000,-14800,2000,380,3850,3950,25,28,26,"
+                    + ",".join("3900" for _ in range(95)) + ","
+                    + ",".join("26" for _ in range(200)) + "\n"
+                    + "1250,2,1,1,0,0,1,0,31,380100,-14800,-14700,2010,380,3860,3960,25,28,26,"
+                    + ",".join("3910" for _ in range(95)) + ","
+                    + ",".join("26" for _ in range(200)) + "\n"
+                    + "1500,2,1,1,0,0,1,0,31,380200,-14500,-14600,1990,380,3870,3970,25,28,26,"
+                    + ",".join("3920" for _ in range(95)) + ","
+                    + ",".join("26" for _ in range(200)) + "\n"
+                ).encode('utf-8')
+            },
+            2: {
+                "name": "LOG0002.CSV",
+                "content": (
+                    "tick_ms,fsm,mode,ams_ok,fault,detail,tsms,dash_chg,mod_mask,pack_mV,I_raw_mA,I_filt_mA,Idcdc_mA,dcbus_V,vmin_mV,vmax_mV,tmin_C,tmax_C,tavg_C,"
+                    + ",".join(f"c0_{i}" for i in range(19)) + "," + ",".join(f"c1_{i}" for i in range(19)) + "," + ",".join(f"c2_{i}" for i in range(19)) + "," + ",".join(f"c3_{i}" for i in range(19)) + "," + ",".join(f"c4_{i}" for i in range(19)) + ","
+                    + ",".join(f"t0_{i}" for i in range(40)) + "," + ",".join(f"t1_{i}" for i in range(40)) + "," + ",".join(f"t2_{i}" for i in range(40)) + "," + ",".join(f"t3_{i}" for i in range(40)) + "," + ",".join(f"t4_{i}" for i in range(40)) + "\n"
+                    + "2000,2,1,1,0,0,1,0,31,379000,-10000,-10200,1800,379,3750,3850,26,29,27,"
+                    + ",".join("3800" for _ in range(95)) + ","
+                    + ",".join("27" for _ in range(200)) + "\n"
+                    + "2250,2,1,1,0,0,1,0,31,379500,-9800,-10000,1820,379,3760,3860,26,29,27,"
+                    + ",".join("3810" for _ in range(95)) + ","
+                    + ",".join("27" for _ in range(200)) + "\n"
+                ).encode('utf-8')
+            }
+        }
+        
+        session_connected = False
+        open_handle = None
+        open_file_idx = None
+        
+        rx_id = 0x002
+        tx_id = 0x012
+        
+        buffer = bytearray()
+        total_len = 0
+        
+        while self.running:
+            try:
+                msg = bus.recv(timeout=0.05)
+            except Exception:
+                break
+            if not msg or msg.arbitration_id != rx_id:
+                continue
+                
+            pci = msg.data[0]
+            frame_type = pci & 0xF0
+            payload = None
+            
+            if frame_type == 0x00 or pci <= 0x07:
+                length = pci & 0x0F
+                payload = bytes(msg.data[1:1+length])
+            elif frame_type == 0x10:
+                total_len = ((pci & 0x0F) << 8) | msg.data[1]
+                buffer = bytearray(msg.data[2:8])
+                fc = [0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+                bus.send(can.Message(arbitration_id=tx_id, data=fc, is_extended_id=False))
+                continue
+            elif frame_type == 0x20:
+                if total_len == 0:
+                    continue
+                chunk = msg.data[1:8]
+                rem = total_len - len(buffer)
+                chunk_len = min(7, rem)
+                buffer.extend(chunk[:chunk_len])
+                if len(buffer) >= total_len:
+                    payload = bytes(buffer)
+                    total_len = 0
+                else:
+                    continue
+                    
+            if payload is None or len(payload) < 2:
+                continue
+                
+            msg_type = payload[0]
+            opcode = payload[1]
+            
+            if msg_type == 0x00:  # Cmd
+                if opcode == 0x01:  # CONNECT
+                    session_connected = True
+                    self.send_isotp(bus, tx_id, [0x01, 0x01])
+                elif opcode == 0x02:  # DISCONNECT
+                    session_connected = False
+                    self.send_isotp(bus, tx_id, [0x01, 0x02])
+                elif session_connected:
+                    if opcode == 0x21:  # LOGFS_LIST
+                        entries_payload = bytearray([0x01, 0x21, 0x00, 0x00, 2])
+                        for idx, info in simulated_files.items():
+                            name_padded = info["name"].encode('utf-8').ljust(12, b'\x00')
+                            size = len(info["content"])
+                            entry = struct.pack("<HxxII12s", idx, size, 1718000000, name_padded)
+                            entries_payload.extend(entry)
+                        self.send_isotp(bus, tx_id, entries_payload)
+                        
+                    elif opcode == 0x22:  # LOGFS_OPEN
+                        file_idx = struct.unpack("<H", payload[2:4])[0]
+                        if file_idx in simulated_files:
+                            open_handle = 0x42
+                            open_file_idx = file_idx
+                            size = len(simulated_files[file_idx]["content"])
+                            crc32_val = zlib.crc32(simulated_files[file_idx]["content"])
+                            resp = struct.pack("<BBBII", 0x01, 0x22, open_handle, size, crc32_val)
+                            self.send_isotp(bus, tx_id, resp)
+                        else:
+                            self.send_isotp(bus, tx_id, [0x02, 0x22, 0x04])
+                            
+                    elif opcode == 0x23:  # LOGFS_READ
+                        handle = payload[2]
+                        offset = struct.unpack("<I", payload[3:7])[0]
+                        length = struct.unpack("<H", payload[7:9])[0]
+                        if handle == open_handle and open_file_idx in simulated_files:
+                            content = simulated_files[open_file_idx]["content"]
+                            chunk = content[offset : offset + length]
+                            resp = bytearray([0x01, 0x23])
+                            resp.extend(chunk)
+                            self.send_isotp(bus, tx_id, resp)
+                        else:
+                            self.send_isotp(bus, tx_id, [0x02, 0x23, 0x08])
+                            
+                    elif opcode == 0x25:  # LOGFS_CLOSE
+                        open_handle = None
+                        open_file_idx = None
+                        self.send_isotp(bus, tx_id, [0x01, 0x25])
+        try:
+            bus.shutdown()
+        except Exception:
+            pass
+
+    def send_isotp(self, bus, tx_id, payload):
+        payload = bytes(payload)
+        if len(payload) <= 7:
+            data = bytearray(8)
+            data[0] = len(payload)
+            data[1:1+len(payload)] = payload
+            for idx in range(1+len(payload), 8):
+                data[idx] = 0xAA
+            bus.send(can.Message(arbitration_id=tx_id, data=data, is_extended_id=False))
+        else:
+            data = bytearray(8)
+            data[0] = 0x10 | ((len(payload) >> 8) & 0x0F)
+            data[1] = len(payload) & 0xFF
+            data[2:8] = payload[0:6]
+            bus.send(can.Message(arbitration_id=tx_id, data=data, is_extended_id=False))
+            seq = 1
+            offset = 6
+            while offset < len(payload):
+                chunk = payload[offset : offset + 7]
+                cf_data = bytearray(8)
+                cf_data[0] = 0x20 | (seq & 0x0F)
+                cf_data[1:1+len(chunk)] = chunk
+                for idx in range(1+len(chunk), 8):
+                    cf_data[idx] = 0xAA
+                bus.send(can.Message(arbitration_id=tx_id, data=cf_data, is_extended_id=False))
+                seq = (seq + 1) % 16
+                offset += len(chunk)
+                time.sleep(0.002)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
