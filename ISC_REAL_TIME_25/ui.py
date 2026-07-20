@@ -2972,8 +2972,8 @@ class MainWindow(QMainWindow):
         self._pr_bitrate.setStyleSheet(self.get_input_style())
         cv.addWidget(self._pr_bitrate)
         
-        cv.addWidget(self._lbl("AMS Node ID (dec):", "color:#888; font-size:10px;"))
-        self._pr_node_id = QLineEdit("2")
+        cv.addWidget(self._lbl("AMS Node ID (Node 1 = 1, Node 2 = 2):", "color:#888; font-size:10px;"))
+        self._pr_node_id = QLineEdit("1")
         self._pr_node_id.setStyleSheet(self.get_input_style())
         cv.addWidget(self._pr_node_id)
         
@@ -3379,7 +3379,7 @@ class AMSExtractionThread(QThread):
     files_listed = pyqtSignal(list)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, interface, channel, bitrate, ams_node_id=2, action="list", selected_file_index=None, selected_file_name=None):
+    def __init__(self, interface, channel, bitrate, ams_node_id=1, action="list", selected_file_index=None, selected_file_name=None):
         super().__init__()
         self.interface = interface
         self.channel = channel
@@ -3509,8 +3509,12 @@ class AMSExtractionThread(QThread):
                 
                 self.status.emit("Verifying file integrity...")
                 actual_crc = zlib.crc32(file_bytes)
-                if expected_crc != 0 and actual_crc != expected_crc:
-                    raise Exception(f"File integrity check failed! Expected CRC {expected_crc:08X}, got {actual_crc:08X}")
+                if expected_crc != 0:
+                    if actual_crc != expected_crc:
+                        raise Exception(f"File integrity check failed! Expected CRC {expected_crc:08X}, got {actual_crc:08X}")
+                    logger.info("[LOGFS] CRC32 verified: %08X", actual_crc)
+                else:
+                    logger.info("[LOGFS] Server returned CRC32=0 (bypassing pre-check CRC verification)")
                 
                 self.status.emit("Saving raw log to AMS_data folder...")
                 ams_data_dir = Path("AMS_data")
