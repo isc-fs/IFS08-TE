@@ -75,17 +75,117 @@ _RELEASES_PAGE = "https://github.com/MrAndy5/ISCmetrics/releases/latest"
 
 logger = logging.getLogger("ISC_RTT_USB")
 
+# ── NxTech Inverter FSM State Machine ────────────────────────────────────────
+# Source: NxTech Portal — Controller state machine section
+# App_State_App / App_State_Req enumeration (both Tx and Rx use same values)
+INVERTER_STATES_MAP = {
+    1:  "INIT",               # Initialization state
+    2:  "POST",               # Power-On Self Test
+    3:  "STANDBY",            # Awaiting HV
+    4:  "READY",              # HV detected, ready for active control
+    5:  "CURRENT",            # Current control (active)
+    6:  "TORQUE",             # Torque control (active)
+    7:  "SPEED",              # Speed control (active)
+    8:  "Placeholder",
+    9:  "Placeholder",
+    10: "FAULT_SOFT",         # Non-latched fault — reset via STANDBY request
+    11: "FAULT_HARD",         # Latched fault — needs power cycle or SHUTDOWN request
+    12: "DISCHARGE",          # Discharging DC-Link
+    13: "SHUTDOWN",           # Shutting down (power saving)
+    14: "OFF",                # LV is off
+}
+# Active control states (torque is being applied)
+_INV_ACTIVE_STATES = {5, 6, 7}
+
+# ── NxTech DEM Diagnostic Codes (L3 — DEM_Code) ─────────────────────────────
+# Source: NxTech Portal — Diagnostics section, L3 table
+# inv_error = DEM_Code from EMC_TX_STATE_2 (0x461).
+# The DEM cycles through all registered errors/warnings; 0 = everything OK.
 INVERTER_ERRORS_MAP = {
-    1: "Lost Message (CAN Timeout)",
-    2: "Undervoltage Fault",
-    3: "Overtemperature Fault",
+    0:  "No Fault",
+    1:  "Lost msg: setpoint not received",
+    2:  "DCBus Undervoltage",
+    3:  "PwrStg Overtemperature",
+    4:  "PwrStg Temp Degradation",
+    5:  "EMCtrl Fault (see PwrStg_BitState / EMCtrl_FOC_BitState)",
+    6:  "Task Overrun",
+    7:  "CAN1 BusOff",
+    8:  "EMachine Overtemperature",
+    9:  "Phase Current Out-of-Range",
+    10: "Power Stage Temp Out-of-Range",
+    11: "DC Bus Out-of-Range",
+    12: "DP Overtemp",
+    13: "DRV Overtemp",
+    14: "Aux Supply Undervoltage",
+    15: "Aux Supply Overvoltage",
+    16: "Overspeed",
+    17: "Speed Degrade",
+    18: "EMachine Temp Degrade",
+    19: "Bad Current Offset",
+    20: "AbsEnc Error 1",
+    21: "Ext Temp 1 Out-of-Range",     # Sensor 1 disconnected / inadequate wiring
+    22: "Ext Temp 2 Out-of-Range",     # Sensor 2 (KTY81-210 motor winding) out of range
+    23: "PMIC Not Ready",
+    24: "E2E CRC Fault (setpoint)",
+    25: "E2E CNT Fault (setpoint)",
+    26: "Invalid Calibration",
+    27: "E2E CRC Fault (state)",
+    28: "E2E CNT Fault (state)",
+    29: "Crosscheck Fault",
+    30: "Crosscheck Torque",
+    31: "Wrong Member",
+    32: "Hardware Supervisor Fault",   # KL30/31 supply inadequate
+    33: "KL30 Undervoltage",
+    34: "KL30 Overvoltage",
+    35: "Lost Message (setpoint)",
+    36: "Torque Not Coherent",
+    37: "LV External Sensor Supply Fault",  # 5V supply shorted or KL30/31 inadequate
 }
 
-def decode_inverter_errors(error_code: int) -> list:
-    desc = INVERTER_ERRORS_MAP.get(error_code)
-    if desc:
-        return [desc]
-    return [f"Fault Code {error_code} (Check DeveLinkSTUDIO)"]
+# ── DEM Safe State reference ──────────────────────────────────────────────────
+INVERTER_ERRORS_SAFESTATE = {
+    1: "Freewheeling", 2: "Freewheeling", 3: "Freewheeling", 4: "Degrade",
+    5: "Freewheeling", 6: "Freewheeling", 7: "None", 8: "Freewheeling",
+    9: "Freewheeling", 10: "Freewheeling", 11: "Freewheeling", 12: "Freewheeling",
+    13: "Freewheeling", 14: "Freewheeling", 15: "None", 16: "Freewheeling",
+    17: "Degrade", 18: "Degrade", 19: "Freewheeling", 20: "Freewheeling",
+    21: "None", 22: "None", 23: "Freewheeling", 24: "Freewheeling",
+    25: "Freewheeling", 26: "Freewheeling", 27: "Freewheeling", 28: "Freewheeling",
+    29: "Freewheeling", 30: "Freewheeling", 31: "Freewheeling", 32: "Freewheeling",
+    33: "Freewheeling", 34: "Freewheeling", 35: "Freewheeling", 36: "Freewheeling",
+    37: "Freewheeling",
+}
+
+def decode_inverter_state(state_code: int) -> str:
+    name = INVERTER_STATES_MAP.get(state_code, f"State {state_code}")
+    # Official descriptions per NxTech documentation
+    descs = {
+        1: "Init",
+        2: "Power-On Self Test",
+        3: "Awaiting HV",
+        4: "HV Ready",
+        5: "Current Active",
+        6: "Torque Active",
+        7: "Speed Active",
+        10: "Non-latched Fault",
+        11: "Latched Fault / Shutdown",
+        12: "Discharging DC-Link",
+        13: "Power Saving Sleep",
+        14: "LV Off",
+    }
+    desc = descs.get(state_code)
+    return f"{name} ({desc})" if desc else name
+
+def decode_inverter_errors(error_code: int, state_code: int = 0) -> list:
+    """Decode DEM_Code from EMC_TX_STATE_2. Returns empty list when no fault."""
+    if error_code == 0:
+        return []
+    desc = INVERTER_ERRORS_MAP.get(error_code, f"DEM Code {error_code} (Unknown)")
+    safe = INVERTER_ERRORS_SAFESTATE.get(error_code, "")
+    suffix = f" [{safe}]" if safe else ""
+    fault_type = "SOFT" if state_code == 10 else "HARD" if state_code == 11 else "DEM"
+    return [f"{fault_type}: {desc}{suffix}"]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COLOUR SCHEME  (ISC Green / Grafana dark)
@@ -187,11 +287,14 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     # ── Inverter status ───────────────────────────────────────────────────
     'inv_state':            ('Inverter State',         ''),
     'inv_vconfig_active':   ('Vconfig Active',         '0/1'),
-    'inv_error':            ('Inverter Error',         ''),
+    'inv_error':            ('Inverter Error (DEM)',   ''),
+    'dem_code':             ('DEM Code',               ''),
+    'emctrl_foc_bitstate':  ('EMCtrl FOC BitState',    'bitfield'),
     # ── Inverter electrical ───────────────────────────────────────────────
     'inv_dc_bus_V':         ('DC Bus Voltage',         'V'),
-    'inv_temp_motor1':      ('Motor Temperature',      'degC'),
-    'inv_temp_pwrstg':      ('Power Stage Temp',       'degC'),
+    'inv_temp_motor1':      ('Ext Temp Sensor 1',      'degC'),   # NTC on Sensor 1 input (disconnected = 255)
+    'inv_temp_motor2':      ('Motor 2 Winding Temp',   'degC'),   # NTC on Sensor 2 input (KTY81-210 working sensor)
+    'inv_temp_pwrstg':      ('Power Stage Temp',       'degC'),   # Alias for Motor 2 / Sensor 2
     'inv_temp_board':       ('Inverter Board Temp',    'degC'),
     # ── Motor speed & current ─────────────────────────────────────────────
     'inv_rpm':              ('Motor Speed',            'RPM'),
@@ -1887,17 +1990,18 @@ class MainWindow(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w); v.setSpacing(6); v.setContentsMargins(8,8,8,8)
 
-        # Metric cards row (8 cards)
+        # Metric cards row (9 cards)
         cr = QHBoxLayout(); cr.setSpacing(6)
-        self._ov_rpm    = MetricCard("RPM",         "rpm",  ISC_GREEN)
-        self._ov_vbus   = MetricCard("DC BUS",      "V",    ISC_GREEN)
-        self._ov_temp   = MetricCard("MAX TEMP",    "degC", F1_ERROR)
-        self._ov_soc    = MetricCard("SOC (VTC6)",  "%",    F1_BLUE)
-        self._ov_torque = MetricCard("TORQUE REQ",  "%",    ISC_GREEN)
-        self._ov_cur    = MetricCard("MOTOR I",     "A",    F1_PURPLE)
-        self._ov_vcell  = MetricCard("MIN CELL",    "mV",   F1_WARNING)
-        self._ov_state  = MetricCard("INV STATE",   "",     ISC_GREEN)
-        for c in (self._ov_rpm, self._ov_vbus, self._ov_temp, self._ov_soc,
+        self._ov_rpm     = MetricCard("RPM",         "rpm",  ISC_GREEN)
+        self._ov_vbus    = MetricCard("DC BUS",      "V",    ISC_GREEN)
+        self._ov_tm2     = MetricCard("MOTOR 2 TEMP","degC", F1_WARNING)
+        self._ov_temp    = MetricCard("MAX TEMP",    "degC", F1_ERROR)
+        self._ov_soc     = MetricCard("SOC (VTC6)",  "%",    F1_BLUE)
+        self._ov_torque  = MetricCard("TORQUE REQ",  "%",    ISC_GREEN)
+        self._ov_cur     = MetricCard("MOTOR I",     "A",    F1_PURPLE)
+        self._ov_vcell   = MetricCard("MIN CELL",    "mV",   F1_WARNING)
+        self._ov_state   = MetricCard("INV STATE",   "",     ISC_GREEN)
+        for c in (self._ov_rpm, self._ov_vbus, self._ov_tm2, self._ov_temp, self._ov_soc,
                   self._ov_torque, self._ov_cur, self._ov_vcell, self._ov_state):
             cr.addWidget(c)
         v.addLayout(cr, stretch=2)
@@ -2011,15 +2115,18 @@ class MainWindow(QMainWindow):
         ev.addWidget(self._pt_speed)
         top.addWidget(eng, stretch=2)
 
-        # Inverter temps
-        itb = QGroupBox("INVERTER TEMPERATURES")
+        # Inverter status & diagnostics
+        itb = QGroupBox("INVERTER STATUS & DIAGNOSTICS")
         itg = QGridLayout(itb)
-        self._pt_tm1   = MetricCard("Motor 1",   "°C", F1_WARNING)
-        self._pt_tpwr  = MetricCard("PWRSTG",    "°C", F1_WARNING)
+        self._pt_tm1   = MetricCard("Sensor 1",   "°C", F1_WARNING)
+        self._pt_tm2   = MetricCard("Motor 2 (NTC)", "°C", F1_WARNING)
         self._pt_tbd   = MetricCard("Board",     "°C", ISC_GREEN)
         self._pt_tdcdc = MetricCard("DC-DC",     "°C", ISC_GREEN)
-        itg.addWidget(self._pt_tm1,   0, 0); itg.addWidget(self._pt_tpwr, 0, 1)
+        self._pt_dem   = MetricCard("DEM Code",  "",   F1_ERROR)
+        self._pt_foc   = MetricCard("FOC BitState", "", ISC_GREEN)
+        itg.addWidget(self._pt_tm1,   0, 0); itg.addWidget(self._pt_tm2, 0, 1)
         itg.addWidget(self._pt_tbd,   1, 0); itg.addWidget(self._pt_tdcdc,1, 1)
+        itg.addWidget(self._pt_dem,   2, 0); itg.addWidget(self._pt_foc,  2, 1)
         top.addWidget(itb, stretch=2)
 
         # Battery summary
@@ -2247,8 +2354,11 @@ class MainWindow(QMainWindow):
         # SoC from VTC6 OCV table (overrides raw ECU value if cell voltage available)
         soc_vtc6 = soc_from_cell_mv(vcell) if vcell > 0 else float(soc)
 
+        tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
+
         self._ov_rpm.set_value(f"{int(rpm):,}")
         self._ov_vbus.set_value(f"{vbus}")
+        self._ov_tm2.set_value(f"{tm2_val:.0f}" if isinstance(tm2_val, (int, float)) else str(tm2_val))
         self._ov_temp.set_value(f"{max_t:.0f}")
         self._ov_soc.set_value(f"{soc_vtc6:.1f}")
         self._ov_torque.set_value(f"{tpct}")
@@ -2282,13 +2392,13 @@ class MainWindow(QMainWindow):
             lbl.setText(f"● {text}")
             lbl.setStyleSheet(f"color:{'#00c853' if on else '#333'}; font-size:10px; font-weight:bold;")
         _ind(self._ind_precharge, "PRECHARGE OK", bool(pre))
-        _ind(self._ind_inv_ok,    "INV OK",       ierr == 0 and istate > 0)
+        _ind(self._ind_inv_ok,    f"INV {decode_inverter_state(istate)}", istate in _INV_ACTIVE_STATES)
         _ind(self._ind_ams,       f"AMS {ams}",   ams > 0)
 
-        # Inverter fault decoder
+        # Inverter fault decoder — pass istate for soft-fault substate awareness
         if ierr > 0:
-            err_descs = decode_inverter_errors(ierr)
-            self._lbl_inv_errors.setText("❌ FAULTS: " + " | ".join(err_descs))
+            err_descs = decode_inverter_errors(ierr, istate)
+            self._lbl_inv_errors.setText("\u274c FAULTS: " + " | ".join(err_descs))
             self._lbl_inv_errors.show()
         else:
             self._lbl_inv_errors.setText("")
@@ -2314,10 +2424,22 @@ class MainWindow(QMainWindow):
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
         self._pt_speed.set_value(str(s.get('inv_speed_actual', 0)))
-        self._pt_tm1.set_value(f"{s.get('inv_temp_motor1', 0)} degC")
-        self._pt_tpwr.set_value(f"{s.get('inv_temp_pwrstg', 0)} degC")
+        _tm1_raw = s.get('inv_temp_motor1', 0)
+        # After -50 offset applied in decoder: >=200°C means disconnected/out-of-range (DEM 21)
+        _tm1_str = "N/C (Disconnected)" if _tm1_raw >= 200 else f"{_tm1_raw} degC"
+        self._pt_tm1.set_value(_tm1_str)
+        _tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
+        self._pt_tm2.set_value(f"{_tm2_val} degC")
         self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)} degC")
-        self._pt_tdcdc.set_value(f"{s.get('temp_dcdc', 0)} degC")
+        _tdcdc_raw = s.get('temp_dcdc', 0)
+        _tdcdc_str = "N/C" if _tdcdc_raw <= -100 or _tdcdc_raw == -32768 else f"{_tdcdc_raw} degC"
+        self._pt_tdcdc.set_value(_tdcdc_str)
+        
+        dem_val = s.get('dem_code', s.get('inv_error', 0))
+        self._pt_dem.set_value(f"{dem_val}")
+        foc_val = s.get('emctrl_foc_bitstate', 0)
+        self._pt_foc.set_value(f"0b{foc_val:08b}" if foc_val > 0 else "0 (OK)")
+        
         self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)} V")
         vcell_pt = s.get('v_cell_min_mV', 0)
         soc_vtc6_pt = soc_from_cell_mv(vcell_pt) if vcell_pt > 0 else float(s.get('soc', 0))

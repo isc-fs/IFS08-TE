@@ -191,9 +191,9 @@ class SerialCSVLogger:
         "corriente_accu", "corriente_dcdc", "temp_dcdc",
         "tmax_mod0", "tmax_mod1", "tmax_mod2", "tmax_mod3", "tmax_mod4",
         # ── Inverter  [snap bytes 59-81] ────────────────────────────────────
-        "inv_state", "inv_vconfig_active", "inv_error",
+        "inv_state", "inv_vconfig_active", "inv_error", "dem_code", "emctrl_foc_bitstate",
         "inv_dc_bus_V",
-        "inv_temp_motor1", "inv_temp_pwrstg", "inv_temp_board",
+        "inv_temp_motor1", "inv_temp_motor2", "inv_temp_pwrstg", "inv_temp_board",
         "inv_rpm", "inv_speed_actual", "inv_current_actual",
         # ── IMU (simulated or parsed from bytes 82-101 of snapshot) ──────────
         "imu_ax_g", "imu_ay_g", "imu_az_g",
@@ -244,9 +244,11 @@ class SerialCSVLogger:
             s.get('temp_dcdc',      0),
             *(tmax[i] if i < len(tmax) else 0 for i in range(5)),
             s.get('inv_state',             0), s.get('last_vconfig_tick', 0),
-            s.get('inv_error',             0), s.get('inv_dc_bus_V',      0),
-            s.get('inv_temp_motor1',       0), s.get('inv_temp_pwrstg',   0),
-            s.get('inv_temp_board',        0), s.get('inv_rpm',           0),
+            s.get('inv_error',             0), s.get('dem_code', s.get('inv_error', 0)),
+            s.get('emctrl_foc_bitstate',   0), s.get('inv_dc_bus_V',      0),
+            s.get('inv_temp_motor1',       0), s.get('inv_temp_motor2',   0),
+            s.get('inv_temp_pwrstg',       0), s.get('inv_temp_board',    0),
+            s.get('inv_rpm',               0),
             s.get('inv_speed_actual',      0), s.get('inv_current_actual', 0),
             # IMU columns
             s.get('imu_ax_g',            0.0), s.get('imu_ay_g',         0.0), s.get('imu_az_g',            0.0),
@@ -513,15 +515,21 @@ def _decode_fast_snapshot(data: bytes, seq: int) -> dict:
         't11_8_9':           unpacked[6],
         'last_vconfig_tick': unpacked[7],
         'inv_error':         unpacked[8],
+        'dem_code':          unpacked[8],   # Alias for inv_error (DEM_Code from EMC_TX_STATE_2)
+        'emctrl_foc_bitstate': 0,
         'torque_pct':        unpacked[9],
         'inv_dc_bus_V':      unpacked[10],
         'v_cell_min_mV':     unpacked[11],
         'apps1_raw':         unpacked[12],
         'apps2_raw':         unpacked[13],
         'brake_raw':         unpacked[14],
-        'inv_temp_motor1':   unpacked[15],
-        'inv_temp_pwrstg':   unpacked[16],
-        'inv_temp_board':    unpacked[17],
+        # DBC EMC_TX_STATE_5 (0x464): physical_degC = raw_byte - 50  (scale=1, offset=-50)
+        # Raw 255 → 205°C = out-of-range / sensor disconnected marker
+        # Raw   0 → -50°C = minimum of valid range
+        'inv_temp_motor1':   unpacked[15] - 50,   # EMachine_Temp_1_degC (Sensor 1, disconnected)
+        'inv_temp_motor2':   unpacked[16] - 50,   # EMachine_Temp_2_degC (Sensor 2, Motor Winding NTC)
+        'inv_temp_pwrstg':   unpacked[16] - 50,   # Backward-compat alias for Sensor 2
+        'inv_temp_board':    unpacked[17] - 50,   # Board_Temp_degC
         'inv_rpm':           int(round(unpacked[18] / 10.0)),
     }
 
@@ -581,10 +589,14 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'inv_state':          unpacked[32],
         'last_vconfig_tick':  unpacked[33],
         'inv_error':          unpacked[34],
+        'dem_code':           unpacked[34],  # Alias for inv_error (DEM_Code from EMC_TX_STATE_2)
+        'emctrl_foc_bitstate': 0,
         'inv_dc_bus_V':       unpacked[35],
-        'inv_temp_motor1':    unpacked[36],
-        'inv_temp_pwrstg':    unpacked[37],
-        'inv_temp_board':     unpacked[38],
+        # DBC EMC_TX_STATE_5 (0x464): physical_degC = raw_byte - 50  (scale=1, offset=-50)
+        'inv_temp_motor1':    unpacked[36] - 50,  # EMachine_Temp_1_degC (Sensor 1, disconnected → 205°C)
+        'inv_temp_motor2':    unpacked[37] - 50,  # EMachine_Temp_2_degC (Sensor 2, Motor Winding NTC)
+        'inv_temp_pwrstg':    unpacked[37] - 50,  # Backward-compat alias for Sensor 2
+        'inv_temp_board':     unpacked[38] - 50,  # Board_Temp_degC
         'inv_rpm':            int(round(unpacked[39] / 10.0)),
         'inv_speed_actual':   unpacked[40],
         'inv_current_actual': unpacked[41],
@@ -1033,8 +1045,11 @@ def receive_data(bucket_id: str,
         'inv_state':          0,
         'last_vconfig_tick':  0,
         'inv_error':          0,
+        'dem_code':           0,
+        'emctrl_foc_bitstate': 0,
         'inv_dc_bus_V':       0,
         'inv_temp_motor1':    0,
+        'inv_temp_motor2':    0,
         'inv_temp_pwrstg':    0,
         'inv_temp_board':     0,
         'inv_rpm':            0,
