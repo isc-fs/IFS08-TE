@@ -228,9 +228,18 @@ _VTC6_OCV_TABLE = [
     (0.000, 3.000),
 ]
 
-def soc_from_cell_mv(cell_mv: float) -> float:
-    """Estimate SoC (0–100 %) from minimum cell voltage using VTC6 OCV table."""
-    cell_v = cell_mv / 1000.0
+def soc_from_cell_mv(cell_mv: float, current_a: float = 0.0) -> float:
+    """
+    Estimate SoC (0–100 %) from cell voltage using VTC6 OCV table with IR compensation.
+    95s6p Sony VTC6 pack internal resistance ≈ 0.35 mV/A per 6p cell group.
+    Compensates voltage sag during heavy current draw (e.g. 376A acceleration spikes)
+    so SoC readout remains stable during driving.
+    """
+    # Add back IR voltage drop during discharge (I > 0)
+    ir_drop_mv = max(0.0, float(current_a)) * 0.35
+    ocv_est_mv = cell_mv + ir_drop_mv
+    
+    cell_v = ocv_est_mv / 1000.0
     for i in range(len(_VTC6_OCV_TABLE) - 1):
         soc_hi, v_hi = _VTC6_OCV_TABLE[i]
         soc_lo, v_lo = _VTC6_OCV_TABLE[i + 1]
@@ -290,6 +299,7 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'inv_error':            ('Inverter Error (DEM)',   ''),
     'dem_code':             ('DEM Code',               ''),
     'emctrl_foc_bitstate':  ('EMCtrl FOC BitState',    'bitfield'),
+    'est_time_remaining':   ('Est. Time Remaining',    'min'),
     # ── Inverter electrical ───────────────────────────────────────────────
     'inv_dc_bus_V':         ('DC Bus Voltage',         'V'),
     'inv_temp_motor1':      ('Ext Temp Sensor 1',      'degC'),   # NTC on Sensor 1 input (disconnected = 255)
@@ -1990,19 +2000,20 @@ class MainWindow(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w); v.setSpacing(6); v.setContentsMargins(8,8,8,8)
 
-        # Metric cards row (9 cards)
+        # Metric cards row (10 cards)
         cr = QHBoxLayout(); cr.setSpacing(6)
         self._ov_rpm     = MetricCard("RPM",         "rpm",  ISC_GREEN)
         self._ov_vbus    = MetricCard("DC BUS",      "V",    ISC_GREEN)
         self._ov_tm2     = MetricCard("MOTOR 2 TEMP","degC", F1_WARNING)
         self._ov_temp    = MetricCard("MAX TEMP",    "degC", F1_ERROR)
         self._ov_soc     = MetricCard("SOC (VTC6)",  "%",    F1_BLUE)
+        self._ov_time_rem= MetricCard("EST REMAINING","",    ISC_GREEN)
         self._ov_torque  = MetricCard("TORQUE REQ",  "%",    ISC_GREEN)
         self._ov_cur     = MetricCard("MOTOR I",     "A",    F1_PURPLE)
         self._ov_vcell   = MetricCard("MIN CELL",    "mV",   F1_WARNING)
         self._ov_state   = MetricCard("INV STATE",   "",     ISC_GREEN)
         for c in (self._ov_rpm, self._ov_vbus, self._ov_tm2, self._ov_temp, self._ov_soc,
-                  self._ov_torque, self._ov_cur, self._ov_vcell, self._ov_state):
+                  self._ov_time_rem, self._ov_torque, self._ov_cur, self._ov_vcell, self._ov_state):
             cr.addWidget(c)
         v.addLayout(cr, stretch=2)
 
@@ -2138,9 +2149,11 @@ class MainWindow(QMainWindow):
         self._pt_idcdc = MetricCard("DC-DC Current", "",  ISC_GREEN)
         self._pt_vcell = MetricCard("Min Cell V",    "",  F1_WARNING)
         self._pt_ams   = MetricCard("AMS State",     "",  ISC_GREEN)
+        self._pt_trem  = MetricCard("Est. Cut-off",  "",  ISC_GREEN)
         bsg.addWidget(self._pt_vbus,  0, 0); bsg.addWidget(self._pt_soc,   0, 1)
         bsg.addWidget(self._pt_iaccu, 1, 0); bsg.addWidget(self._pt_idcdc, 1, 1)
         bsg.addWidget(self._pt_vcell, 2, 0); bsg.addWidget(self._pt_ams,   2, 1)
+        bsg.addWidget(self._pt_trem,  3, 0, 1, 2)
         top.addWidget(bsb, stretch=2)
         v.addLayout(top, stretch=3)
 
@@ -2351,8 +2364,25 @@ class MainWindow(QMainWindow):
         tmax   = s.get('temp_max_modulo',  [0]*5)
         max_t  = max((t for t in tmax if t != 0), default=0)
 
-        # SoC from VTC6 OCV table (overrides raw ECU value if cell voltage available)
-        soc_vtc6 = soc_from_cell_mv(vcell) if vcell > 0 else float(soc)
+        # SoC from VTC6 OCV table with IR compensation (uses corriente_accu to prevent sag dip)
+        soc_vtc6 = soc_from_cell_mv(vcell, s.get('corriente_accu', 0)) if vcell > 0 else float(soc)
+
+        # Real-time remaining battery duration estimator (30-second rolling average current)
+        i_curr = max(0.0, float(s.get('corriente_accu', 0)))
+        if not hasattr(self, '_i_rolling_hist'):
+            self._i_rolling_hist = deque(maxlen=300) # 30 seconds at 10Hz
+        self._i_rolling_hist.append(i_curr)
+        i_avg = sum(self._i_rolling_hist) / len(self._i_rolling_hist) if self._i_rolling_hist else 0.0
+
+        # Pack capacity: 18.0 Ah (95s6p Sony VTC6). Usable down to 5% SoC cutoff = ~17.1 Ah
+        # Usable Ah remaining = 17.1 * (soc_vtc6 - 5) / 100
+        usable_ah_rem = max(0.0, 17.1 * (soc_vtc6 - 5.0) / 100.0)
+        if i_avg > 0.5:
+            min_rem = (usable_ah_rem / i_avg) * 60.0
+            time_str = f"{int(min_rem)}m {int((min_rem % 1) * 60):02d}s"
+        else:
+            time_str = "STANDBY"
+            min_rem = 999.0
 
         tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
 
@@ -2361,6 +2391,7 @@ class MainWindow(QMainWindow):
         self._ov_tm2.set_value(f"{tm2_val:.0f}" if isinstance(tm2_val, (int, float)) else str(tm2_val))
         self._ov_temp.set_value(f"{max_t:.0f}")
         self._ov_soc.set_value(f"{soc_vtc6:.1f}")
+        self._ov_time_rem.set_value(time_str)
         self._ov_torque.set_value(f"{tpct}")
         self._ov_cur.set_value(f"{icur}")
         self._ov_vcell.set_value(f"{vcell}")
@@ -2442,13 +2473,24 @@ class MainWindow(QMainWindow):
         
         self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)} V")
         vcell_pt = s.get('v_cell_min_mV', 0)
-        soc_vtc6_pt = soc_from_cell_mv(vcell_pt) if vcell_pt > 0 else float(s.get('soc', 0))
+        i_accu_pt = s.get('corriente_accu', 0)
+        soc_vtc6_pt = soc_from_cell_mv(vcell_pt, i_accu_pt) if vcell_pt > 0 else float(s.get('soc', 0))
         self._pt_soc.set_value(f"{soc_vtc6_pt:.1f} %")
         # corriente_accu and corriente_dcdc are stored in Amperes (A)
         self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0):.1f} A")
         self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0):.1f} A")
         self._pt_vcell.set_value(f"{vcell_pt} mV")
         self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
+        
+        # Est. cut-off duration metric
+        i_hist = getattr(self, '_i_rolling_hist', None)
+        i_avg_pt = (sum(i_hist) / len(i_hist)) if i_hist else 0.0
+        usable_ah = max(0.0, 17.1 * (soc_vtc6_pt - 5.0) / 100.0)
+        if i_avg_pt > 0.5:
+            m_rem = (usable_ah / i_avg_pt) * 60.0
+            self._pt_trem.set_value(f"{int(m_rem)}m {int((m_rem % 1)*60):02d}s")
+        else:
+            self._pt_trem.set_value("STANDBY")
 
         vmin = s.get('vmin_modulo',      [0]*5)
         vmax = s.get('vmax_modulo',      [0]*5)
