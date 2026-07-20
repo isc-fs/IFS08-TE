@@ -111,6 +111,10 @@ ALERT_CELL_MV  = 3400   # mV   — per-module min cell voltage below this
 
 HISTORY_LEN  = 120    # rolling plot sample depth
 ADC_MAX      = 4095   # 12-bit ADC full scale (pedal normalisation)
+APPS1_MIN    = 2500   # raw ADC value at 0% depression
+APPS1_MAX    = 3400   # raw ADC value at 100% depression
+APPS2_MIN    = 2330   # raw ADC value at 0% depression
+APPS2_MAX    = 3040   # raw ADC value at 100% depression
 RPM_MAX      = 6000
 
 # ── Sony VTC6 95s6p OCV–SoC lookup ───────────────────────────────────────────
@@ -171,8 +175,8 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'vmax_modulo_3':        ('Vmax Module 3',          'mV'),
     'vmax_modulo_4':        ('Vmax Module 4',          'mV'),
     # ── Battery / AMS — current & DC-DC ───────────────────────────────────
-    'corriente_accu':       ('Pack Current',           'dA'),
-    'corriente_dcdc':       ('DC-DC Current',          'dA'),
+    'corriente_accu':       ('Pack Current',           'A'),
+    'corriente_dcdc':       ('DC-DC Current',          'A'),
     'temp_dcdc':            ('DC-DC Temperature',      'degC'),
     # ── Battery / AMS — per-module max temperature ─────────────────────────
     'tmax_modulo_0':        ('Tmax Module 0',          'degC'),
@@ -301,10 +305,10 @@ class MplCanvas(QWidget):
         self._line, = self._ax.plot([], [], color=color, linewidth=1.4, antialiased=True)
         self._ax.set_facecolor(F1_DARK_BG)
         self._ax.set_title(title, color=color, fontsize=8, fontweight='bold', pad=2)
-        self._ax.tick_params(labelsize=6, colors='#555')
-        self._ax.grid(True, alpha=0.3)
+        self._ax.tick_params(labelsize=7.5, colors='#ffffff' if F1_TEXT == '#e0e0e0' else '#111111')
+        self._ax.grid(True, color='#444444' if F1_TEXT == '#e0e0e0' else '#cccccc', alpha=0.35)
         for s in self._ax.spines.values():
-            s.set_color('#2a2a2a')
+            s.set_color('#555555' if F1_TEXT == '#e0e0e0' else '#aaaaaa')
 
         canvas = FigureCanvas(fig)
         lay = QVBoxLayout(self)
@@ -780,10 +784,10 @@ class DroppablePlotPanel(QFrame):
         self._ax = fig.add_subplot(111)
         self._line, = self._ax.plot([], [], color=ISC_GREEN, linewidth=1.1)
         self._ax.set_facecolor(F1_DARK_BG)
-        self._ax.tick_params(labelsize=6, colors='#444')
-        self._ax.grid(True, alpha=0.2)
+        self._ax.tick_params(labelsize=7.5, colors='#ffffff' if F1_TEXT == '#e0e0e0' else '#111111')
+        self._ax.grid(True, color='#444444' if F1_TEXT == '#e0e0e0' else '#cccccc', alpha=0.35)
         for s in self._ax.spines.values():
-            s.set_color('#2a2a2a')
+            s.set_color('#555555' if F1_TEXT == '#e0e0e0' else '#aaaaaa')
         self._canvas = FigureCanvas(fig)
         lay.addWidget(self._canvas)
 
@@ -832,10 +836,10 @@ class DroppablePlotPanel(QFrame):
         self._val_lbl.setText("—")
         self._ax.cla()
         self._ax.set_facecolor(F1_DARK_BG)
-        self._ax.tick_params(labelsize=6, colors='#444')
-        self._ax.grid(True, alpha=0.2)
+        self._ax.tick_params(labelsize=7.5, colors='#ffffff' if F1_TEXT == '#e0e0e0' else '#111111')
+        self._ax.grid(True, color='#444444' if F1_TEXT == '#e0e0e0' else '#cccccc', alpha=0.35)
         for s in self._ax.spines.values():
-            s.set_color('#2a2a2a')
+            s.set_color('#555555' if F1_TEXT == '#e0e0e0' else '#aaaaaa')
         self._line, = self._ax.plot([], [], color=ISC_GREEN, linewidth=1.1)
         self._canvas.draw_idle()
         self._border_idle()
@@ -1291,32 +1295,15 @@ class PostRaceWindow(QWidget):
         desc.setWordWrap(True)
         v.addWidget(desc)
 
-        # Coming-soon notice
-        notice = QFrame()
-        notice.setStyleSheet(
-            f"QFrame {{ background:#2a1a00; border:1px solid {F1_WARNING}; border-radius:4px; }}")
-        nl = QVBoxLayout(notice)
-        nl.setContentsMargins(10, 8, 10, 8)
-        nt = QLabel("⚠  AMS SD-card log format is not yet finalised.")
-        nt.setStyleSheet(f"color:{F1_WARNING}; font-size:10px; font-weight:bold;")
-        nd = QLabel(
-            "Import will be enabled once the on-board AMS logger firmware\n"
-            "and output format are defined.")
-        nd.setStyleSheet("color:#888; font-size:9px;")
-        nd.setWordWrap(True)
-        nl.addWidget(nt)
-        nl.addWidget(nd)
-        v.addWidget(notice)
-
-        # File selector (visible but disabled)
+        # File selector
         file_row = QHBoxLayout()
         self._ams_file_lbl = QLabel("No file selected.")
-        self._ams_file_lbl.setStyleSheet("color:#333; font-size:9px; font-family:'Courier New';")
+        self._ams_file_lbl.setStyleSheet("color:#555; font-size:9px; font-family:'Courier New';")
         file_row.addWidget(self._ams_file_lbl, stretch=1)
 
         btn_browse = QPushButton("Browse…")
         btn_browse.setStyleSheet(
-            f"background:{F1_MID_BG}; color:#555; border:1px solid #444; "
+            f"background:{F1_MID_BG}; color:{F1_WARNING}; border:1px solid {F1_WARNING}; "
             f"padding:4px 10px; font-size:10px; border-radius:2px;")
         btn_browse.clicked.connect(self._browse_ams)
         file_row.addWidget(btn_browse)
@@ -1325,8 +1312,8 @@ class PostRaceWindow(QWidget):
         v.addStretch()
 
         # Status
-        self._ams_status = QLabel("Not yet implemented.")
-        self._ams_status.setStyleSheet("color:#444; font-size:9px; font-family:'Courier New';")
+        self._ams_status = QLabel("Ready.")
+        self._ams_status.setStyleSheet("color:#555; font-size:9px; font-family:'Courier New';")
         self._ams_status.setWordWrap(True)
         v.addWidget(self._ams_status)
 
@@ -1934,12 +1921,12 @@ class MainWindow(QMainWindow):
                                fontsize=8, fontweight='bold', pad=2)
         self._ax_tb.set_ylim(-5, 105)
         self._ax_tb.set_xlim(0, HISTORY_LEN)
-        self._ax_tb.tick_params(labelsize=6, colors='#555')
-        self._ax_tb.grid(True, alpha=0.3)
-        self._ax_tb.legend(fontsize=6, loc='upper left',
+        self._ax_tb.tick_params(labelsize=7.5, colors='#ffffff' if F1_TEXT == '#e0e0e0' else '#111111')
+        self._ax_tb.grid(True, color='#444444' if F1_TEXT == '#e0e0e0' else '#cccccc', alpha=0.35)
+        self._ax_tb.legend(fontsize=7, loc='upper left',
                            facecolor=F1_PANEL_BG, labelcolor=F1_TEXT,
-                           edgecolor='#333', framealpha=0.8)
-        for sp in self._ax_tb.spines.values(): sp.set_color('#2a2a2a')
+                           edgecolor='#555555' if F1_TEXT == '#e0e0e0' else '#aaaaaa', framealpha=0.8)
+        for sp in self._ax_tb.spines.values(): sp.set_color('#555555' if F1_TEXT == '#e0e0e0' else '#aaaaaa')
         self._canvas_tb = FigureCanvas(fig_tb)
         tb_widget = QWidget()
         tb_lay = QVBoxLayout(tb_widget); tb_lay.setContentsMargins(0,0,0,0)
@@ -2128,7 +2115,7 @@ class MainWindow(QMainWindow):
         
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        self._log.setMaximumHeight(80)
+        self._log.setMinimumHeight(150)
         self._log.setStyleSheet(
             f"background:{F1_DARK_BG}; color:{F1_TEXT}; "
             f"font-family:'Courier New'; font-size:9px; border:none;")
@@ -2335,9 +2322,9 @@ class MainWindow(QMainWindow):
         vcell_pt = s.get('v_cell_min_mV', 0)
         soc_vtc6_pt = soc_from_cell_mv(vcell_pt) if vcell_pt > 0 else float(s.get('soc', 0))
         self._pt_soc.set_value(f"{soc_vtc6_pt:.1f} %")
-        # corriente_accu is in dA; convert to A for display
-        self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0) / 10.0:.1f} A")
-        self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0) / 10.0:.1f} A")
+        # corriente_accu and corriente_dcdc are stored in Amperes (A)
+        self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0):.1f} A")
+        self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0):.1f} A")
         self._pt_vcell.set_value(f"{vcell_pt} mV")
         self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
 
@@ -2355,9 +2342,14 @@ class MainWindow(QMainWindow):
         a1    = s.get('apps1_raw',  0)
         a2    = s.get('apps2_raw',  0)
         brake = s.get('brake_raw',  0)
-        # Normalise — use max of both APPS sensors for throttle
-        self._ped_thr.set_value(max(a1, a2) / ADC_MAX, int(max(a1, a2)))
-        self._ped_brk.set_value(brake / ADC_MAX,        int(brake))
+        
+        # Normalise APPS sensors to 0-100% using empirical minimums/maximums
+        a1_norm = max(0.0, min(1.0, (a1 - APPS1_MIN) / (APPS1_MAX - APPS1_MIN))) if APPS1_MAX > APPS1_MIN else 0.0
+        a2_norm = max(0.0, min(1.0, (a2 - APPS2_MIN) / (APPS2_MAX - APPS2_MIN))) if APPS2_MAX > APPS2_MIN else 0.0
+        thr_pct = max(a1_norm, a2_norm)
+        
+        self._ped_thr.set_value(thr_pct, int(max(a1, a2)))
+        self._ped_brk.set_value(brake / ADC_MAX, int(brake))
 
         self._dyn_apps1.set_value(str(a1))
         self._dyn_apps2.set_value(str(a2))
@@ -2626,7 +2618,25 @@ class MainWindow(QMainWindow):
         self._inp_pilot.setStyleSheet(ins)
         self._inp_circuit.setStyleSheet(ins)
         
-        # 3. Recursively update all child widgets
+        is_light = (F1_TEXT == '#1a1a1a')
+        txt_col = '#111111' if is_light else '#ffffff'
+        spine_col = '#aaaaaa' if is_light else '#555555'
+        grid_col = '#cccccc' if is_light else '#444444'
+
+        # 3. Restyle self._ax_tb (Overview Throttle/Brake plot)
+        if hasattr(self, '_ax_tb') and hasattr(self, '_canvas_tb'):
+            self._ax_tb.set_facecolor(F1_PANEL_BG)
+            self._canvas_tb.figure.patch.set_facecolor(F1_PANEL_BG)
+            self._ax_tb.tick_params(labelsize=7.5, colors=txt_col)
+            self._ax_tb.grid(True, color=grid_col, alpha=0.5 if is_light else 0.35)
+            for s in self._ax_tb.spines.values():
+                s.set_color(spine_col)
+            self._ax_tb.legend(fontsize=7, loc='upper left',
+                               facecolor=F1_PANEL_BG, labelcolor=F1_TEXT,
+                               edgecolor=spine_col, framealpha=0.9)
+            self._canvas_tb.draw_idle()
+        
+        # 4. Recursively update all child widgets
         def _restyle(w):
             if isinstance(w, MetricCard):
                 w._value.setStyleSheet(f"color:{F1_TEXT}; font-size:19px; font-weight:bold; background:transparent; border:none;")
@@ -2634,26 +2644,56 @@ class MainWindow(QMainWindow):
                 w._set_border(col)
                 w._title.setStyleSheet(f"color:{col}; font-size:9px; font-weight:bold; background:transparent; border:none;")
                 w.update()
-                
-            elif isinstance(w, DroppablePlotPanel):
-                w._title_lbl.setStyleSheet(f"color:#444; font-size:9px; background:transparent; border:none;")
-                w._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
-                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; }}")
+
+            elif isinstance(w, MplCanvas):
                 w._ax.set_facecolor(F1_PANEL_BG)
                 w._canvas.figure.patch.set_facecolor(F1_PANEL_BG)
-                w._ax.spines['bottom'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
-                w._ax.spines['left'].set_color('#555' if F1_TEXT == '#1a1a1a' else '#333')
-                w._ax.tick_params(colors='#1a1a1a' if F1_TEXT == '#1a1a1a' else '#e0e0e0')
+                w._ax.tick_params(labelsize=7.5, colors=txt_col)
+                w._ax.grid(True, color=grid_col, alpha=0.5 if is_light else 0.35)
+                for s in w._ax.spines.values():
+                    s.set_color(spine_col)
+                w._canvas.draw_idle()
+                
+            elif isinstance(w, DroppablePlotPanel):
+                w._title_lbl.setStyleSheet(f"color:{ISC_GREEN if w._channel else ('#666' if is_light else '#888')}; font-size:9px; font-weight:bold; background:transparent; border:none;")
+                w._val_lbl.setStyleSheet(f"color:{ISC_GREEN}; font-size:15px; font-weight:bold; background:transparent; border:none;")
+                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid {'#ccc' if is_light else '#333'}; }}")
+                w._ax.set_facecolor(F1_PANEL_BG)
+                w._canvas.figure.patch.set_facecolor(F1_PANEL_BG)
+                w._ax.tick_params(labelsize=7.5, colors=txt_col)
+                w._ax.grid(True, color=grid_col, alpha=0.5 if is_light else 0.35)
+                for s in w._ax.spines.values():
+                    s.set_color(spine_col)
                 w._canvas.draw_idle()
                 
             elif isinstance(w, QTextEdit):
-                w.setStyleSheet(f"background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid #333; font-family:'Courier New'; font-size:9px;")
+                w.setStyleSheet(f"background:{F1_PANEL_BG}; color:{F1_TEXT}; border:1px solid {'#ccc' if is_light else '#333'}; font-family:'Courier New'; font-size:9px;")
                 
             elif isinstance(w, QComboBox) or isinstance(w, QLineEdit):
                 w.setStyleSheet(self.get_input_style())
+
+            elif isinstance(w, QTableWidget):
+                w.setStyleSheet(f"""
+                    QTableWidget {{ background:{F1_MID_BG}; color:{F1_TEXT}; gridline-color:{'#ddd' if is_light else '#222'}; border:1px solid {'#ccc' if is_light else '#222'}; }}
+                    QHeaderView::section {{ background:{F1_PANEL_BG}; color:{ISC_GREEN}; padding:4px; border:1px solid {'#ccc' if is_light else '#222'}; font-weight:bold; }}
+                """)
+                for r in range(w.rowCount()):
+                    for c in range(w.columnCount()):
+                        item = w.item(r, c)
+                        if item:
+                            item.setForeground(QColor(F1_TEXT))
+
+            elif isinstance(w, QCheckBox):
+                w.setStyleSheet(f"color:{F1_TEXT}; font-size:10px;")
+
+            elif isinstance(w, QProgressBar):
+                w.setStyleSheet(f"""
+                    QProgressBar {{ background:{F1_MID_BG}; border:1px solid {'#ccc' if is_light else '#333'}; border-radius:3px; text-align:center; color:{F1_TEXT}; }}
+                    QProgressBar::chunk {{ background:{ISC_GREEN}; }}
+                """)
                 
             elif isinstance(w, AlertBanner):
-                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px dashed #333; border-radius:4px; }}")
+                w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px dashed {'#ccc' if is_light else '#333'}; border-radius:4px; }}")
                 
             elif isinstance(w, GCircleWidget):
                 w.update()
@@ -2803,6 +2843,12 @@ class MainWindow(QMainWindow):
         sv.addWidget(self._pr_progress)
         
         lv.addWidget(status_box)
+
+        self._pr_btn_open_merge = QPushButton("Open Import/Merge Options")
+        self._pr_btn_open_merge.setStyleSheet(self.get_button_style('accent'))
+        self._pr_btn_open_merge.clicked.connect(self._open_post_race)
+        lv.addWidget(self._pr_btn_open_merge)
+        
         lv.addStretch()
         
         lw = QWidget(); lw.setLayout(lv); lw.setFixedWidth(220)
@@ -2812,8 +2858,8 @@ class MainWindow(QMainWindow):
         rv = QVBoxLayout()
         rv.addWidget(self._lbl("MicroSD Card File Log Directory", f"color:{ISC_GREEN}; font-size:12px; font-weight:bold;"))
         
-        self._pr_table = QTableWidget(0, 4)
-        self._pr_table.setHorizontalHeaderLabels(["Index", "File Name", "Size (bytes)", "Action"])
+        self._pr_table = QTableWidget(0, 5)
+        self._pr_table.setHorizontalHeaderLabels(["Index", "File Name", "Size (bytes)", "Date / Modified", "Action"])
         self._pr_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._pr_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._pr_table.setStyleSheet(f"""
@@ -2941,13 +2987,26 @@ class MainWindow(QMainWindow):
             size_item.setTextAlignment(Qt.AlignCenter)
             self._pr_table.setItem(row, 2, size_item)
             
+            # Date / Modified
+            mtime = file.get("mtime", 0)
+            if mtime > 0:
+                try:
+                    dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    dt_str = "Unknown"
+            else:
+                dt_str = "N/A"
+            date_item = QTableWidgetItem(dt_str)
+            date_item.setTextAlignment(Qt.AlignCenter)
+            self._pr_table.setItem(row, 3, date_item)
+            
             # Action Download Button
             btn = QPushButton("Download")
             btn.setStyleSheet(self.get_button_style())
             file_idx = file["index"]
             file_name = file["name"]
             btn.clicked.connect(lambda checked=False, f_idx=file_idx, f_name=file_name: self._start_file_download(f_idx, f_name))
-            self._pr_table.setCellWidget(row, 3, btn)
+            self._pr_table.setCellWidget(row, 4, btn)
             
         self._pr_lbl_status.setText(f"Connected. Found {len(files)} logs.")
 
@@ -2982,14 +3041,47 @@ class MainWindow(QMainWindow):
     def _on_extraction_status(self, text):
         self._pr_lbl_status.setText(text)
 
+    def _show_custom_msgbox(self, title: str, message: str, is_error: bool = False):
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Critical if is_error else QMessageBox.Information)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setStyleSheet(f"""
+            QMessageBox {{
+                background-color: {F1_DARK_BG};
+            }}
+            QLabel {{
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 6px;
+            }}
+            QPushButton {{
+                background-color: {F1_MID_BG};
+                color: #ffffff;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 5px 18px;
+                font-weight: bold;
+                min-width: 65px;
+            }}
+            QPushButton:hover {{
+                background-color: {ISC_GREEN};
+                color: #000000;
+            }}
+        """)
+        msg.exec_()
+
     def _on_extraction_finished(self, success, result):
         if success:
+            if "Files listed" in result:
+                return
             self._pr_progress.setValue(100)
             self._pr_lbl_status.setText(f"Success! Saved to {Path(result).name}")
-            QMessageBox.information(self, "Extraction Complete", f"File downloaded and converted successfully:\n{result}")
+            self._show_custom_msgbox("Extraction Complete", f"File downloaded successfully to:\n\n{result}", is_error=False)
         else:
             self._pr_lbl_status.setText(f"Error: {result}")
-            QMessageBox.critical(self, "Extraction Error", f"Extraction failed:\n{result}")
+            self._show_custom_msgbox("Extraction Error", f"Extraction failed:\n\n{result}", is_error=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3077,10 +3169,10 @@ def convert_card_csv_to_telemetry_csv(input_bytes: bytes, output_path: Path):
             soc_val = soc_from_cell_mv(vmin_global) if vmin_global > 0 else get_val("soc", 0.0)
             
             pack_current_mA = get_val("I_filt_mA", 0.0)
-            corriente_accu = pack_current_mA / 100.0
+            corriente_accu = pack_current_mA / 1000.0
             
             dcdc_current_mA = get_val("Idcdc_mA", 0.0)
-            corriente_dcdc = dcdc_current_mA / 100.0
+            corriente_dcdc = dcdc_current_mA / 1000.0
             
             out_row = [
                 datetime.now().isoformat(),
@@ -3254,12 +3346,13 @@ class AMSExtractionThread(QThread):
                 if expected_crc != 0 and actual_crc != expected_crc:
                     raise Exception(f"File integrity check failed! Expected CRC {expected_crc:08X}, got {actual_crc:08X}")
                 
-                self.status.emit("Converting data to telemetry CSV...")
-                logs_dir = Path("logs")
-                logs_dir.mkdir(exist_ok=True)
-                out_path = logs_dir / f"extracted_{self.selected_file_name or 'LOG.CSV'}"
+                self.status.emit("Saving raw log to AMS_data folder...")
+                ams_data_dir = Path("AMS_data")
+                ams_data_dir.mkdir(exist_ok=True)
+                out_path = ams_data_dir / (self.selected_file_name or "LOG.CSV")
                 
-                convert_card_csv_to_telemetry_csv(file_bytes, out_path)
+                with open(out_path, 'wb') as f:
+                    f.write(file_bytes)
                 self.finished.emit(True, str(out_path.resolve()))
                 
         except Exception as e:

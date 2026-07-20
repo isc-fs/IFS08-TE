@@ -522,7 +522,7 @@ def _decode_fast_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_motor1':   unpacked[15],
         'inv_temp_pwrstg':   unpacked[16],
         'inv_temp_board':    unpacked[17],
-        'inv_rpm':           unpacked[18],
+        'inv_rpm':           int(round(unpacked[18] / 10.0)),
     }
 
 
@@ -534,8 +534,8 @@ def _decode_slow_snapshot(data: bytes, seq: int) -> dict:
     return {
         'seq': seq,
         'soc':             unpacked[0],
-        'corriente_accu':  unpacked[1],
-        'corriente_dcdc':  unpacked[2],
+        'corriente_accu':  unpacked[1] / 10.0,
+        'corriente_dcdc':  unpacked[2] / 10.0,
         'temp_dcdc':       unpacked[3],
         'tick_ms':         unpacked[4],
         'vmin_modulo':     list(unpacked[5:10]),
@@ -574,8 +574,8 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'soc':                unpacked[13],
         'vmin_modulo':        vmin_modulo,
         'vmax_modulo':        vmax_modulo,
-        'corriente_accu':     unpacked[24],
-        'corriente_dcdc':     unpacked[25],
+        'corriente_accu':     unpacked[24] / 10.0,
+        'corriente_dcdc':     unpacked[25] / 10.0,
         'temp_dcdc':          unpacked[26],
         'temp_max_modulo':    temp_max_modulo,
         'inv_state':          unpacked[32],
@@ -585,7 +585,7 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_motor1':    unpacked[36],
         'inv_temp_pwrstg':    unpacked[37],
         'inv_temp_board':     unpacked[38],
-        'inv_rpm':            unpacked[39],
+        'inv_rpm':            int(round(unpacked[39] / 10.0)),
         'inv_speed_actual':   unpacked[40],
         'inv_current_actual': unpacked[41],
     }
@@ -921,7 +921,7 @@ def merge_ams_temps_into_session(
 
         # Check for accumulator current or min cell voltage to use as alignment signal
         if 'corriente_accu' in session_df.columns and 'I_filt_mA' in ams_df.columns:
-            s_val = session_df['corriente_accu'].values * 100.0  # dA to mA
+            s_val = session_df['corriente_accu'].values * 1000.0  # A to mA
             a_val = ams_df['I_filt_mA'].values
         elif 'v_cell_min_mV' in session_df.columns and 'vmin_mV' in ams_df.columns:
             s_val = session_df['v_cell_min_mV'].values
@@ -986,7 +986,7 @@ def merge_ams_temps_into_session(
         matched = int(merged[AMS_TEMP_COLS[0]].notna().sum()) if AMS_TEMP_COLS[0] in merged.columns else 0
         return True, (
             f"AMS Temps merged — Offset: {best_offset} ms. "
-            f"{matched}/{len(merged)} session rows matched (≤5 s)."
+            f"{matched}/{len(merged)} session rows matched (<=5 s)."
         )
 
     except Exception as exc:
