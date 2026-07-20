@@ -2409,7 +2409,9 @@ class MainWindow(QMainWindow):
         a1    = s.get('apps1_raw', 0)
         a2    = s.get('apps2_raw', 0)
         brk   = s.get('brake_raw', 0)
-        thr_pct = max(a1, a2) / ADC_MAX * 100.0
+        a1_norm = max(0.0, min(1.0, (a1 - APPS1_MIN) / (APPS1_MAX - APPS1_MIN))) if APPS1_MAX > APPS1_MIN else 0.0
+        a2_norm = max(0.0, min(1.0, (a2 - APPS2_MIN) / (APPS2_MAX - APPS2_MIN))) if APPS2_MAX > APPS2_MIN else 0.0
+        thr_pct = max(a1_norm, a2_norm) * 100.0
         brk_pct = brk / ADC_MAX * 100.0
         self._ov_thr_hist.append(thr_pct)
         self._ov_brk_hist.append(brk_pct)
