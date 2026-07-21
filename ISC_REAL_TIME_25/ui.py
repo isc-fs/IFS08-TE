@@ -286,13 +286,13 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     # ── Battery / AMS — current & DC-DC ───────────────────────────────────
     'corriente_accu':       ('Pack Current',           'A'),
     'corriente_dcdc':       ('DC-DC Current',          'A'),
-    'temp_dcdc':            ('DC-DC Temperature',      'degC'),
+    'temp_dcdc':            ('DC-DC Temperature',      'ºC'),
     # ── Battery / AMS — per-module max temperature ─────────────────────────
-    'tmax_modulo_0':        ('Tmax Module 0',          'degC'),
-    'tmax_modulo_1':        ('Tmax Module 1',          'degC'),
-    'tmax_modulo_2':        ('Tmax Module 2',          'degC'),
-    'tmax_modulo_3':        ('Tmax Module 3',          'degC'),
-    'tmax_modulo_4':        ('Tmax Module 4',          'degC'),
+    'tmax_modulo_0':        ('Tmax Module 0',          'ºC'),
+    'tmax_modulo_1':        ('Tmax Module 1',          'ºC'),
+    'tmax_modulo_2':        ('Tmax Module 2',          'ºC'),
+    'tmax_modulo_3':        ('Tmax Module 3',          'ºC'),
+    'tmax_modulo_4':        ('Tmax Module 4',          'ºC'),
     # ── Inverter status ───────────────────────────────────────────────────
     'inv_state':            ('Inverter State',         ''),
     'inv_vconfig_active':   ('Vconfig Active',         '0/1'),
@@ -302,13 +302,13 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'est_time_remaining':   ('Est. Time Remaining',    'min'),
     # ── Inverter electrical ───────────────────────────────────────────────
     'inv_dc_bus_V':         ('DC Bus Voltage',         'V'),
-    'inv_temp_motor1':      ('Ext Temp Sensor 1',      'degC'),   # NTC on Sensor 1 input (disconnected = 255)
-    'inv_temp_motor2':      ('Motor 2 Winding Temp',   'degC'),   # NTC on Sensor 2 input (KTY81-210 working sensor)
-    'inv_temp_pwrstg':      ('Power Stage Temp',       'degC'),   # Alias for Motor 2 / Sensor 2
-    'inv_temp_board':       ('Inverter Board Temp',    'degC'),
+    'inv_temp_motor1':      ('Ext Temp Sensor 1',      'ºC'),   # NTC on Sensor 1 input (disconnected = 255)
+    'inv_temp_motor2':      ('Motor 2 Winding Temp',   'ºC'),   # NTC on Sensor 2 input (KTY81-210 working sensor)
+    'inv_temp_pwrstg':      ('Power Stage Temp',       'ºC'),   # Alias for Motor 2 / Sensor 2
+    'inv_temp_board':       ('Inverter Board Temp',    'ºC'),
     # ── Motor speed & current ─────────────────────────────────────────────
     'inv_rpm':              ('Motor Speed',            'RPM'),
-    'inv_speed_actual':     ('Speed Feedback',         'RPM'),
+    'inv_speed_actual':     ('Vehicle Speed',          'km/h'),
     'inv_current_actual':   ('Motor Current',          'A'),
 }
 
@@ -1522,10 +1522,11 @@ class PostRaceWindow(QWidget):
             f"color:{F1_WARNING}; font-size:9px; font-family:'Courier New';")
         QApplication.processEvents()
 
-        ok, msg = rtt.merge_gps_into_session(
+        ok, msg, new_path = rtt.merge_gps_into_session(
             self._session_path, self._gps_file_path, utc_offset_hours=utc_off)
 
         if ok:
+            self._session_path = new_path
             self._gps_status.setText(f"✓  {msg}")
             self._gps_status.setStyleSheet(
                 f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
@@ -1552,9 +1553,10 @@ class PostRaceWindow(QWidget):
             f"color:{F1_WARNING}; font-size:9px; font-family:'Courier New';")
         QApplication.processEvents()
 
-        ok, msg = rtt.merge_ams_temps_into_session(self._session_path, self._ams_file_path)
+        ok, msg, new_path = rtt.merge_ams_temps_into_session(self._session_path, self._ams_file_path)
 
         if ok:
+            self._session_path = new_path
             self._ams_status.setText(f"✓  {msg}")
             self._ams_status.setStyleSheet(
                 f"color:{ISC_GREEN}; font-size:9px; font-family:'Courier New';")
@@ -1579,9 +1581,10 @@ class PostRaceWindow(QWidget):
             
             if self._gps_file_path:
                 utc_off = self._UTC_OFFSETS[self._utc_offset_combo.currentIndex()][1]
-                ok, msg = rtt.merge_gps_into_session(
+                ok, msg, new_path = rtt.merge_gps_into_session(
                     self._session_path, self._gps_file_path, utc_offset_hours=utc_off)
                 if ok:
+                    self._session_path = new_path
                     merged_any = True
                     gps_msg = f"GPS: {msg}\n"
                     self._log_append(f"[AUTO-MERGE] GPS integrated: {msg}")
@@ -1589,9 +1592,10 @@ class PostRaceWindow(QWidget):
                     self._log_append(f"[AUTO-MERGE] GPS failed: {msg}")
             
             if self._ams_file_path:
-                ok, msg = rtt.merge_ams_temps_into_session(
+                ok, msg, new_path = rtt.merge_ams_temps_into_session(
                     self._session_path, self._ams_file_path)
                 if ok:
+                    self._session_path = new_path
                     merged_any = True
                     ams_msg = f"AMS: {msg}\n"
                     self._log_append(f"[AUTO-MERGE] AMS integrated: {msg}")
@@ -2004,8 +2008,8 @@ class MainWindow(QMainWindow):
         cr = QHBoxLayout(); cr.setSpacing(6)
         self._ov_rpm     = MetricCard("RPM",         "rpm",  ISC_GREEN)
         self._ov_vbus    = MetricCard("DC BUS",      "V",    ISC_GREEN)
-        self._ov_tm2     = MetricCard("MOTOR 2 TEMP","degC", F1_WARNING)
-        self._ov_temp    = MetricCard("MAX TEMP",    "degC", F1_ERROR)
+        self._ov_tm2     = MetricCard("MOTOR 2 TEMP","ºC", F1_WARNING)
+        self._ov_temp    = MetricCard("MAX TEMP",    "ºC", F1_ERROR)
         self._ov_soc     = MetricCard("SOC (VTC6)",  "%",    F1_BLUE)
         self._ov_time_rem= MetricCard("EST REMAINING","",    ISC_GREEN)
         self._ov_torque  = MetricCard("TORQUE REQ",  "%",    ISC_GREEN)
@@ -2021,7 +2025,7 @@ class MainWindow(QMainWindow):
         pr = QHBoxLayout(); pr.setSpacing(6)
         self._ov_plot_rpm  = MplCanvas("Motor Speed  [RPM]",      ISC_GREEN)
         self._ov_plot_vbus = MplCanvas("DC Bus Voltage  [V]",     F1_WARNING)
-        self._ov_plot_temp = MplCanvas("Max Battery Temp  [degC]",F1_ERROR)
+        self._ov_plot_temp = MplCanvas("Max Battery Temp  [ºC]",F1_ERROR)
 
         # Throttle + Brake dual-line canvas
         self._ov_thr_hist: Deque[float] = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
@@ -2171,11 +2175,11 @@ class MainWindow(QMainWindow):
             vbv.addWidget(b); self._mod_v_bars.append(b)
         bot.addWidget(self._vbox_v, stretch=1)
 
-        self._vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {alert_temp:.0f} degC")
+        self._vbox_t = QGroupBox(f"PER-MODULE MAX TEMPERATURE  [ºC]   —   ALERT > {alert_temp:.0f} ºC")
         vbt = QVBoxLayout(self._vbox_t)
         self._mod_t_bars: List[ModuleBarWidget] = []
         for i in range(5):
-            b = ModuleBarWidget(i, "degC", lo=0, hi=80, warn_hi=alert_temp)
+            b = ModuleBarWidget(i, "ºC", lo=0, hi=80, warn_hi=alert_temp)
             vbt.addWidget(b); self._mod_t_bars.append(b)
         bot.addWidget(self._vbox_t, stretch=1)
         v.addLayout(bot, stretch=3)
@@ -2297,7 +2301,7 @@ class MainWindow(QMainWindow):
         tmax = s.get('temp_max_modulo', [])
         valid_t = [t for t in tmax if t != 0]
         if valid_t and max(valid_t) > alert_temp:
-            alerts.append((f"BATTERY TEMP {max(valid_t):.0f} degC > {alert_temp:.0f} degC", 'critical'))
+            alerts.append((f"BATTERY TEMP {max(valid_t):.0f} ºC > {alert_temp:.0f} ºC", 'critical'))
         vbus = s.get('inv_dc_bus_V', 0)
         if 0 < vbus < alert_volt:
             alerts.append((f"DC BUS {vbus} V < {alert_volt:.0f} V", 'warning'))
@@ -2399,7 +2403,7 @@ class MainWindow(QMainWindow):
 
         self._mini_rpm.setText(f"{int(rpm):,} rpm")
         self._mini_vbus.setText(f"{vbus} V")
-        self._mini_temp.setText(f"{max_t:.0f} degC")
+        self._mini_temp.setText(f"{max_t:.0f} ºC")
 
         self._ov_plot_rpm.update_plot(rpm)
         self._ov_plot_vbus.update_plot(vbus)
@@ -2456,20 +2460,21 @@ class MainWindow(QMainWindow):
 
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
-        self._pt_speed.set_value(str(s.get('inv_speed_actual', 0)))
+        self._pt_speed.set_value(f"{s.get('inv_speed_actual', 0):.1f} km/h")
         _tm1_raw = s.get('inv_temp_motor1', 0)
         # After -50 offset applied in decoder: >=200°C means disconnected/out-of-range (DEM 21)
-        _tm1_str = "N/C (Disconnected)" if _tm1_raw >= 200 else f"{_tm1_raw} degC"
+        _tm1_str = "N/C (Disconnected)" if _tm1_raw >= 200 else f"{_tm1_raw} ºC"
         self._pt_tm1.set_value(_tm1_str)
         _tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
-        self._pt_tm2.set_value(f"{_tm2_val} degC")
-        self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)} degC")
+        self._pt_tm2.set_value(f"{_tm2_val} ºC")
+        self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)} ºC")
         _tdcdc_raw = s.get('temp_dcdc', 0)
-        _tdcdc_str = "N/C" if _tdcdc_raw <= -100 or _tdcdc_raw == -32768 else f"{_tdcdc_raw} degC"
+        _tdcdc_str = "N/C" if _tdcdc_raw <= -100 or _tdcdc_raw == -32768 else f"{_tdcdc_raw} ºC"
         self._pt_tdcdc.set_value(_tdcdc_str)
         
         dem_val = s.get('dem_code', s.get('inv_error', 0))
-        self._pt_dem.set_value(f"{dem_val}")
+        dem_desc = INVERTER_ERRORS_MAP.get(dem_val, "Unknown")
+        self._pt_dem.set_value(f"{dem_val} - {dem_desc}" if dem_val > 0 else "0 - No Fault")
         foc_val = s.get('emctrl_foc_bitstate', 0)
         self._pt_foc.set_value(f"0b{foc_val:08b}" if foc_val > 0 else "0 (OK)")
         
@@ -2652,7 +2657,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_vbox_v') and self._vbox_v:
             self._vbox_v.setTitle(f"PER-MODULE CELL VOLTAGE  [mV]   (min to max)   —   ALERT < {cell_mv:.0f} mV")
         if hasattr(self, '_vbox_t') and self._vbox_t:
-            self._vbox_t.setTitle(f"PER-MODULE MAX TEMPERATURE  [degC]   —   ALERT > {temp_c:.0f} degC")
+            self._vbox_t.setTitle(f"PER-MODULE MAX TEMPERATURE  [ºC]   —   ALERT > {temp_c:.0f} ºC")
 
     def _open_post_race(self):
         if self._post_race_win is None or not self._post_race_win.isVisible():
@@ -2742,8 +2747,8 @@ class MainWindow(QMainWindow):
                 # 2. Text-to-speech announcement (if enabled)
                 if self.settings.get("enable_tts", True):
                     friendly_text = alert_text
-                    if "degC" in friendly_text:
-                        friendly_text = friendly_text.replace("degC", "degrees Celsius")
+                    if "ºC" in friendly_text:
+                        friendly_text = friendly_text.replace("ºC", "degrees Celsius")
                     if "mV" in friendly_text:
                         friendly_text = friendly_text.replace("mV", "millivolts")
                     if "V" in friendly_text:

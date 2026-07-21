@@ -531,6 +531,7 @@ def _decode_fast_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_pwrstg':   unpacked[16] - 50,   # Backward-compat alias for Sensor 2
         'inv_temp_board':    unpacked[17] - 50,   # Board_Temp_degC
         'inv_rpm':           int(round(unpacked[18] / 10.0)),
+        'inv_speed_actual':   round((unpacked[18] / 10.0) * (11.0 / 32.0) * 0.2032 * 3.6, 1),
     }
 
 
@@ -542,8 +543,8 @@ def _decode_slow_snapshot(data: bytes, seq: int) -> dict:
     return {
         'seq': seq,
         'soc':             unpacked[0],
-        'corriente_accu':  unpacked[1] / 10.0,
-        'corriente_dcdc':  unpacked[2] / 10.0,
+        'corriente_accu':  -unpacked[1] / 10.0,
+        'corriente_dcdc':  -unpacked[2] / 10.0,
         'temp_dcdc':       unpacked[3],
         'tick_ms':         unpacked[4],
         'vmin_modulo':     list(unpacked[5:10]),
@@ -582,11 +583,12 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'soc':                unpacked[13],
         'vmin_modulo':        vmin_modulo,
         'vmax_modulo':        vmax_modulo,
-        'corriente_accu':     unpacked[24] / 10.0,
-        'corriente_dcdc':     unpacked[25] / 10.0,
+        'corriente_accu':     -unpacked[24] / 10.0,
+        'corriente_dcdc':     -unpacked[25] / 10.0,
         'temp_dcdc':          unpacked[26],
         'temp_max_modulo':    temp_max_modulo,
         'inv_state':          unpacked[32],
+        'inv_vconfig_active': 1 if unpacked[33] > 0 else 0,
         'last_vconfig_tick':  unpacked[33],
         'inv_error':          unpacked[34],
         'dem_code':           unpacked[34],  # Alias for inv_error (DEM_Code from EMC_TX_STATE_2)
@@ -598,8 +600,8 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_pwrstg':    unpacked[37] - 50,  # Backward-compat alias for Sensor 2
         'inv_temp_board':     unpacked[38] - 50,  # Board_Temp_degC
         'inv_rpm':            int(round(unpacked[39] / 10.0)),
-        'inv_speed_actual':   unpacked[40],
-        'inv_current_actual': unpacked[41],
+        'inv_speed_actual':   round((unpacked[39] / 10.0) * (11.0 / 32.0) * 0.2032 * 3.6, 1),
+        'inv_current_actual': -unpacked[41],
     }
 
 
@@ -830,7 +832,7 @@ def merge_gps_into_session(
     session_path: Path,
     gps_file_path: Path,
     utc_offset_hours: float = 0.0,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Path]:
     """
     Merge GPS coordinates from an NMEA log (micro-SD) into an existing
     session CSV.
@@ -889,23 +891,25 @@ def merge_gps_into_session(
         # Restore original row order and drop helper column
         merged = merged.loc[orig_order.values] if False else merged  # keep sorted
         merged.drop(columns=['_dt'], inplace=True)
-        merged.to_csv(session_path, index=False)
+        
+        new_path = session_path if session_path.stem.endswith('_merged') else session_path.with_name(f"{session_path.stem}_merged{session_path.suffix}")
+        merged.to_csv(new_path, index=False)
 
         matched = int(merged['gps_fix'].notna().sum()) if 'gps_fix' in merged.columns else 0
         return True, (
             f"GPS merged — {total_fixes} fixes in file, "
             f"{matched}/{len(merged)} session rows matched (≤5 s)."
-        )
+        ), new_path, new_path
 
     except Exception as exc:
         logger.exception("[POST-RACE] GPS merge error")
-        return False, f"Error: {exc}"
+        return False, f"Error: {exc}", session_path
 
 
 def merge_ams_temps_into_session(
     session_path: Path,
     ams_file_path: Path,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Path]:
     """
     Inject per-cell AMS temperature data (19 cells × 5 modules = 95 values)
     from a micro-SD log file into the existing session CSV.
@@ -993,7 +997,9 @@ def merge_ams_temps_into_session(
         merged.drop(columns=['_aligned_tick'], inplace=True, errors='ignore')
         # Restore original order
         merged = merged.loc[orig_order.values]
-        merged.to_csv(session_path, index=False)
+        
+        new_path = session_path if session_path.stem.endswith('_merged') else session_path.with_name(f"{session_path.stem}_merged{session_path.suffix}")
+        merged.to_csv(new_path, index=False)
 
         matched = int(merged[AMS_TEMP_COLS[0]].notna().sum()) if AMS_TEMP_COLS[0] in merged.columns else 0
         return True, (
@@ -1003,7 +1009,7 @@ def merge_ams_temps_into_session(
 
     except Exception as exc:
         logger.exception("[POST-RACE] AMS merge error")
-        return False, f"Error: {exc}"
+        return False, f"Error: {exc}", session_path
 
 
 # ================== MAIN RECEIVE LOOP ==================

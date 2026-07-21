@@ -1,6 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+excludes = [
+    'PyQt5.QtWebEngine', 'PyQt5.QtWebEngineCore', 'PyQt5.QtWebEngineWidgets',
+    'PyQt5.QtQml', 'PyQt5.QtQuick', 'PyQt5.Qt3D', 'PyQt5.QtMultimedia',
+    'PyQt5.QtSql', 'PyQt5.QtDesigner', 'PyQt5.QtBluetooth', 'PyQt5.QtSensors',
+    'PyQt5.QtPositioning', 'PyQt5.QtXml', 'PyQt5.QtNfc',
+    'tkinter', 'tcl', 'scipy', 'unittest', 'pydoc', 'curses',
+    'matplotlib.tests', 'matplotlib.testing', 'numpy.tests'
+]
+
 a = Analysis(
     ['ui.py'],
     pathex=[],
@@ -10,9 +19,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
