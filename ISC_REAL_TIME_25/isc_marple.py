@@ -45,13 +45,7 @@ logger = logging.getLogger("ISC_MARPLE")
 
 def upload_session_csv(file_path: str, metadata: dict) -> None:
     """
-    Sube un archivo CSV a Marple Data y espera a que sea importado.
-
-    Pattern (SDK v3):
-        db     = DB(api_token)
-        stream = db.get_stream(stream_name)
-        ds     = stream.push_file(path, metadata={...})
-        ds     = ds.wait_for_import(timeout=N)
+    Sube un archivo CSV a Marple Data usando el SDK de marple.
     """
     if not os.path.exists(file_path):
         logger.error(f"Archivo no encontrado: {file_path}")
@@ -61,16 +55,10 @@ def upload_session_csv(file_path: str, metadata: dict) -> None:
         logger.info("Conectando a Marple DB…")
         db = DB(MARPLE_API_TOKEN)
 
-        logger.info(f"Obteniendo stream '{DATASTREAM_NAME}'…")
-        stream = db.get_stream(DATASTREAM_NAME)
+        logger.info(f"Subiendo archivo '{os.path.basename(file_path)}' al stream '{DATASTREAM_NAME}'…")
+        dataset_id = db.push_file(DATASTREAM_NAME, file_path, metadata=metadata or {})
 
-        logger.info(f"Subiendo archivo: {os.path.basename(file_path)}")
-        dataset = stream.push_file(file_path, metadata=metadata)
-
-        logger.info(f"Esperando importación (timeout={IMPORT_TIMEOUT_S} s)…")
-        dataset = dataset.wait_for_import(timeout=IMPORT_TIMEOUT_S)
-
-        logger.info(f"¡Subida completada! Dataset: {dataset}")
+        logger.info(f"¡Subida completada! ID de Dataset en Marple: {dataset_id}")
 
     except Exception as e:
         logger.error(f"Error crítico subiendo a Marple: {e}")
