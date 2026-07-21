@@ -196,7 +196,10 @@ class SerialCSVLogger:
         "inv_dc_bus_V",
         "inv_temp_motor1", "inv_temp_motor2", "inv_temp_pwrstg", "inv_temp_board",
         "inv_rpm", "inv_speed_actual", "inv_current_actual",
-        # ── IMU (simulated or parsed from bytes 82-101 of snapshot) ──────────
+        # ── GPS  [snap bytes 82-95] ──────────────────────────────────────────
+        "gps_lat_deg", "gps_lon_deg", "gps_speed_kmh", "gps_course_deg",
+        "gps_sats", "gps_has_fix",
+        # ── IMU (simulated or parsed from snap bytes) ─────────────────────────
         "imu_ax_g", "imu_ay_g", "imu_az_g",
         "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
         "imu_roll_deg", "imu_pitch_deg",
@@ -251,6 +254,13 @@ class SerialCSVLogger:
             s.get('inv_temp_pwrstg',       0), s.get('inv_temp_board',    0),
             s.get('inv_rpm',               0),
             s.get('inv_speed_actual',      0), s.get('inv_current_actual', 0),
+            # GPS columns — only emit when fix is valid; blank otherwise avoids
+            # stale positions showing as live after the fix drops.
+            s.get('gps_lat_deg',   "") if s.get('gps_has_fix', 0) else "",
+            s.get('gps_lon_deg',   "") if s.get('gps_has_fix', 0) else "",
+            s.get('gps_speed_kmh', "") if s.get('gps_has_fix', 0) else "",
+            s.get('gps_course_deg',"") if s.get('gps_has_fix', 0) else "",
+            s.get('gps_sats',        0), s.get('gps_has_fix', 0),
             # IMU columns
             s.get('imu_ax_g',            0.0), s.get('imu_ay_g',         0.0), s.get('imu_az_g',            0.0),
             s.get('imu_gx_dps',          0.0), s.get('imu_gy_dps',       0.0), s.get('imu_gz_dps',          0.0),
@@ -567,6 +577,17 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
     vmax_modulo = list(unpacked[19:24])
     temp_max_modulo = list(unpacked[27:32])
     
+    # ── GPS fields [bytes 82..95] ─────────────────────────────────────────────
+    # Always read raw; scale only when has_fix == 1 to avoid stale position
+    # being shown as live after the fix drops.  If fix is 0 the position
+    # registers hold the last valid values — intentional ECU behaviour.
+    _gps_has_fix    = data[95]
+    _gps_lat_raw    = struct.unpack_from('<i', data, 82)[0]   # int32 LE degrees × 1e7
+    _gps_lon_raw    = struct.unpack_from('<i', data, 86)[0]   # int32 LE degrees × 1e7
+    _gps_spd_raw    = struct.unpack_from('<H', data, 90)[0]   # uint16 LE km/h × 100
+    _gps_crs_raw    = struct.unpack_from('<H', data, 92)[0]   # uint16 LE deg × 100
+    _gps_sats       = data[94]
+
     return {
         'tick_ms':            unpacked[0],
         'seq':                seq, # unpacked[1] is seq as well, but we pass it
@@ -601,8 +622,21 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_pwrstg':    unpacked[37] - 50,  # Backward-compat alias for Sensor 2
         'inv_temp_board':     unpacked[38] - 50,  # Board_Temp_degC
         'inv_rpm':            int(round(unpacked[39] / 10.0)),
-        'inv_speed_actual':   round((unpacked[39] / 10.0) * (11.0 / 32.0) * 0.2032 * 3.6, 1),
+        'inv_speed_actual':   round((unpacked[39] / 10.0) * (11.0 / 32.0) * (2.0 * math.pi / 60.0) * 0.2032 * 3.6, 1),
         'inv_current_actual': -unpacked[41],
+        # ── GPS [bytes 82..95] ───────────────────────────────────────────────
+        # Scaled human-readable values (always present; gate display on gps_has_fix)
+        'gps_lat_deg':    round(_gps_lat_raw / 1e7, 7),
+        'gps_lon_deg':    round(_gps_lon_raw / 1e7, 7),
+        'gps_speed_kmh':  round(_gps_spd_raw / 100.0, 2),
+        'gps_course_deg': round(_gps_crs_raw / 100.0, 2),
+        'gps_sats':       _gps_sats,
+        'gps_has_fix':    _gps_has_fix,
+        # Raw wire values (for diagnostics / round-trip tests)
+        'gps_lat_deg1e7':     _gps_lat_raw,
+        'gps_lon_deg1e7':     _gps_lon_raw,
+        'gps_speed_kmh_x100': _gps_spd_raw,
+        'gps_course_deg_x100':_gps_crs_raw,
     }
 
 
@@ -1201,6 +1235,14 @@ def receive_data(bucket_id: str,
                 logger.debug("[STATS] rx=%d frag_ok=%d snap=%d chk=%d drop=%d",
                              counters["rx"], counters["frag_ok"],
                              counters["snapshot"], counters["chk"], counters["frag_drop"])
+                _s = latest_data_dict.get('snapshot', {})
+                if _s.get('gps_has_fix', 0):
+                    logger.debug(
+                        "[GPS] lat=%.7f lon=%.7f spd=%.2f km/h crs=%.1f deg sats=%d",
+                        _s.get('gps_lat_deg', 0.0), _s.get('gps_lon_deg', 0.0),
+                        _s.get('gps_speed_kmh', 0.0), _s.get('gps_course_deg', 0.0),
+                        _s.get('gps_sats', 0),
+                    )
                 last_stats_t = now
 
     finally:

@@ -310,6 +310,13 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'inv_rpm':              ('Motor Speed',            'RPM'),
     'inv_speed_actual':     ('Vehicle Speed',          'km/h'),
     'inv_current_actual':   ('Motor Current',          'A'),
+    # ── GPS live (from radio snapshot bytes 82-95) ─────────────────────────
+    'gps_lat_deg':          ('GPS Latitude',           '°'),
+    'gps_lon_deg':          ('GPS Longitude',          '°'),
+    'gps_speed_kmh':        ('GPS Speed',              'km/h'),
+    'gps_course_deg':       ('GPS Course',             '°'),
+    'gps_sats':             ('GPS Satellites',         ''),
+    'gps_has_fix':          ('GPS Fix',                '0/1'),
 }
 
 plt.style.use('dark_background')
@@ -2073,6 +2080,12 @@ class MainWindow(QMainWindow):
         self._lbl_inv_errors.setStyleSheet("color:#ff3333; font-size:10px; font-weight:bold;")
         self._lbl_inv_errors.hide()
 
+        # GPS live status label (shown in indicator row)
+        self._lbl_gps = QLabel("GPS: NO FIX")
+        self._lbl_gps.setStyleSheet(
+            "color:#555; font-size:9px; font-family:'Courier New'; font-weight:bold;"
+        )
+
         for l in (self._ind_precharge, self._ind_inv_ok, self._ind_ams):
             l.setStyleSheet("color:#333; font-size:10px; font-weight:bold;")
         for l in (self._lbl_seq, self._lbl_tick):
@@ -2080,7 +2093,7 @@ class MainWindow(QMainWindow):
         self._lbl_lqi.setStyleSheet("color:#00c853; font-size:9px; font-family:'Courier New';")
         for w2 in (self._ind_precharge, self._ind_inv_ok, self._ind_ams,
                    self._lbl_seq, self._lbl_tick, self._signal_bars, self._lbl_lqi,
-                   self._lbl_inv_errors):
+                   self._lbl_inv_errors, self._lbl_gps):
             ir.addWidget(w2)
         ir.addStretch()
         v.addLayout(ir, stretch=1)
@@ -2459,6 +2472,25 @@ class MainWindow(QMainWindow):
             self._lbl_lqi.setStyleSheet("color:#f0b429; font-size:9px; font-family:'Courier New';")
         else:
             self._lbl_lqi.setStyleSheet("color:#ef4444; font-size:9px; font-family:'Courier New';")
+
+        # GPS live status
+        gps_fix  = s.get('gps_has_fix', 0)
+        gps_sats = s.get('gps_sats', 0)
+        if gps_fix:
+            gps_lat  = s.get('gps_lat_deg',   0.0)
+            gps_lon  = s.get('gps_lon_deg',   0.0)
+            gps_spd  = s.get('gps_speed_kmh', 0.0)
+            self._lbl_gps.setText(
+                f"GPS ✓  {gps_lat:+.5f}° {gps_lon:+.5f}°  {gps_spd:.1f} km/h  [{gps_sats} sats]"
+            )
+            self._lbl_gps.setStyleSheet(
+                "color:#00c853; font-size:9px; font-family:'Courier New'; font-weight:bold;"
+            )
+        else:
+            self._lbl_gps.setText(f"GPS NO FIX  [{gps_sats} sats]" if gps_sats else "GPS: NO FIX")
+            self._lbl_gps.setStyleSheet(
+                "color:#555; font-size:9px; font-family:'Courier New'; font-weight:bold;"
+            )
 
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
