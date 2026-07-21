@@ -6,7 +6,7 @@ excludes = [
     'PyQt5.QtQml', 'PyQt5.QtQuick', 'PyQt5.Qt3D', 'PyQt5.QtMultimedia',
     'PyQt5.QtSql', 'PyQt5.QtDesigner', 'PyQt5.QtBluetooth', 'PyQt5.QtSensors',
     'PyQt5.QtPositioning', 'PyQt5.QtXml', 'PyQt5.QtNfc',
-    'tkinter', 'tcl', 'scipy', 'unittest', 'pydoc', 'curses',
+    'tkinter', 'tcl', 'scipy', 'pydoc', 'curses',
     'matplotlib.tests', 'matplotlib.testing', 'numpy.tests'
 ]
 

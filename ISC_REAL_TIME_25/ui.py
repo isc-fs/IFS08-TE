@@ -303,8 +303,8 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     # ── Inverter electrical ───────────────────────────────────────────────
     'inv_dc_bus_V':         ('DC Bus Voltage',         'V'),
     'inv_temp_motor1':      ('Ext Temp Sensor 1',      'ºC'),   # NTC on Sensor 1 input (disconnected = 255)
-    'inv_temp_motor2':      ('Motor 2 Winding Temp',   'ºC'),   # NTC on Sensor 2 input (KTY81-210 working sensor)
-    'inv_temp_pwrstg':      ('Power Stage Temp',       'ºC'),   # Alias for Motor 2 / Sensor 2
+    'inv_temp_motor2':      ('Motor Temp (KTY)',       'ºC'),   # NTC on Sensor 2 input (KTY81-210 working sensor)
+    'inv_temp_pwrstg':      ('Power Stage Temp (IGBT)', 'ºC'),   # Alias for Motor 2 / Sensor 2
     'inv_temp_board':       ('Inverter Board Temp',    'ºC'),
     # ── Motor speed & current ─────────────────────────────────────────────
     'inv_rpm':              ('Motor Speed',            'RPM'),
@@ -2462,11 +2462,10 @@ class MainWindow(QMainWindow):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
         self._pt_speed.set_value(f"{s.get('inv_speed_actual', 0):.1f} km/h")
         _tm1_raw = s.get('inv_temp_motor1', 0)
-        # After -50 offset applied in decoder: >=200°C means disconnected/out-of-range (DEM 21)
-        _tm1_str = "N/C (Disconnected)" if _tm1_raw >= 200 else f"{_tm1_raw} ºC"
+        _tm1_str = "N/C" if _tm1_raw >= 200 else f"{_tm1_raw} ºC"
         self._pt_tm1.set_value(_tm1_str)
-        _tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
-        self._pt_tm2.set_value(f"{_tm2_val} ºC")
+        self._pt_tm2.set_value(f"{s.get('inv_temp_motor2', 0)} ºC")
+        self._pt_pwr.set_value(f"{s.get('inv_temp_pwrstg', 0)} ºC")
         self._pt_tbd.set_value(f"{s.get('inv_temp_board', 0)} ºC")
         _tdcdc_raw = s.get('temp_dcdc', 0)
         _tdcdc_str = "N/C" if _tdcdc_raw <= -100 or _tdcdc_raw == -32768 else f"{_tdcdc_raw} ºC"
@@ -2711,7 +2710,13 @@ class MainWindow(QMainWindow):
                         "try { $s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female) } catch {} }; "
                         f"$s.Speak('{safe_text}')"
                     )
-                    subprocess.run(["powershell", "-Command", ps_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creationflags
+                    )
                 except Exception:
                     pass
         threading.Thread(target=_speak, daemon=True).start()

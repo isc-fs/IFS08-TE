@@ -31,6 +31,7 @@ Post-race data injection:
 from __future__ import annotations
 from collections import deque
 import csv
+import math
 import logging
 import struct
 import threading
@@ -526,12 +527,12 @@ def _decode_fast_snapshot(data: bytes, seq: int) -> dict:
         # DBC EMC_TX_STATE_5 (0x464): physical_degC = raw_byte - 50  (scale=1, offset=-50)
         # Raw 255 → 205°C = out-of-range / sensor disconnected marker
         # Raw   0 → -50°C = minimum of valid range
-        'inv_temp_motor1':   unpacked[15] - 50,   # EMachine_Temp_1_degC (Sensor 1, disconnected)
-        'inv_temp_motor2':   unpacked[16] - 50,   # EMachine_Temp_2_degC (Sensor 2, Motor Winding NTC)
-        'inv_temp_pwrstg':   unpacked[16] - 50,   # Backward-compat alias for Sensor 2
-        'inv_temp_board':    unpacked[17] - 50,   # Board_Temp_degC
+        'inv_temp_motor1':   unpacked[15] - 50,   # EMachine_Temp_1 (Sensor 1, disconnected)
+        'inv_temp_motor2':   unpacked[16] - 50,   # EMachine_Temp_2 (Motor KTY sensor)
+        'inv_temp_pwrstg':   unpacked[17] - 50,   # PwrStg / IGBT Temp
+        'inv_temp_board':    unpacked[17] - 50,   # Board_Temp
         'inv_rpm':           int(round(unpacked[18] / 10.0)),
-        'inv_speed_actual':   round((unpacked[18] / 10.0) * (11.0 / 32.0) * 0.2032 * 3.6, 1),
+        'inv_speed_actual':   round((unpacked[18] / 10.0) * (11.0 / 32.0) * (2.0 * math.pi / 60.0) * 0.2032 * 3.6, 1),
     }
 
 
