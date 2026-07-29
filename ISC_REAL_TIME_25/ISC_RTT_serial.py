@@ -554,7 +554,7 @@ def _decode_slow_snapshot(data: bytes, seq: int) -> dict:
     return {
         'seq': seq,
         'soc':             unpacked[0],
-        'corriente_accu':  -unpacked[1] / 10.0,
+        'corriente_accu':  unpacked[1] / 10.0,
         'corriente_dcdc':  -unpacked[2] / 10.0,
         'temp_dcdc':       unpacked[3],
         'tick_ms':         unpacked[4],
@@ -605,7 +605,7 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'soc':                unpacked[13],
         'vmin_modulo':        vmin_modulo,
         'vmax_modulo':        vmax_modulo,
-        'corriente_accu':     -unpacked[24] / 10.0,
+        'corriente_accu':     unpacked[24] / 10.0,
         'corriente_dcdc':     -unpacked[25] / 10.0,
         'temp_dcdc':          unpacked[26],
         'temp_max_modulo':    temp_max_modulo,

@@ -217,38 +217,86 @@ APPS2_MIN    = 2330   # raw ADC value at 0% depression
 APPS2_MAX    = 3040   # raw ADC value at 100% depression
 RPM_MAX      = 6000
 
-# ── Sony VTC6 95s6p OCV–SoC lookup ───────────────────────────────────────────
-# 95 cells in series × 6 cells in parallel = 570 total cells
-# Pack capacity: 6 × 3.0 Ah = 18 Ah   |   Max voltage: 95 × 4.2 V ≈ 399 V
-# OCV table: (SoC_fraction, cell_OCV_V)  — derived from Sony VTC6 discharge curve
+# ── Sony VTC6 95s6p — SoC estimation ────────────────────────────────────────
+# Pack: 95s series × 6p parallel = 570 cells total
+# Capacity: 6 × 3.0 Ah = 18 Ah
+# Voltage range: 400 V (100% SOC) — 280 V (0% / cutoff as specified)
+# Usable energy: 18 Ah × avg(400+280)/2 = 18 × 340 = 6 120 Wh
+#
+# SOC is calculated from DC Bus Voltage as primary source (always available
+# even when cell-level sensors are not decoded correctly).
+# OCV cell table is kept as secondary fine-grained source when cell mV is valid.
+
+_SOC_V_FULL   = 400.0   # V — 100 % SoC
+_SOC_V_CUTOFF = 280.0   # V — 0 % SoC (accumulator cutoff)
+_PACK_AH      = 18.0    # Ah  (6p × 3.0 Ah VTC6)
+_PACK_WH      = _PACK_AH * (_SOC_V_FULL + _SOC_V_CUTOFF) / 2.0  # ≈ 6 120 Wh
+
+# Fine-grained OCV table for cell-level fallback (per-cell volts vs SoC)
 _VTC6_OCV_TABLE = [
-    (1.000, 4.200), (0.950, 4.150), (0.900, 4.100), (0.800, 4.020),
+    (1.000, 4.211), (0.950, 4.150), (0.900, 4.100), (0.800, 4.020),
     (0.700, 3.940), (0.600, 3.870), (0.500, 3.800), (0.400, 3.740),
     (0.300, 3.680), (0.200, 3.600), (0.100, 3.500), (0.050, 3.400),
-    (0.000, 3.000),
+    (0.000, 2.947),  # 280 V / 95 cells
 ]
 
+def soc_from_voltage(bus_v: float, cell_mv: float = 0.0,
+                     current_a: float = 0.0) -> float:
+    """
+    Estimate SoC (0–100 %) for the 95s6p Sony VTC6 accumulator.
+
+    Priority:
+      1. DC Bus Voltage (inv_dc_bus_V) — always available, linear between
+         280 V (0 %) and 400 V (100 %) as specified.
+      2. Per-cell mV (v_cell_min_mV) — finer resolution via OCV table when
+         the cell sensor is valid (> 2 500 mV, < 4 500 mV per cell).
+         IR compensation applied: OCV = V_cell + I × 0.35 mV/A.
+
+    Returns SoC as a float in [0.0, 100.0].
+    """
+    # ── Primary: DC Bus Voltage ───────────────────────────────────────────
+    if bus_v and bus_v > _SOC_V_CUTOFF * 0.5:   # sanity: > 140 V
+        soc_bus = (bus_v - _SOC_V_CUTOFF) / (_SOC_V_FULL - _SOC_V_CUTOFF) * 100.0
+        soc_bus = max(0.0, min(100.0, soc_bus))
+
+        # ── Secondary: refine with cell OCV if cell sensor is valid ──────
+        if cell_mv and 2500 < cell_mv < 4500:
+            ir_drop_mv = max(0.0, float(current_a)) * 0.35
+            ocv_v = (cell_mv + ir_drop_mv) / 1000.0
+            soc_cell = None
+            for i in range(len(_VTC6_OCV_TABLE) - 1):
+                soc_hi, v_hi = _VTC6_OCV_TABLE[i]
+                soc_lo, v_lo = _VTC6_OCV_TABLE[i + 1]
+                if v_lo <= ocv_v <= v_hi:
+                    frac = (ocv_v - v_lo) / (v_hi - v_lo) if v_hi != v_lo else 0.0
+                    soc_cell = (soc_lo + frac * (soc_hi - soc_lo)) * 100.0
+                    break
+            if soc_cell is None:
+                soc_cell = 100.0 if ocv_v >= _VTC6_OCV_TABLE[0][1] else 0.0
+            soc_cell = max(0.0, min(100.0, soc_cell))
+            # Blend: 60% cell OCV (finer) + 40% bus voltage (robustness)
+            return round(0.6 * soc_cell + 0.4 * soc_bus, 1)
+
+        return round(soc_bus, 1)
+
+    # ── Fallback: cell-only if bus voltage missing ────────────────────────
+    if cell_mv and 2500 < cell_mv < 4500:
+        ir_drop_mv = max(0.0, float(current_a)) * 0.35
+        ocv_v = (cell_mv + ir_drop_mv) / 1000.0
+        for i in range(len(_VTC6_OCV_TABLE) - 1):
+            soc_hi, v_hi = _VTC6_OCV_TABLE[i]
+            soc_lo, v_lo = _VTC6_OCV_TABLE[i + 1]
+            if v_lo <= ocv_v <= v_hi:
+                frac = (ocv_v - v_lo) / (v_hi - v_lo) if v_hi != v_lo else 0.0
+                return round((soc_lo + frac * (soc_hi - soc_lo)) * 100.0, 1)
+        return 100.0 if ocv_v >= _VTC6_OCV_TABLE[0][1] else 0.0
+
+    return 0.0  # no valid source
+
+
+# Keep old name as alias so any remaining call sites still work
 def soc_from_cell_mv(cell_mv: float, current_a: float = 0.0) -> float:
-    """
-    Estimate SoC (0–100 %) from cell voltage using VTC6 OCV table with IR compensation.
-    95s6p Sony VTC6 pack internal resistance ≈ 0.35 mV/A per 6p cell group.
-    Compensates voltage sag during heavy current draw (e.g. 376A acceleration spikes)
-    so SoC readout remains stable during driving.
-    """
-    # Add back IR voltage drop during discharge (I > 0)
-    ir_drop_mv = max(0.0, float(current_a)) * 0.35
-    ocv_est_mv = cell_mv + ir_drop_mv
-    
-    cell_v = ocv_est_mv / 1000.0
-    for i in range(len(_VTC6_OCV_TABLE) - 1):
-        soc_hi, v_hi = _VTC6_OCV_TABLE[i]
-        soc_lo, v_lo = _VTC6_OCV_TABLE[i + 1]
-        if v_lo <= cell_v <= v_hi:
-            frac = (cell_v - v_lo) / (v_hi - v_lo) if v_hi != v_lo else 0.0
-            return round((soc_lo + frac * (soc_hi - soc_lo)) * 100.0, 1)
-    if cell_v >= _VTC6_OCV_TABLE[0][1]:  return 100.0
-    if cell_v <= _VTC6_OCV_TABLE[-1][1]: return 0.0
-    return 0.0
+    return soc_from_voltage(0.0, cell_mv, current_a)
 
 # ── All ECU signals available in the Customise tab ───────────────────────────
 # Format: 'snapshot_key': ('Display Label', 'unit')
@@ -688,6 +736,233 @@ class GCircleWidget(QWidget):
         p.setPen(QColor('#444'))
         p.setFont(QFont("Arial", 7))
         p.drawText(cx - r, cy + r + 3, r * 2, 14, Qt.AlignCenter, "← LAT →")
+        p.end()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GPS TRACK MAP WIDGET
+# ══════════════════════════════════════════════════════════════════════════════
+import math as _math
+
+class GPSTrackWidget(QWidget):
+    """
+    Real-time GPS track map drawn with QPainter.
+    Uses equirectangular local XY projection (origin = first GPS fix).
+    No external map tiles / internet required. Full dark & light theme support.
+    """
+    TRAIL_MAXLEN = 2000   # ~10 min at 3 Hz
+    MIN_MOVE_M   = 0.5    # minimum displacement (m) before appending a new point
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._trail: deque = deque(maxlen=self.TRAIL_MAXLEN)  # (x_m, y_m)
+        self._origin_lat: float | None = None   # degrees
+        self._origin_lon: float | None = None   # degrees
+        self._cur_x: float = 0.0   # metres east  from origin
+        self._cur_y: float = 0.0   # metres north from origin
+        self._cur_spd: float = 0.0  # km/h
+        self._cur_hdg: float = 0.0  # degrees (course over ground)
+        self._has_fix: bool = False
+        self._sats: int = 0
+        self._lat: float = 0.0
+        self._lon: float = 0.0
+        self.setMinimumSize(200, 200)
+
+    # ── coordinate helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _latlon_to_xy(lat: float, lon: float,
+                      lat0: float, lon0: float) -> tuple[float, float]:
+        """Equirectangular projection → (east_m, north_m) from (lat0, lon0)."""
+        R = 6_371_000.0
+        dlat = _math.radians(lat - lat0)
+        dlon = _math.radians(lon - lon0)
+        cos_lat0 = _math.cos(_math.radians(lat0))
+        return dlon * R * cos_lat0, dlat * R
+
+    # ── public API ──────────────────────────────────────────────────────────
+    def update_gps(self, lat: float, lon: float,
+                   speed_kmh: float, course_deg: float,
+                   has_fix: bool, sats: int) -> None:
+        self._has_fix = has_fix
+        self._sats    = sats
+        self._lat     = lat
+        self._lon     = lon
+        self._cur_spd = speed_kmh
+        self._cur_hdg = course_deg
+
+        if has_fix:
+            if self._origin_lat is None:
+                # Anchor origin on first good fix
+                self._origin_lat = lat
+                self._origin_lon = lon
+                self._cur_x, self._cur_y = 0.0, 0.0
+                self._trail.append((0.0, 0.0))
+            else:
+                x, y = self._latlon_to_xy(lat, lon,
+                                          self._origin_lat, self._origin_lon)
+                self._cur_x, self._cur_y = x, y
+                # Only append if car has moved enough to avoid GPS jitter
+                if self._trail:
+                    lx, ly = self._trail[-1]
+                    if _math.hypot(x - lx, y - ly) >= self.MIN_MOVE_M:
+                        self._trail.append((x, y))
+                else:
+                    self._trail.append((x, y))
+        self.update()   # trigger paintEvent
+
+    def reset_track(self) -> None:
+        """Clear accumulated trail (use when starting a new session)."""
+        self._trail.clear()
+        self._origin_lat = None
+        self._origin_lon = None
+        self.update()
+
+    # ── painting ────────────────────────────────────────────────────────────
+    def paintEvent(self, _ev):
+        is_light = (F1_TEXT == '#1a1a1a')
+        bg       = QColor(F1_PANEL_BG)
+        border   = QColor('#bbbbbb' if is_light else '#333333')
+        trail_c  = QColor('#0d9afe' if is_light else '#00b4fc')  # bright blue
+        dot_c    = QColor(ISC_GREEN)
+        axis_c   = QColor('#888888' if is_light else '#555555')
+        txt_c    = QColor('#111111' if is_light else '#cccccc')
+        no_fix_c = QColor('#cc4444')
+        hdg_c    = QColor('#ff8800')   # heading arrow
+
+        w, h = self.width(), self.height()
+        pad  = 12
+        map_x, map_y   = pad, pad
+        map_w, map_h   = w - 2 * pad, h - 2 * pad - 36   # bottom 36px for info bar
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # ── background ──────────────────────────────────────────────────────
+        p.fillRect(0, 0, w, h, bg)
+
+        # ── map frame ───────────────────────────────────────────────────────
+        p.setPen(QPen(border, 1))
+        p.setBrush(QBrush(QColor('#f8faff' if is_light else '#0d0d0d')))
+        p.drawRoundedRect(map_x, map_y, map_w, map_h, 6, 6)
+
+        # ── grid lines ──────────────────────────────────────────────────────
+        grid_c = QColor('#cccccc' if is_light else '#1c1c1c')
+        p.setPen(QPen(grid_c, 1, Qt.DotLine))
+        for frac in (0.25, 0.5, 0.75):
+            gx = int(map_x + frac * map_w)
+            gy = int(map_y + frac * map_h)
+            p.drawLine(gx, map_y, gx, map_y + map_h)
+            p.drawLine(map_x, gy, map_x + map_w, gy)
+
+        if not self._trail or self._origin_lat is None:
+            # ── No GPS fix yet ─────────────────────────────────────────────
+            p.setPen(no_fix_c)
+            p.setFont(QFont("Courier New", 9, QFont.Bold))
+            p.drawText(map_x, map_y, map_w, map_h, Qt.AlignCenter,
+                       "NO GPS FIX\nWaiting for signal…")
+        else:
+            # ── Compute bounding box of trail for auto-zoom ─────────────────
+            xs = [pt[0] for pt in self._trail]
+            ys = [pt[1] for pt in self._trail]
+            xs.append(self._cur_x); ys.append(self._cur_y)
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            span_x = max(max_x - min_x, 20.0)   # metres, minimum 20 m
+            span_y = max(max_y - min_y, 20.0)
+            # uniform scale with 10% padding
+            scale = min(map_w * 0.85 / span_x, map_h * 0.85 / span_y)
+            cx0   = map_x + map_w / 2 - (min_x + max_x) / 2 * scale
+            cy0   = map_y + map_h / 2 + (min_y + max_y) / 2 * scale
+
+            def world_to_screen(xm, ym):
+                return cx0 + xm * scale, cy0 - ym * scale
+
+            # ── Draw trail ─────────────────────────────────────────────────
+            pts = list(self._trail)
+            n   = len(pts)
+            if n >= 2:
+                pen = QPen(trail_c, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                path_pts = [world_to_screen(x, y) for x, y in pts]
+                for i in range(1, len(path_pts)):
+                    # Fade older segments to grey
+                    alpha = int(80 + 175 * i / n)
+                    fade_c = QColor(trail_c)
+                    fade_c.setAlpha(alpha)
+                    p.setPen(QPen(fade_c, 2, Qt.SolidLine, Qt.RoundCap))
+                    x1, y1 = path_pts[i - 1]
+                    x2, y2 = path_pts[i]
+                    p.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+            # ── Origin dot (start of session) ──────────────────────────────
+            ox, oy = world_to_screen(0, 0)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor('#ff4444')))
+            p.drawEllipse(int(ox) - 5, int(oy) - 5, 10, 10)
+
+            # ── Heading arrow ─────────────────────────────────────────────
+            sx, sy = world_to_screen(self._cur_x, self._cur_y)
+            arrow_len = 18
+            hdg_rad   = _math.radians(self._cur_hdg)
+            ax = sx + arrow_len * _math.sin(hdg_rad)
+            ay = sy - arrow_len * _math.cos(hdg_rad)
+            p.setPen(QPen(hdg_c, 2))
+            p.drawLine(int(sx), int(sy), int(ax), int(ay))
+            # arrowhead
+            perp = _math.radians(self._cur_hdg + 150)
+            perp2= _math.radians(self._cur_hdg - 150)
+            ahl  = 8
+            p.drawLine(int(ax), int(ay),
+                       int(ax + ahl * _math.sin(perp)),  int(ay - ahl * _math.cos(perp)))
+            p.drawLine(int(ax), int(ay),
+                       int(ax + ahl * _math.sin(perp2)), int(ay - ahl * _math.cos(perp2)))
+
+            # ── Live car dot ──────────────────────────────────────────────
+            p.setPen(QPen(QColor('#000000'), 1))
+            p.setBrush(QBrush(dot_c))
+            p.drawEllipse(int(sx) - 7, int(sy) - 7, 14, 14)
+
+            # ── Scale bar (20 m) ──────────────────────────────────────────
+            bar_px   = int(20 * scale)
+            bar_x0   = map_x + 8
+            bar_y0   = map_y + map_h - 10
+            p.setPen(QPen(axis_c, 2))
+            p.drawLine(bar_x0, bar_y0, bar_x0 + bar_px, bar_y0)
+            p.drawLine(bar_x0, bar_y0 - 4, bar_x0, bar_y0 + 1)
+            p.drawLine(bar_x0 + bar_px, bar_y0 - 4, bar_x0 + bar_px, bar_y0 + 1)
+            p.setPen(txt_c)
+            p.setFont(QFont("Courier New", 7))
+            p.drawText(bar_x0, bar_y0 - 12, bar_px + 2, 12, Qt.AlignCenter, "20 m")
+
+        # ── Info bar at bottom ──────────────────────────────────────────────
+        info_y = map_y + map_h + 4
+        info_h = h - info_y - 2
+        p.setPen(txt_c)
+        p.setFont(QFont("Courier New", 8, QFont.Bold))
+
+        if self._has_fix:
+            fix_dot_c = QColor('#00c853')
+            spd_txt   = f"  {self._cur_spd:.1f} km/h"
+            sat_txt   = f"  {self._sats} sats"
+            lat_txt   = f"  {self._lat:+.5f}°"
+            lon_txt   = f"  {self._lon:+.5f}°"
+            trail_txt = f"  {len(self._trail)} pts"
+            info_str  = f"GPS ●  {self._cur_spd:.1f} km/h   Hdg {self._cur_hdg:.0f}°   Sats {self._sats}   {self._lat:+.5f}° {self._lon:+.5f}°   Trail {len(self._trail)} pts"
+        else:
+            fix_dot_c = no_fix_c
+            info_str  = f"GPS ✕   NO FIX   Sats {self._sats}"
+
+        # Status dot
+        p.setPen(Qt.NoPen)
+        p.setBrush(fix_dot_c)
+        dot_r = 5
+        p.drawEllipse(pad, info_y + (info_h - dot_r * 2) // 2, dot_r * 2, dot_r * 2)
+
+        p.setPen(txt_c)
+        p.setFont(QFont("Courier New", 7))
+        p.drawText(pad + dot_r * 2 + 4, info_y, w - pad * 2, info_h,
+                   Qt.AlignVCenter | Qt.AlignLeft, info_str)
         p.end()
 
 
@@ -2244,6 +2519,25 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("color:#333; font-size:9px;")
         gv.addWidget(note)
         h.addWidget(gbox, stretch=1)
+
+        # GPS Track Map
+        gpb = QGroupBox("GPS TRACK MAP")
+        gpv = QVBoxLayout(gpb); gpv.setContentsMargins(6, 6, 6, 6)
+        self._gps_map = GPSTrackWidget()
+        gpv.addWidget(self._gps_map)
+
+        # Reset-track button (clears trail on new session)
+        self._btn_gps_reset = QPushButton("⟳  Reset Track")
+        self._btn_gps_reset.setStyleSheet(self.get_button_style())
+        self._btn_gps_reset.setFixedHeight(24)
+        self._btn_gps_reset.clicked.connect(self._gps_map.reset_track)
+        gpv.addWidget(self._btn_gps_reset)
+
+        # GPS speed card below map
+        self._gps_speed_card = MetricCard("GPS Speed", "km/h", ISC_GREEN)
+        gpv.addWidget(self._gps_speed_card)
+
+        h.addWidget(gpb, stretch=2)
         return w
 
     # ── Log strip ─────────────────────────────────────────────────────────────
@@ -2383,25 +2677,90 @@ class MainWindow(QMainWindow):
         tmax   = s.get('temp_max_modulo',  [0]*5)
         max_t  = max((t for t in tmax if t != 0), default=0)
 
-        # SoC from VTC6 OCV table with IR compensation (uses corriente_accu to prevent sag dip)
-        soc_vtc6 = soc_from_cell_mv(vcell, s.get('corriente_accu', 0)) if vcell > 0 else float(soc)
+        # ── SOC: primary=bus voltage (280V=0%, 400V=100%), blend with cell OCV when valid
+        soc_vtc6 = soc_from_voltage(
+            bus_v   = float(vbus),
+            cell_mv = float(vcell) if vcell else 0.0,
+            current_a = float(s.get('corriente_accu', 0)),
+        )
 
-        # Real-time remaining battery duration estimator (30-second rolling average current)
-        i_curr = max(0.0, float(s.get('corriente_accu', 0)))
+        # ── Time remaining: dual estimator ────────────────────────────────────
+        # Source A: rolling 60-second power average (corriente_accu × Vbus)
+        # Source B: linear voltage-drop extrapolation to cutoff (sensor-failure backup)
+        # Displays the more conservative (lower) of the two when both are valid.
+
+        i_raw  = float(s.get('corriente_accu', 0))
+        i_curr = max(0.0, i_raw)                          # discharge only (regen ignored)
+        vbus_f = float(vbus) if vbus and vbus > 140 else _SOC_V_FULL
+
+        # ── Initialise persistent state on first call ──────────────────────
         if not hasattr(self, '_i_rolling_hist'):
-            self._i_rolling_hist = deque(maxlen=300) # 30 seconds at 10Hz
-        self._i_rolling_hist.append(i_curr)
-        i_avg = sum(self._i_rolling_hist) / len(self._i_rolling_hist) if self._i_rolling_hist else 0.0
+            self._i_rolling_hist = deque(maxlen=600)      # 60 s at 10 Hz
+        if not hasattr(self, '_vdrop_v0'):
+            self._vdrop_v0 = None   # bus voltage at session start (V)
+            self._vdrop_t0 = None   # elapsed time at session start (s)
 
-        # Pack capacity: 18.0 Ah (95s6p Sony VTC6). Usable down to 5% SoC cutoff = ~17.1 Ah
-        # Usable Ah remaining = 17.1 * (soc_vtc6 - 5) / 100
-        usable_ah_rem = max(0.0, 17.1 * (soc_vtc6 - 5.0) / 100.0)
-        if i_avg > 0.5:
-            min_rem = (usable_ah_rem / i_avg) * 60.0
-            time_str = f"{int(min_rem)}m {int((min_rem % 1) * 60):02d}s"
+        # Reset voltage-drop tracker when a new session starts (elapsed resets)
+        elapsed = float(s.get('time_elapsed_s', 0))
+        if elapsed < 5.0 or self._vdrop_v0 is None:
+            if vbus_f > 300:
+                self._vdrop_v0 = vbus_f
+                self._vdrop_t0 = elapsed
+
+        self._i_rolling_hist.append(i_curr)
+        i_avg   = sum(self._i_rolling_hist) / len(self._i_rolling_hist)
+
+        # ── Racing floor: if inverter is actively running (state 6) and
+        #    current sensor reads near-zero, assume minimum racing power.
+        #    Based on empirical 32-min / 390V endurance run → ~31 A avg.
+        INV_RUNNING = (int(s.get('inv_state', 0)) == 6)
+        RACING_FLOOR_A = 20.0   # minimum assumed draw while inverter is running
+        if INV_RUNNING and i_avg < RACING_FLOOR_A:
+            i_eff = RACING_FLOOR_A   # floor prevents absurdly high estimates
+        else:
+            i_eff = i_avg
+
+        pwr_eff = i_eff * vbus_f                          # Watts
+
+        # ── Source A: current-based Wh estimate ───────────────────────────
+        wh_rem = _PACK_WH * (soc_vtc6 / 100.0)
+        if pwr_eff > 200.0:
+            min_rem_i = (wh_rem / pwr_eff) * 60.0
+        else:
+            min_rem_i = None
+
+        # ── Source B: voltage-drop-rate extrapolation ─────────────────────
+        min_rem_v = None
+        if (self._vdrop_v0 is not None and vbus_f > _SOC_V_CUTOFF
+                and elapsed > self._vdrop_t0):
+            dt_s = elapsed - self._vdrop_t0
+            dv   = self._vdrop_v0 - vbus_f               # total drop so far (V)
+            if dv > 2.0 and dt_s > 15.0:                 # need real signal
+                dvdt = dv / dt_s                          # V/s average discharge rate
+                t_to_cutoff_s = (vbus_f - _SOC_V_CUTOFF) / dvdt
+                min_rem_v = max(0.0, t_to_cutoff_s / 60.0)
+
+        # ── Pick estimate ─────────────────────────────────────────────────
+        if min_rem_i is not None and min_rem_v is not None:
+            min_rem  = min(min_rem_i, min_rem_v)          # conservative: take lower
+            src_tag  = ""
+        elif min_rem_i is not None:
+            min_rem  = min_rem_i
+            src_tag  = ""
+        elif min_rem_v is not None:
+            min_rem  = min_rem_v
+            src_tag  = " (V)"                             # voltage-only indicator
+        else:
+            min_rem  = None
+            src_tag  = ""
+
+        if min_rem is not None:
+            time_str = f"{int(min_rem)}m {int((min_rem % 1) * 60):02d}s{src_tag}"
+        elif INV_RUNNING:
+            time_str = "CALC…"                            # running but window not full yet
         else:
             time_str = "STANDBY"
-            min_rem = 999.0
+            min_rem  = 999.0
 
         tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
 
@@ -2514,7 +2873,11 @@ class MainWindow(QMainWindow):
         self._pt_vbus.set_value(f"{s.get('inv_dc_bus_V', 0)} V")
         vcell_pt = s.get('v_cell_min_mV', 0)
         i_accu_pt = s.get('corriente_accu', 0)
-        soc_vtc6_pt = soc_from_cell_mv(vcell_pt, i_accu_pt) if vcell_pt > 0 else float(s.get('soc', 0))
+        soc_vtc6_pt = soc_from_voltage(
+            bus_v     = float(s.get('inv_dc_bus_V', 0)),
+            cell_mv   = float(vcell_pt) if vcell_pt else 0.0,
+            current_a = float(i_accu_pt),
+        )
         self._pt_soc.set_value(f"{soc_vtc6_pt:.1f} %")
         # corriente_accu and corriente_dcdc are stored in Amperes (A)
         self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0):.1f} A")
@@ -2525,9 +2888,11 @@ class MainWindow(QMainWindow):
         # Est. cut-off duration metric
         i_hist = getattr(self, '_i_rolling_hist', None)
         i_avg_pt = (sum(i_hist) / len(i_hist)) if i_hist else 0.0
-        usable_ah = max(0.0, 17.1 * (soc_vtc6_pt - 5.0) / 100.0)
-        if i_avg_pt > 0.5:
-            m_rem = (usable_ah / i_avg_pt) * 60.0
+        wh_rem_pt = _PACK_WH * (soc_vtc6_pt / 100.0)
+        vbus_pt   = float(s.get('inv_dc_bus_V', _SOC_V_FULL))
+        pwr_pt    = i_avg_pt * vbus_pt
+        if pwr_pt > 50.0:
+            m_rem = (wh_rem_pt / pwr_pt) * 60.0
             self._pt_trem.set_value(f"{int(m_rem)}m {int((m_rem % 1)*60):02d}s")
         else:
             self._pt_trem.set_value("STANDBY")
@@ -2572,6 +2937,19 @@ class MainWindow(QMainWindow):
         self._g_lat.setText(f"Lat  G:   {ay:+.2f}")
         self._g_tot.setText(f"Total G:  {math.sqrt(ax**2 + ay**2):.2f}")
 
+        # GPS Track Map updates (only when Dynamics tab is visible — already gated by caller)
+        gps_fix  = bool(s.get('gps_has_fix', 0))
+        gps_lat  = s.get('gps_lat_deg',    0.0)
+        gps_lon  = s.get('gps_lon_deg',    0.0)
+        gps_spd  = s.get('gps_speed_kmh',  0.0)
+        gps_hdg  = s.get('gps_course_deg', 0.0)
+        gps_sats = int(s.get('gps_sats',   0))
+        self._gps_map.update_gps(gps_lat, gps_lon, gps_spd, gps_hdg, gps_fix, gps_sats)
+        if gps_fix:
+            self._gps_speed_card.set_value(f"{gps_spd:.1f}")
+        else:
+            self._gps_speed_card.set_value("NO FIX")
+
     def _update_customize(self, s: dict):
         for panel in self._drop_panels:
             panel.update_value(s)
@@ -2611,6 +2989,15 @@ class MainWindow(QMainWindow):
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(True)
         self._btn_settings.setEnabled(False)
+        # Reset GPS trail so each session starts with a fresh map
+        if hasattr(self, '_gps_map'):
+            self._gps_map.reset_track()
+        # Reset voltage-drop estimator so new session gets a fresh V0 anchor
+        self._vdrop_v0 = None
+        self._vdrop_t0 = None
+        # Reset current rolling history
+        if hasattr(self, '_i_rolling_hist'):
+            self._i_rolling_hist.clear()
 
     def _stop(self):
         if not self.is_receiving:
@@ -2906,6 +3293,9 @@ class MainWindow(QMainWindow):
                 w.setStyleSheet(f"QFrame {{ background:{F1_PANEL_BG}; border:1px dashed {'#ccc' if is_light else '#333'}; border-radius:4px; }}")
                 
             elif isinstance(w, GCircleWidget):
+                w.update()
+
+            elif isinstance(w, GPSTrackWidget):
                 w.update()
                 
             elif isinstance(w, PedalWidget):
