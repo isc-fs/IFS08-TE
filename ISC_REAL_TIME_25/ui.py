@@ -261,7 +261,9 @@ def soc_from_voltage(bus_v: float, cell_mv: float = 0.0,
 
         # ── Secondary: refine with cell OCV if cell sensor is valid ──────
         if cell_mv and 2500 < cell_mv < 4500:
-            ir_drop_mv = max(0.0, float(current_a)) * 0.35
+            # Rectify current magnitude for IR drop (ignore negative noise/polarity flip)
+            curr_eff = abs(float(current_a))
+            ir_drop_mv = curr_eff * 0.35
             ocv_v = (cell_mv + ir_drop_mv) / 1000.0
             soc_cell = None
             for i in range(len(_VTC6_OCV_TABLE) - 1):
@@ -297,6 +299,96 @@ def soc_from_voltage(bus_v: float, cell_mv: float = 0.0,
 # Keep old name as alias so any remaining call sites still work
 def soc_from_cell_mv(cell_mv: float, current_a: float = 0.0) -> float:
     return soc_from_voltage(0.0, cell_mv, current_a)
+
+# ── Predictive Analytics Engine ──────────────────────────────────────────────
+class PredictiveAnalyticsEngine:
+    """
+    Real-time predictive telemetry analytics engine for Formula Student:
+    1. Driver Efficiency Index (Wh/km & Wh/min)
+    2. Thermal Derating & Overtemp Predictor (dT/dt °C/min & time to 90°C trip)
+    3. Battery Health & Internal Resistance Estimator (mΩ)
+    4. Adaptive Driver Pace & Strategy Advisor (Recommended Torque % for 22min Endurance)
+    """
+    def __init__(self, target_endurance_min: float = 22.0):
+        self.target_endurance_min = target_endurance_min
+        self._t_hist = deque(maxlen=300)      # 30s at 10Hz
+        self._tm2_hist = deque(maxlen=300)    # 30s at 10Hz
+        self._prev_iaccu = 0.0
+        self._prev_vbus = 0.0
+        self._r_int_samples = deque(maxlen=50) # rolling R_int estimates
+        self.r_int_mOhm = 285.0                # default baseline ~285 mΩ (95s6p VTC6)
+
+    def reset(self):
+        self._t_hist.clear()
+        self._tm2_hist.clear()
+        self._r_int_samples.clear()
+        self._prev_iaccu = 0.0
+        self._prev_vbus = 0.0
+
+    def compute(self, s: dict, soc_vtc6: float, i_eff: float) -> dict:
+        vbus = float(s.get('inv_dc_bus_V', 0))
+        iaccu = float(s.get('corriente_accu', 0))
+        istate = int(s.get('inv_state', 0))
+        tq_req = float(s.get('torque_pct', 0))
+        if iaccu < 0 and (istate == 6 or s.get('inv_rpm', 0) > 100 or tq_req > 2):
+            iaccu = abs(iaccu)
+        spd = float(s.get('inv_speed_actual', 0))
+        tm2 = float(s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0)))
+        elapsed = float(s.get('time_elapsed_s', 0))
+
+        # 1. Driver Efficiency Index (Wh/min & Wh/km)
+        pwr_w = i_eff * vbus if (vbus > 140) else 0.0
+        pwr_kw = pwr_w / 1000.0
+        eff_wh_min = (pwr_w / 60.0)
+        eff_wh_km = (pwr_kw / spd * 1000.0) if spd > 5.0 else 0.0
+
+        # 2. Thermal dT/dt & Overtemp Predictor
+        self._t_hist.append(elapsed)
+        self._tm2_hist.append(tm2)
+        thermal_dt_dt = 0.0
+        thermal_t_overtemp = 999.0
+
+        if len(self._t_hist) > 20:
+            dt_s = self._t_hist[-1] - self._t_hist[0]
+            dtm2 = self._tm2_hist[-1] - self._tm2_hist[0]
+            if dt_s > 2.0:
+                thermal_dt_dt = round((dtm2 / dt_s) * 60.0, 1)  # °C / min
+                if thermal_dt_dt > 0.5 and tm2 < 90.0:
+                    thermal_t_overtemp = round((90.0 - tm2) / thermal_dt_dt, 1)
+
+        # 3. Battery Health & Internal Resistance R_int (mΩ)
+        if self._prev_iaccu != 0.0 and self._prev_vbus > 140 and vbus > 140:
+            di = iaccu - self._prev_iaccu
+            dv = vbus - self._prev_vbus
+            # High-current step transition detection (di > 10A and dv < -1V)
+            if di > 10.0 and dv < -1.0:
+                r_est = (abs(dv) / di) * 1000.0  # mΩ
+                if 50.0 <= r_est <= 800.0:
+                    self._r_int_samples.append(r_est)
+                    self.r_int_mOhm = round(sum(self._r_int_samples) / len(self._r_int_samples), 1)
+
+        self._prev_iaccu = iaccu
+        self._prev_vbus = vbus
+
+        # 4. Adaptive Driver Pace & Strategy Advisor
+        wh_rem = _PACK_WH * (soc_vtc6 / 100.0)
+        t_target_h = self.target_endurance_min / 60.0
+        pwr_target_kw = wh_rem / t_target_h / 1000.0  # kW
+
+        if pwr_kw > 0.5:
+            rec_torque = min(100.0, round(tq_req * (pwr_target_kw / max(0.5, pwr_kw)), 0))
+        else:
+            rec_torque = 100.0
+
+        return {
+            'eff_wh_min':          round(eff_wh_min, 1),
+            'eff_wh_km':           round(eff_wh_km, 1),
+            'thermal_dt_dt':       thermal_dt_dt,
+            'thermal_t_overtemp':  thermal_t_overtemp,
+            'batt_r_int':          self.r_int_mOhm,
+            'strategy_pwr_target': round(pwr_target_kw, 2),
+            'strategy_rec_torque': int(rec_torque),
+        }
 
 # ── All ECU signals available in the Customise tab ───────────────────────────
 # Format: 'snapshot_key': ('Display Label', 'unit')
@@ -365,6 +457,14 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'gps_course_deg':       ('GPS Course',             '°'),
     'gps_sats':             ('GPS Satellites',         ''),
     'gps_has_fix':          ('GPS Fix',                '0/1'),
+    # ── Predictive Analytics & Strategy ───────────────────────────────────
+    'eff_wh_min':           ('Consumption Rate',       'Wh/min'),
+    'eff_wh_km':            ('Driver Efficiency',      'Wh/km'),
+    'thermal_dt_dt':        ('Motor Heating Rate',     'ºC/min'),
+    'thermal_t_overtemp':   ('Est. Time to Overtemp',  'min'),
+    'batt_r_int':           ('Pack Internal R',        'mΩ'),
+    'strategy_pwr_target':  ('Endurance Target Power', 'kW'),
+    'strategy_rec_torque':  ('Rec. Torque Limit',     '%'),
 }
 
 plt.style.use('dark_background')
@@ -2449,6 +2549,20 @@ class MainWindow(QMainWindow):
         bsg.addWidget(self._pt_vcell, 2, 0); bsg.addWidget(self._pt_ams,   2, 1)
         bsg.addWidget(self._pt_trem,  3, 0, 1, 2)
         top.addWidget(bsb, stretch=2)
+
+        # Predictive analytics & endurance strategy
+        psb = QGroupBox("PREDICTIVE ANALYTICS & STRATEGY")
+        psg = QGridLayout(psb)
+        self._pt_eff      = MetricCard("Consumption Rate", "Wh/min", ISC_GREEN)
+        self._pt_heat     = MetricCard("Heating Rate",     "ºC/min", F1_WARNING)
+        self._pt_overtemp = MetricCard("Est. Overtemp",    "min",    F1_ERROR)
+        self._pt_rint     = MetricCard("Pack Internal R",  "mΩ",     F1_PURPLE)
+        self._pt_rec_tq   = MetricCard("Rec. Torque %",    "%",      ISC_GREEN)
+        psg.addWidget(self._pt_eff,      0, 0); psg.addWidget(self._pt_heat,     0, 1)
+        psg.addWidget(self._pt_overtemp, 1, 0); psg.addWidget(self._pt_rint,     1, 1)
+        psg.addWidget(self._pt_rec_tq,   2, 0, 1, 2)
+        top.addWidget(psb, stretch=2)
+
         v.addLayout(top, stretch=3)
 
         # ── Bottom section: per-module bars ────────────────────────────────────
@@ -2678,11 +2792,24 @@ class MainWindow(QMainWindow):
         max_t  = max((t for t in tmax if t != 0), default=0)
 
         # ── SOC: primary=bus voltage (280V=0%, 400V=100%), blend with cell OCV when valid
-        soc_vtc6 = soc_from_voltage(
+        raw_soc_vtc6 = soc_from_voltage(
             bus_v   = float(vbus),
             cell_mv = float(vcell) if vcell else 0.0,
             current_a = float(s.get('corriente_accu', 0)),
         )
+
+        # Monotonic non-increasing latch during active sessions (no regen = SoC never rises)
+        # Gated on raw_soc_vtc6 > 0.0 to prevent precharge (0V bus) from locking SoC at 0%
+        if (self.is_receiving or self.demo_mode) and raw_soc_vtc6 > 0.0:
+            if not hasattr(self, '_session_min_soc') or self._session_min_soc is None:
+                self._session_min_soc = raw_soc_vtc6
+            else:
+                self._session_min_soc = min(self._session_min_soc, raw_soc_vtc6)
+            soc_vtc6 = self._session_min_soc
+        elif (self.is_receiving or self.demo_mode) and getattr(self, '_session_min_soc', None) is not None:
+            soc_vtc6 = self._session_min_soc
+        else:
+            soc_vtc6 = raw_soc_vtc6
 
         # ── Time remaining: dual estimator ────────────────────────────────────
         # Source A: rolling 60-second power average (corriente_accu × Vbus)
@@ -2690,6 +2817,9 @@ class MainWindow(QMainWindow):
         # Displays the more conservative (lower) of the two when both are valid.
 
         i_raw  = float(s.get('corriente_accu', 0))
+        # Protect against inverted polarity or negative current noise while motor is active
+        if i_raw < 0 and (int(istate) == 6 or s.get('inv_rpm', 0) > 100 or tpct > 2):
+            i_raw = abs(i_raw)
         i_curr = max(0.0, i_raw)                          # discharge only (regen ignored)
         vbus_f = float(vbus) if vbus and vbus > 140 else _SOC_V_FULL
 
@@ -2761,6 +2891,12 @@ class MainWindow(QMainWindow):
         else:
             time_str = "STANDBY"
             min_rem  = 999.0
+
+        # Compute Predictive Analytics & Strategy Metrics
+        if not hasattr(self, '_analytics_engine'):
+            self._analytics_engine = PredictiveAnalyticsEngine()
+        analytics = self._analytics_engine.compute(s, soc_vtc6, i_eff)
+        s.update(analytics)
 
         tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
 
@@ -2884,6 +3020,14 @@ class MainWindow(QMainWindow):
         self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0):.1f} A")
         self._pt_vcell.set_value(f"{vcell_pt} mV")
         self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
+
+        if hasattr(self, '_pt_eff'):
+            self._pt_eff.set_value(f"{s.get('eff_wh_min', 0.0):.1f}")
+            self._pt_heat.set_value(f"{s.get('thermal_dt_dt', 0.0):+.1f}")
+            t_ov = s.get('thermal_t_overtemp', 999.0)
+            self._pt_overtemp.set_value(f"{t_ov:.1f}" if t_ov < 900 else "SAFE")
+            self._pt_rint.set_value(f"{s.get('batt_r_int', 285.0):.0f}")
+            self._pt_rec_tq.set_value(f"{s.get('strategy_rec_torque', 100)} %")
         
         # Est. cut-off duration metric
         i_hist = getattr(self, '_i_rolling_hist', None)
@@ -2992,9 +3136,12 @@ class MainWindow(QMainWindow):
         # Reset GPS trail so each session starts with a fresh map
         if hasattr(self, '_gps_map'):
             self._gps_map.reset_track()
-        # Reset voltage-drop estimator so new session gets a fresh V0 anchor
+        # Reset voltage-drop estimator & session SoC latch so new session gets a fresh anchor
         self._vdrop_v0 = None
         self._vdrop_t0 = None
+        self._session_min_soc = None
+        if hasattr(self, '_analytics_engine'):
+            self._analytics_engine.reset()
         # Reset current rolling history
         if hasattr(self, '_i_rolling_hist'):
             self._i_rolling_hist.clear()
