@@ -96,6 +96,12 @@ INVERTER_STATES_MAP = {
 }
 # Active control states (torque is being applied)
 _INV_ACTIVE_STATES = {5, 6, 7}
+# Short names for the live INV STATE card (number + name)
+_STATE_SHORT_MAP = {
+    0: "OFF",  1: "INIT",  2: "POST",   3: "AWAIT HV", 4: "HV RDY",
+    5: "CURR", 6: "TORQUE",7: "SPEED", 10: "FLT SOFT",11: "FLT HARD",
+   12: "DISCHG",13:"SLEEP",14: "LV OFF",
+}
 
 # ── NxTech DEM Diagnostic Codes (L3 — DEM_Code) ─────────────────────────────
 # Source: NxTech Portal — Diagnostics section, L3 table
@@ -1474,67 +1480,371 @@ class SettingsDialog(QDialog):
         btn.clicked.connect(self.accept)
         g.addWidget(btn, 9, 0, 1, 2)
 
+        btn_cal = QPushButton("Calibrate Pedals...")
+        btn_cal.setStyleSheet(self._p.get_button_style())
+        btn_cal.setToolTip("Launch the brake & APPS calibration wizard")
+        btn_cal.clicked.connect(self._open_cal_wizard)
+        g.addWidget(btn_cal, 10, 0, 1, 2)
+
     # ── Marple password gate ──────────────────────────────────────────────────
-    def _on_marple_toggled(self, state: int):
-        """Ask for the Marple API password whenever the checkbox is ticked on."""
-        if state == 0:
-            return  # unchecking — always allowed
-        # Prompt for password (echo mode hidden)
-        pwd, ok = QInputDialog.getText(
-            self,
-            "Marple Upload — Authentication Required",
-            "Enter the Marple API password:",
-            QLineEdit.Password,
-        )
-        if not ok:
-            # User cancelled → silently uncheck
-            self.chk_marple.blockSignals(True)
-            self.chk_marple.setChecked(False)
-            self.chk_marple.blockSignals(False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FAULT HISTORY DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+class FaultHistoryDialog(QDialog):
+    """Read-only table of all fault events persisted in fault_history.json."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ISCmetrics - Fault History Log")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setGeometry(200, 150, 820, 480)
+        self.setStyleSheet(f"background:{F1_DARK_BG}; color:{F1_TEXT};")
+        self._build()
+
+    def _build(self):
+        import json
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+
+        title = QLabel("Fault Event History  (all sessions)")
+        title.setStyleSheet(f"color:{ISC_GREEN}; font-size:13px; font-weight:bold;")
+        v.addWidget(title)
+
+        cols = ["Timestamp", "Session", "Kind", "DEM", "Description", "Detail"]
+        tbl = QTableWidget(0, len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.setStyleSheet(f"""
+            QTableWidget {{ background:{F1_MID_BG}; color:{F1_TEXT};
+                            gridline-color:#333; border:none; font-size:10px; }}
+            QHeaderView::section {{ background:{F1_PANEL_BG}; color:{ISC_GREEN};
+                                    font-size:10px; font-weight:bold; border:none; padding:4px; }}
+            QTableWidget::item:selected {{ background:{ISC_GREEN}; color:{F1_DARK_BG}; }}
+        """)
+        fault_file = rtt.USER_DIR / "fault_history.json"
+        events = []
+        if fault_file.exists():
+            try:
+                with open(fault_file, "r") as f:
+                    events = json.load(f)
+            except Exception:
+                events = []
+        tbl.setRowCount(len(events))
+        from PyQt5.QtGui import QColor
+        for row, ev in enumerate(reversed(events)):
+            vals = [ev.get("ts",""), ev.get("session",""), ev.get("kind",""),
+                    str(ev.get("dem_code","")), ev.get("dem_desc",""), ev.get("detail","")]
+            for col, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                if ev.get("kind") == "APPS_IMPL":
+                    item.setForeground(QColor(F1_WARNING))
+                elif ev.get("dem_code", 0):
+                    item.setForeground(QColor(F1_ERROR))
+                tbl.setItem(row, col, item)
+        tbl.resizeColumnsToContents()
+        v.addWidget(tbl)
+        if not events:
+            lbl = QLabel("No fault events recorded yet.")
+            lbl.setStyleSheet("color:#555; font-size:11px; padding:8px;")
+            lbl.setAlignment(Qt.AlignCenter)
+            v.addWidget(lbl)
+        row_btns = QHBoxLayout()
+        btn_clear = QPushButton("Clear History")
+        btn_clear.setStyleSheet(
+            f"QPushButton{{background:{F1_ERROR};color:white;border:none;border-radius:3px;padding:5px 12px;font-size:10px;}}"
+            f"QPushButton:hover{{background:#dc2626;}}")
+        btn_clear.clicked.connect(lambda: self._clear(fault_file, tbl))
+        row_btns.addWidget(btn_clear)
+        row_btns.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(
+            f"QPushButton{{background:{F1_PANEL_BG};color:{F1_TEXT};border:1px solid #444;border-radius:3px;padding:5px 14px;font-size:10px;}}"
+            f"QPushButton:hover{{border-color:{ISC_GREEN};}}")
+        btn_close.clicked.connect(self.accept)
+        row_btns.addWidget(btn_close)
+        v.addLayout(row_btns)
+
+    def _clear(self, fault_file, tbl):
+        import json
+        reply = QMessageBox.question(self, "Clear Fault History",
+            "Delete all fault history entries permanently?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                with open(fault_file, "w") as f:
+                    json.dump([], f)
+                tbl.setRowCount(0)
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BRAKE & APPS CALIBRATION WIZARD
+# ══════════════════════════════════════════════════════════════════════════════
+class BrakeCalibrationWizard(QDialog):
+    """
+    3-step guided wizard to calibrate APPS1, APPS2 and Brake ADC ranges.
+    Hardcoded defaults remain the fallback if the wizard is never run.
+    Wizard result is saved to settings.json via MainWindow._apply_pedal_calibration().
+    """
+    SAMPLE_MS  = 3000
+    TICK_MS    = 100
+
+    STEPS = [
+        ("Step 1/3 - Release All Pedals",
+         "Fully release BOTH pedals and hold them at rest.\n"
+         "Click 'Start Sampling' - the wizard records resting ADC values for 3 seconds."),
+        ("Step 2/3 - Press Throttle to the Floor",
+         "Keep the brake released. Press the throttle pedal fully to the floor and hold.\n"
+         "Click 'Start Sampling' to record APPS1 and APPS2 maximum values."),
+        ("Step 3/3 - Press Brake to the Floor",
+         "Release the throttle. Press the brake pedal fully to the floor and hold.\n"
+         "Click 'Start Sampling' to record the brake maximum ADC value."),
+        ("Calibration Complete - Review & Save",
+         "These values will replace the hardcoded defaults.\n"
+         "Click 'Save & Apply' to use them, or Cancel to discard."),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ISCmetrics - Pedal Calibration Wizard")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setGeometry(250, 200, 500, 380)
+        self.setStyleSheet(f"background:{F1_DARK_BG}; color:{F1_TEXT};")
+        self.result_cal: dict = {}
+        self._step    = 0
+        self._samples: list  = []
+        self._elapsed = 0
+        self._timer   = QTimer(self)
+        self._timer.timeout.connect(self._on_tick)
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(10)
+
+        self._lbl_title = QLabel()
+        self._lbl_title.setStyleSheet(f"color:{ISC_GREEN}; font-size:13px; font-weight:bold;")
+        v.addWidget(self._lbl_title)
+
+        self._lbl_instr = QLabel()
+        self._lbl_instr.setWordWrap(True)
+        self._lbl_instr.setStyleSheet(f"color:{F1_TEXT}; font-size:11px;")
+        v.addWidget(self._lbl_instr)
+
+        # Live ADC row
+        adc_row = QHBoxLayout()
+        for lbl_txt, attr in [("APPS1:", "_a1"), ("APPS2:", "_a2"), ("Brake:", "_brk")]:
+            adc_row.addWidget(QLabel(lbl_txt))
+            w = QLabel("---")
+            w.setStyleSheet(f"color:{F1_WARNING}; font-weight:bold; font-size:12px; min-width:55px;")
+            setattr(self, attr, w)
+            adc_row.addWidget(w)
+            adc_row.addSpacing(10)
+        v.addLayout(adc_row)
+
+        self._prog = QProgressBar()
+        self._prog.setRange(0, self.SAMPLE_MS)
+        self._prog.setValue(0)
+        self._prog.setTextVisible(False)
+        self._prog.setStyleSheet(
+            f"QProgressBar{{background:{F1_MID_BG};border:1px solid #333;border-radius:3px;height:8px;}}"
+            f"QProgressBar::chunk{{background:{ISC_GREEN};border-radius:3px;}}")
+        self._prog.hide()
+        v.addWidget(self._prog)
+
+        self._lbl_status = QLabel("")
+        self._lbl_status.setStyleSheet("color:#888; font-size:10px;")
+        v.addWidget(self._lbl_status)
+
+        self._lbl_result = QLabel("")
+        self._lbl_result.setStyleSheet(f"color:{ISC_GREEN}; font-size:10px; font-family:'Courier New';")
+        self._lbl_result.hide()
+        v.addWidget(self._lbl_result)
+
+        v.addStretch()
+
+        btn_row = QHBoxLayout()
+        self._btn_next = QPushButton("Start Sampling")
+        self._btn_next.setStyleSheet(
+            f"QPushButton{{background:{ISC_GREEN};color:{F1_DARK_BG};border:none;border-radius:3px;"
+            f"padding:7px 18px;font-weight:bold;}}QPushButton:hover{{background:#00a000;}}")
+        self._btn_next.clicked.connect(self._on_next)
+        btn_row.addWidget(self._btn_next)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet(
+            f"QPushButton{{background:{F1_PANEL_BG};color:{F1_TEXT};border:1px solid #444;"
+            f"border-radius:3px;padding:7px 14px;}}QPushButton:hover{{border-color:{F1_ERROR};}}")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        v.addLayout(btn_row)
+
+        # Live poll
+        self._live = QTimer(self)
+        self._live.timeout.connect(self._update_adc)
+        self._live.start(150)
+
+        self._refresh_step()
+
+    def _refresh_step(self):
+        title, instr = self.STEPS[min(self._step, len(self.STEPS)-1)]
+        self._lbl_title.setText(title)
+        self._lbl_instr.setText(instr)
+        self._btn_next.setText("Start Sampling" if self._step < 3 else "Save & Apply")
+
+    def _update_adc(self):
+        s = rtt.get_latest_data().get('snapshot', {})
+        self._a1.setText(str(s.get('apps1_raw', '---')))
+        self._a2.setText(str(s.get('apps2_raw', '---')))
+        self._brk.setText(str(s.get('brake_raw', '---')))
+
+    def _on_next(self):
+        if self._step == 3:
+            self._live.stop()
+            self.accept()
             return
-        entered_hash = hashlib.sha256(pwd.encode()).hexdigest()
-        if entered_hash != _MARPLE_PASSWORD_HASH:
-            QMessageBox.warning(
-                self,
-                "Access Denied",
-                "Incorrect password.\nMarple cloud upload has not been enabled.",
-            )
-            self.chk_marple.blockSignals(True)
-            self.chk_marple.setChecked(False)
-            self.chk_marple.blockSignals(False)
+        self._samples = []
+        self._elapsed = 0
+        self._prog.setValue(0)
+        self._prog.show()
+        self._btn_next.setEnabled(False)
+        self._lbl_status.setText("Sampling...")
+        self._timer.start(self.TICK_MS)
 
-    @staticmethod
-    def _lbl(t, s):
-        l = QLabel(t); l.setStyleSheet(s); return l
+    def _on_tick(self):
+        s = rtt.get_latest_data().get('snapshot', {})
+        a1  = s.get('apps1_raw')
+        a2  = s.get('apps2_raw')
+        brk = s.get('brake_raw')
+        if None not in (a1, a2, brk):
+            self._samples.append((int(a1), int(a2), int(brk)))
+        self._elapsed += self.TICK_MS
+        self._prog.setValue(self._elapsed)
+        if self._elapsed >= self.SAMPLE_MS:
+            self._timer.stop()
+            self._process_step()
 
-    def _refresh_ports(self):
-        self.combo_port.clear()
-        cur = self._p.settings.get("port")
-        for i, (port, desc) in enumerate(rtt.list_serial_ports()):
-            self.combo_port.addItem(f"{port}  ({desc})", port)
-            if port == cur:
-                self.combo_port.setCurrentIndex(i)
+    def _process_step(self):
+        if not self._samples:
+            self._lbl_status.setText("No data - is the car on?")
+            self._btn_next.setEnabled(True)
+            return
+        a1s  = [x[0] for x in self._samples]
+        a2s  = [x[1] for x in self._samples]
+        brks = [x[2] for x in self._samples]
+        avg  = lambda lst: int(sum(lst) / len(lst))
 
-    def get_settings(self) -> dict:
-        try:    baud = int(self.input_baud.text())
-        except: baud = self._p.settings["baud"]
-        try:    temp_c = float(self.input_alert_temp.text())
-        except: temp_c = self._p.settings.get("alert_temp_c", 40.0)
-        try:    volt_v = float(self.input_alert_volt.text())
-        except: volt_v = self._p.settings.get("alert_volt_v", 380.0)
-        try:    cell_mv = float(self.input_alert_cell.text())
-        except: cell_mv = self._p.settings.get("alert_cell_mv", 3400.0)
-        return {
-            "port":       self.combo_port.currentData(),
-            "baud":       baud,
-            "use_influx": self.chk_marple.isChecked(),
-            "debug":      self.chk_debug.isChecked(),
-            "demo_mode":  self.chk_demo.isChecked(),
-            "enable_tts": self.chk_tts.isChecked(),
-            "alert_temp_c":  temp_c,
-            "alert_volt_v":  volt_v,
-            "alert_cell_mv": cell_mv,
-        }
+        if self._step == 0:
+            self.result_cal.update({'apps1_min': avg(a1s), 'apps2_min': avg(a2s), 'brk_min': avg(brks)})
+            self._lbl_status.setText(
+                f"Resting: APPS1_MIN={self.result_cal['apps1_min']}  "
+                f"APPS2_MIN={self.result_cal['apps2_min']}  BRK_MIN={self.result_cal['brk_min']}")
+        elif self._step == 1:
+            self.result_cal.update({'apps1_max': avg(a1s), 'apps2_max': avg(a2s)})
+            self._lbl_status.setText(
+                f"WOT: APPS1_MAX={self.result_cal['apps1_max']}  APPS2_MAX={self.result_cal['apps2_max']}")
+        elif self._step == 2:
+            self.result_cal['brk_max'] = avg(brks)
+            self._lbl_status.setText(f"Full brake: BRK_MAX={self.result_cal['brk_max']}")
+
+        self._step += 1
+        self._prog.hide()
+        self._btn_next.setEnabled(True)
+        self._refresh_step()
+
+        if self._step == 3:
+            c = self.result_cal
+            self._lbl_result.setText(
+                f"APPS1:  {c.get('apps1_min','?')} -> {c.get('apps1_max','?')}\n"
+                f"APPS2:  {c.get('apps2_min','?')} -> {c.get('apps2_max','?')}\n"
+                f"Brake:  {c.get('brk_min','?')} -> {c.get('brk_max','?')}")
+            self._lbl_result.show()
+
+    def closeEvent(self, ev):
+        self._timer.stop()
+        self._live.stop()
+        super().closeEvent(ev)
+
+
+# ── Remaining SettingsDialog methods (restored to correct class scope) ─────────
+# These must live inside SettingsDialog, not BrakeCalibrationWizard.
+# We re-open SettingsDialog here using monkey-patching to avoid a full rewrite.
+def _sd_open_cal_wizard(self):
+    """Launch the BrakeCalibrationWizard; apply results immediately."""
+    wiz = BrakeCalibrationWizard(self._p)
+    if wiz.exec_():
+        self._p._apply_pedal_calibration(wiz.result_cal)
+
+def _sd_on_marple_toggled(self, state: int):
+    """Ask for the Marple API password whenever the checkbox is ticked on."""
+    if state == 0:
+        return  # unchecking — always allowed
+    pwd, ok = QInputDialog.getText(
+        self,
+        "Marple Upload — Authentication Required",
+        "Enter the Marple API password:",
+        QLineEdit.Password,
+    )
+    if not ok:
+        self.chk_marple.blockSignals(True)
+        self.chk_marple.setChecked(False)
+        self.chk_marple.blockSignals(False)
+        return
+    entered_hash = hashlib.sha256(pwd.encode()).hexdigest()
+    if entered_hash != _MARPLE_PASSWORD_HASH:
+        QMessageBox.warning(
+            self,
+            "Access Denied",
+            "Incorrect password.\nMarple cloud upload has not been enabled.",
+        )
+        self.chk_marple.blockSignals(True)
+        self.chk_marple.setChecked(False)
+        self.chk_marple.blockSignals(False)
+
+@staticmethod
+def _sd_lbl(t, s):
+    l = QLabel(t); l.setStyleSheet(s); return l
+
+def _sd_refresh_ports(self):
+    self.combo_port.clear()
+    cur = self._p.settings.get("port")
+    for i, (port, desc) in enumerate(rtt.list_serial_ports()):
+        self.combo_port.addItem(f"{port}  ({desc})", port)
+        if port == cur:
+            self.combo_port.setCurrentIndex(i)
+
+def _sd_get_settings(self) -> dict:
+    try:    baud = int(self.input_baud.text())
+    except: baud = self._p.settings["baud"]
+    try:    temp_c = float(self.input_alert_temp.text())
+    except: temp_c = self._p.settings.get("alert_temp_c", 40.0)
+    try:    volt_v = float(self.input_alert_volt.text())
+    except: volt_v = self._p.settings.get("alert_volt_v", 380.0)
+    try:    cell_mv = float(self.input_alert_cell.text())
+    except: cell_mv = self._p.settings.get("alert_cell_mv", 3400.0)
+    return {
+        "port":          self.combo_port.currentData(),
+        "baud":          baud,
+        "use_influx":    self.chk_marple.isChecked(),
+        "debug":         self.chk_debug.isChecked(),
+        "demo_mode":     self.chk_demo.isChecked(),
+        "enable_tts":    self.chk_tts.isChecked(),
+        "alert_temp_c":  temp_c,
+        "alert_volt_v":  volt_v,
+        "alert_cell_mv": cell_mv,
+    }
+
+# Bind the orphaned methods back onto SettingsDialog
+SettingsDialog._open_cal_wizard  = _sd_open_cal_wizard
+SettingsDialog._on_marple_toggled= _sd_on_marple_toggled
+SettingsDialog._lbl              = staticmethod(_sd_lbl.__func__ if hasattr(_sd_lbl, '__func__') else _sd_lbl)
+SettingsDialog._refresh_ports    = _sd_refresh_ports
+SettingsDialog.get_settings      = _sd_get_settings
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2683,6 +2993,14 @@ class MainWindow(QMainWindow):
         self._btn_add_note.setFixedWidth(100)
         self._btn_add_note.clicked.connect(self._submit_note)
         nh.addWidget(self._btn_add_note)
+
+        self._btn_fault_hist = QPushButton("Fault History")
+        self._btn_fault_hist.setStyleSheet(self.get_button_style())
+        self._btn_fault_hist.setFixedWidth(120)
+        self._btn_fault_hist.setToolTip("View persistent fault event log (DEM codes, APPS implausibility)")
+        self._btn_fault_hist.clicked.connect(self._open_fault_history)
+        nh.addWidget(self._btn_fault_hist)
+
         
         v.addLayout(nh)
         return box
@@ -2693,7 +3011,42 @@ class MainWindow(QMainWindow):
         return rtt.get_latest_data().get('snapshot', {})
 
     # ── Alert checking ────────────────────────────────────────────────────────
+    # ── Fault History Log ──────────────────────────────────────────────────────
+    def _log_fault_event(self, dem: int, inv_error: int, kind: str, desc: str) -> None:
+        """Append a fault event to the persistent fault_history.json file."""
+        import json
+        fault_file = rtt.USER_DIR / "fault_history.json"
+        bucket = getattr(rtt, '_current_bucket_id', None) or "unknown_session"
+        entry = {
+            "ts":        datetime.now().isoformat(timespec='seconds'),
+            "session":   bucket,
+            "kind":      kind,
+            "dem_code":  dem,
+            "dem_desc":  INVERTER_ERRORS_MAP.get(dem, f"Code {dem}") if dem else "",
+            "inv_error": inv_error,
+            "detail":    desc,
+        }
+        try:
+            history = []
+            if fault_file.exists():
+                try:
+                    with open(fault_file, "r") as f:
+                        history = json.load(f)
+                except Exception:
+                    history = []
+            history.append(entry)
+            with open(fault_file, "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            logger.warning("[FAULT LOG] Could not write fault_history.json: %s", e)
+
+    def _open_fault_history(self) -> None:
+        """Open the FaultHistoryDialog to show all recorded fault events."""
+        dlg = FaultHistoryDialog(self)
+        dlg.exec_()
+
     def _check_alerts(self, s: dict) -> None:
+
         if not (self.is_receiving or self.demo_mode):
             self._alert_banner.set_alerts([])
             self._ov_temp.set_alert(False)
@@ -2731,6 +3084,42 @@ class MainWindow(QMainWindow):
         vcell = s.get('v_cell_min_mV', 0)
         if 0 < vcell < alert_cell:
             alerts.append((f"MIN CELL {vcell} mV < {alert_cell:.0f} mV", 'critical'))
+
+        # ── APPS Implausibility (EV 2.5 / FMEA) ──────────────────────────────
+        # Only check when the car is powered (avoid false positives at key-off)
+        if s.get('inv_dc_bus_V', 0) > 200:
+            apps1 = s.get('apps1_raw', APPS1_MIN)
+            apps2 = s.get('apps2_raw', APPS2_MIN)
+            _a1_span = max(APPS1_MAX - APPS1_MIN, 1)
+            _a2_span = max(APPS2_MAX - APPS2_MIN, 1)
+            a1_pct = max(0.0, min(100.0, (apps1 - APPS1_MIN) / _a1_span * 100.0))
+            a2_pct = max(0.0, min(100.0, (apps2 - APPS2_MIN) / _a2_span * 100.0))
+            apps_diff = abs(a1_pct - a2_pct)
+            if apps_diff > 10.0:
+                self._apps_impl_count = getattr(self, '_apps_impl_count', 0) + 1
+                if self._apps_impl_count >= 3:  # 3 consecutive frames (~300 ms)
+                    alerts.append((
+                        f"APPS IMPLAUSIBILITY: A1={a1_pct:.0f}%  A2={a2_pct:.0f}%  "
+                        f"(diff {apps_diff:.0f}%) — CHECK PEDAL SENSORS",
+                        'critical'))
+                    if self._apps_impl_count == 3:  # Log only on first trigger
+                        self._log_fault_event(
+                            s.get('dem_code', 0), s.get('inv_error', 0),
+                            'APPS_IMPL', f"A1={a1_pct:.0f}% A2={a2_pct:.0f}% diff={apps_diff:.1f}%")
+            else:
+                self._apps_impl_count = 0
+
+        # ── DEM fault change detection (for fault history log) ────────────────
+        dem_now = int(s.get('dem_code', 0))
+        if dem_now != 0 and dem_now != getattr(self, '_last_dem_logged', -1):
+            dem_desc = INVERTER_ERRORS_MAP.get(dem_now, f"Code {dem_now}")
+            self._log_fault_event(dem_now, int(s.get('inv_error', 0)),
+                                  'DEM', dem_desc)
+            self._last_dem_logged = dem_now
+        elif dem_now == 0:
+            self._last_dem_logged = 0
+
+
         self._alert_banner.set_alerts(alerts)
         self._ov_temp.set_alert(any(a[1] == 'critical' and 'TEMP' in a[0] for a in alerts))
         self._ov_vbus.set_alert(any('DC BUS' in a[0] for a in alerts))
@@ -2898,6 +3287,21 @@ class MainWindow(QMainWindow):
         analytics = self._analytics_engine.compute(s, soc_vtc6, i_eff)
         s.update(analytics)
 
+        # ── Persist analytics into the shared snapshot so SerialCSVLogger logs them ──
+        # The logger runs in a separate thread and reads rtt.latest_data_dict directly.
+        # Writing back here means the values appear in the CSV on the very next snapshot row.
+        try:
+            live_snap = rtt.get_latest_data().get('snapshot')
+            if live_snap is not None:
+                for _ak in ('eff_wh_min', 'eff_wh_km', 'thermal_dt_dt',
+                            'thermal_t_overtemp', 'batt_r_int',
+                            'strategy_pwr_target', 'strategy_rec_torque'):
+                    if _ak in analytics:
+                        live_snap[_ak] = analytics[_ak]
+        except Exception:
+            pass  # Never let analytics write-back crash the UI update loop
+
+
         tm2_val = s.get('inv_temp_motor2', s.get('inv_temp_pwrstg', 0))
 
         self._ov_rpm.set_value(f"{int(rpm):,}")
@@ -2909,7 +3313,8 @@ class MainWindow(QMainWindow):
         self._ov_torque.set_value(f"{tpct}")
         self._ov_cur.set_value(f"{icur}")
         self._ov_vcell.set_value(f"{vcell}")
-        self._ov_state.set_value(f"{istate}")
+        self._ov_state.set_value(f"{istate}  {_STATE_SHORT_MAP.get(int(istate), '?')}")
+
 
         self._mini_rpm.setText(f"{int(rpm):,} rpm")
         self._mini_vbus.setText(f"{vbus} V")
@@ -3190,6 +3595,17 @@ class MainWindow(QMainWindow):
                     saved = json.load(f)
                     current_settings.update(saved)
                     self.settings.update(saved)
+                # Apply any saved pedal calibration to the live module globals
+                cal = {
+                    'apps1_min': saved.get('apps1_min'),
+                    'apps1_max': saved.get('apps1_max'),
+                    'apps2_min': saved.get('apps2_min'),
+                    'apps2_max': saved.get('apps2_max'),
+                    'brk_min':   saved.get('brk_min'),
+                    'brk_max':   saved.get('brk_max'),
+                }
+                if any(v is not None for v in cal.values()):
+                    self._apply_pedal_calibration(cal)
             except Exception as e:
                 self._log_append(f"Error loading settings.json: {e}")
 
@@ -3198,19 +3614,52 @@ class MainWindow(QMainWindow):
         settings_file = rtt.USER_DIR / "settings.json"
         try:
             to_save = {
-                "port": self.settings.get("port"),
-                "baud": self.settings.get("baud"),
-                "use_influx": self.settings.get("use_influx"),
-                "debug": self.settings.get("debug"),
-                "demo_mode": self.settings.get("demo_mode"),
+                "port":         self.settings.get("port"),
+                "baud":         self.settings.get("baud"),
+                "use_influx":   self.settings.get("use_influx"),
+                "debug":        self.settings.get("debug"),
+                "demo_mode":    self.settings.get("demo_mode"),
                 "alert_temp_c": self.settings.get("alert_temp_c"),
                 "alert_volt_v": self.settings.get("alert_volt_v"),
-                "alert_cell_mv": self.settings.get("alert_cell_mv"),
+                "alert_cell_mv":self.settings.get("alert_cell_mv"),
+                # Pedal calibration (written by BrakeCalibrationWizard)
+                "apps1_min":    self.settings.get("apps1_min", APPS1_MIN),
+                "apps1_max":    self.settings.get("apps1_max", APPS1_MAX),
+                "apps2_min":    self.settings.get("apps2_min", APPS2_MIN),
+                "apps2_max":    self.settings.get("apps2_max", APPS2_MAX),
+                "brk_min":      self.settings.get("brk_min",   0),
+                "brk_max":      self.settings.get("brk_max",   ADC_MAX),
             }
             with open(settings_file, "w") as f:
                 json.dump(to_save, f, indent=4)
         except Exception as e:
             self._log_append(f"Error saving settings.json: {e}")
+
+    def _apply_pedal_calibration(self, cal: dict) -> None:
+        """Apply wizard or loaded calibration values to the live module-level globals."""
+        global APPS1_MIN, APPS1_MAX, APPS2_MIN, APPS2_MAX
+        if cal.get('apps1_min') is not None:
+            APPS1_MIN = int(cal['apps1_min'])
+        if cal.get('apps1_max') is not None:
+            APPS1_MAX = int(cal['apps1_max'])
+        if cal.get('apps2_min') is not None:
+            APPS2_MIN = int(cal['apps2_min'])
+        if cal.get('apps2_max') is not None:
+            APPS2_MAX = int(cal['apps2_max'])
+        # Store in settings for persistence on next save
+        self.settings.update({
+            'apps1_min': APPS1_MIN, 'apps1_max': APPS1_MAX,
+            'apps2_min': APPS2_MIN, 'apps2_max': APPS2_MAX,
+            'brk_min':   cal.get('brk_min', self.settings.get('brk_min', 0)),
+            'brk_max':   cal.get('brk_max', self.settings.get('brk_max', ADC_MAX)),
+        })
+        self._save_settings_to_file()
+        self._log_append(
+            f"[CAL] Pedal calibration applied: "
+            f"APPS1={APPS1_MIN}->{APPS1_MAX}  "
+            f"APPS2={APPS2_MIN}->{APPS2_MAX}  "
+            f"BRK={self.settings.get('brk_min',0)}->{self.settings.get('brk_max',ADC_MAX)}")
+
 
     def _update_widget_thresholds(self):
         temp_c = self.settings.get("alert_temp_c", 40.0)

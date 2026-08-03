@@ -203,6 +203,11 @@ class SerialCSVLogger:
         "imu_ax_g", "imu_ay_g", "imu_az_g",
         "imu_gx_dps", "imu_gy_dps", "imu_gz_dps",
         "imu_roll_deg", "imu_pitch_deg",
+        # ── Predictive Analytics & Strategy (computed in ui.py) ──────────────
+        "eff_wh_min", "eff_wh_km",
+        "thermal_dt_dt", "thermal_t_overtemp",
+        "batt_r_int",
+        "strategy_pwr_target", "strategy_rec_torque",
         # ── Pit-Wall Notes ──────────────────────────────────────────────────
         "notes",
     ]
@@ -265,6 +270,11 @@ class SerialCSVLogger:
             s.get('imu_ax_g',            0.0), s.get('imu_ay_g',         0.0), s.get('imu_az_g',            0.0),
             s.get('imu_gx_dps',          0.0), s.get('imu_gy_dps',       0.0), s.get('imu_gz_dps',          0.0),
             s.get('imu_roll_deg',        0.0), s.get('imu_pitch_deg',    0.0),
+            # Predictive Analytics — written back to snapshot dict by ui.py after each compute cycle
+            s.get('eff_wh_min',           ""), s.get('eff_wh_km',              ""),
+            s.get('thermal_dt_dt',        ""), s.get('thermal_t_overtemp',     ""),
+            s.get('batt_r_int',           ""),
+            s.get('strategy_pwr_target',  ""), s.get('strategy_rec_torque',    ""),
             "",  # Empty note for telemetry snapshots
         ]
 
