@@ -2313,13 +2313,13 @@ class MainWindow(QMainWindow):
         self.theme_mode   = "dark"
 
         self.settings     = current_settings.copy()
+        self._log: Optional[QTextEdit] = None
         self._load_settings_from_file()
         self.demo_mode    = self.settings["demo_mode"]
         self.is_receiving = False
         self.rx_thread: Optional[threading.Thread] = None
         self._post_race_win: Optional["PostRaceWindow"] = None
         self._settings_dlg: Optional[SettingsDialog]    = None
-        self._log: Optional[QTextEdit] = None
 
         icon = Path(__file__).resolve().parent / "isc_logo.ico"
         if icon.exists():
@@ -3605,7 +3605,7 @@ class MainWindow(QMainWindow):
                     'brk_max':   saved.get('brk_max'),
                 }
                 if any(v is not None for v in cal.values()):
-                    self._apply_pedal_calibration(cal)
+                    self._apply_pedal_calibration(cal, save_to_file=False)
             except Exception as e:
                 self._log_append(f"Error loading settings.json: {e}")
 
@@ -3635,7 +3635,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log_append(f"Error saving settings.json: {e}")
 
-    def _apply_pedal_calibration(self, cal: dict) -> None:
+    def _apply_pedal_calibration(self, cal: dict, save_to_file: bool = True) -> None:
         """Apply wizard or loaded calibration values to the live module-level globals."""
         global APPS1_MIN, APPS1_MAX, APPS2_MIN, APPS2_MAX
         if cal.get('apps1_min') is not None:
@@ -3653,7 +3653,8 @@ class MainWindow(QMainWindow):
             'brk_min':   cal.get('brk_min', self.settings.get('brk_min', 0)),
             'brk_max':   cal.get('brk_max', self.settings.get('brk_max', ADC_MAX)),
         })
-        self._save_settings_to_file()
+        if save_to_file:
+            self._save_settings_to_file()
         self._log_append(
             f"[CAL] Pedal calibration applied: "
             f"APPS1={APPS1_MIN}->{APPS1_MAX}  "
@@ -3681,13 +3682,15 @@ class MainWindow(QMainWindow):
             self._post_race_win.show()
 
     def _log_append(self, msg: str):
-        if self._log is None:
+        log_widget = getattr(self, '_log', None)
+        if log_widget is None:
+            logger.info(msg)
             return
         ts = datetime.now().strftime("%H:%M:%S")
-        self._log.append(f"[{ts}] {msg}")
-        doc = self._log.document()
+        log_widget.append(f"[{ts}] {msg}")
+        doc = log_widget.document()
         while doc.blockCount() > 30:
-            cur = self._log.textCursor()
+            cur = log_widget.textCursor()
             cur.movePosition(cur.Start)
             cur.select(cur.BlockUnderCursor)
             cur.removeSelectedText(); cur.deleteChar()
