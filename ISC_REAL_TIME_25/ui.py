@@ -213,7 +213,8 @@ _MARPLE_PASSWORD_HASH = hashlib.sha256(b"ISC_telemetry_2026").hexdigest()
 # Alert thresholds
 ALERT_TEMP_C   = 40.0   # °C   — any module max temp above this
 ALERT_VOLT_V   = 380    # V    — DC bus below this
-ALERT_CELL_MV  = 3400   # mV   — per-module min cell voltage below this
+ALERT_CELL_MV      = 3400   # mV   — per-module min cell voltage below this
+ALERT_CELL_IMB_MV  = 100    # mV   — max cell imbalance (vmax-vmin) above this triggers alert
 
 HISTORY_LEN  = 120    # rolling plot sample depth
 ADC_MAX      = 4095   # 12-bit ADC full scale (pedal normalisation)
@@ -221,6 +222,8 @@ APPS1_MIN    = 2500   # raw ADC value at 0% depression
 APPS1_MAX    = 3400   # raw ADC value at 100% depression
 APPS2_MIN    = 2330   # raw ADC value at 0% depression
 APPS2_MAX    = 3040   # raw ADC value at 100% depression
+BRK_MIN      = 582    # brake ADC resting floor (reads ~580-584 at rest, hardcoded default)
+BRK_MAX      = ADC_MAX  # brake ADC at full depression (overridden by calibration wizard)
 RPM_MAX      = 6000
 
 # ── Sony VTC6 95s6p — SoC estimation ────────────────────────────────────────
@@ -323,6 +326,9 @@ class PredictiveAnalyticsEngine:
         self._prev_vbus = 0.0
         self._r_int_samples = deque(maxlen=50) # rolling R_int estimates
         self.r_int_mOhm = 285.0                # default baseline ~285 mΩ (95s6p VTC6)
+        # Integrated Wh counter
+        self._wh_used   = 0.0
+        self._prev_time = None
 
     def reset(self):
         self._t_hist.clear()
@@ -330,6 +336,8 @@ class PredictiveAnalyticsEngine:
         self._r_int_samples.clear()
         self._prev_iaccu = 0.0
         self._prev_vbus = 0.0
+        self._wh_used   = 0.0
+        self._prev_time = None
 
     def compute(self, s: dict, soc_vtc6: float, i_eff: float) -> dict:
         vbus = float(s.get('inv_dc_bus_V', 0))
@@ -386,6 +394,24 @@ class PredictiveAnalyticsEngine:
         else:
             rec_torque = 100.0
 
+        # ── Integrated Wh counter ─────────────────────────────────────────────
+        # corriente_accu polarity: positive = discharge (or abs if already corrected)
+        import time as _time
+        _now = _time.monotonic()
+        if self._prev_time is not None and vbus > 140 and iaccu > 0:
+            dt_h = (_now - self._prev_time) / 3600.0
+            self._wh_used += (iaccu * vbus) * dt_h
+        self._prev_time = _now
+
+        # ── Cell imbalance: max (vmax-vmin) across modules ─────────────────────
+        vmin_arr = s.get('vmin_modulo', [])
+        vmax_arr = s.get('vmax_modulo', [])
+        cell_imbalance_mV = 0.0
+        if vmin_arr and vmax_arr:
+            for vm_lo, vm_hi in zip(vmin_arr, vmax_arr):
+                if vm_hi > 0 and vm_lo > 0:
+                    cell_imbalance_mV = max(cell_imbalance_mV, vm_hi - vm_lo)
+
         return {
             'eff_wh_min':          round(eff_wh_min, 1),
             'eff_wh_km':           round(eff_wh_km, 1),
@@ -394,6 +420,8 @@ class PredictiveAnalyticsEngine:
             'batt_r_int':          self.r_int_mOhm,
             'strategy_pwr_target': round(pwr_target_kw, 2),
             'strategy_rec_torque': int(rec_torque),
+            'session_wh_used':     round(self._wh_used, 2),
+            'cell_imbalance_mV':   round(cell_imbalance_mV, 1),
         }
 
 # ── All ECU signals available in the Customise tab ───────────────────────────
@@ -471,6 +499,8 @@ SNAPSHOT_CHANNELS: Dict[str, tuple] = {
     'batt_r_int':           ('Pack Internal R',        'mΩ'),
     'strategy_pwr_target':  ('Endurance Target Power', 'kW'),
     'strategy_rec_torque':  ('Rec. Torque Limit',     '%'),
+    'session_wh_used':      ('Session Energy Used',   'Wh'),
+    'cell_imbalance_mV':    ('Max Cell Imbalance',    'mV'),
 }
 
 plt.style.use('dark_background')
@@ -1475,10 +1505,16 @@ class SettingsDialog(QDialog):
         self.input_alert_cell.setStyleSheet(ins)
         g.addWidget(self.input_alert_cell, 8, 1)
 
+        g.addWidget(self._lbl("Alert Cell Imbalance (mV):", ls), 9, 0)
+        self.input_alert_imb = QLineEdit(str(self._p.settings.get("alert_cell_imb_mv", 100.0)))
+        self.input_alert_imb.setStyleSheet(ins)
+        self.input_alert_imb.setToolTip("Alert when max(Vmax-Vmin) across any module exceeds this value")
+        g.addWidget(self.input_alert_imb, 9, 1)
+
         btn = QPushButton("Apply & Close")
         btn.setStyleSheet(self._p.get_button_style('accent'))
         btn.clicked.connect(self.accept)
-        g.addWidget(btn, 9, 0, 1, 2)
+        g.addWidget(btn, 10, 0, 1, 2)
 
         btn_cal = QPushButton("Calibrate Pedals...")
         btn_cal.setStyleSheet(self._p.get_button_style())
@@ -1581,10 +1617,201 @@ class FaultHistoryDialog(QDialog):
                 pass
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FAULT PATTERN DATABASE DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+class FaultPatternDialog(QDialog):
+    """
+    Scans ALL ISC_*.csv log files in the logs directory and builds a
+    cross-session fault frequency table: which DEM codes appear, how often,
+    in how many sessions, and for how long total.
+    """
+    LOGS_DIR = rtt.USER_DIR.parent / "logs"   # C:\\Users\\<user>\\Documents\\ISCmetrics\\logs
+
+    DEM_NAMES = {
+        0:'No Fault', 1:'Lost Msg Setpoint', 2:'DCBus Undervoltage', 3:'PwrStg Overtemp',
+        4:'PwrStg Temp Degrade', 5:'EMCtrl Fault', 6:'Task Overrun', 7:'CAN1 BusOff',
+        8:'EMachine Overtemp', 9:'Phase Current OOR', 10:'PwrStg Temp OOR', 11:'DC Bus OOR',
+        12:'DP Overtemp', 13:'DRV Overtemp', 14:'Aux Supply UV', 15:'Aux Supply OV',
+        16:'Overspeed', 17:'Speed Degrade', 18:'EMachine Temp Degrade', 19:'Bad Current Offset',
+        20:'AbsEnc Error 1', 21:'Ext Temp 1 OOR', 22:'Ext Temp 2 OOR (KTY)',
+        23:'PMIC Not Ready', 26:'Invalid Calibration', 29:'Crosscheck Fault',
+        32:'HW Supervisor Fault', 33:'KL30 UV', 34:'KL30 OV', 37:'LV Sensor Supply Fault',
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ISCmetrics - Fault Pattern Database")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setGeometry(150, 100, 950, 580)
+        self.setStyleSheet(f"background:{F1_DARK_BG}; color:{F1_TEXT};")
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 14, 14, 14)
+
+        hdr_row = QHBoxLayout()
+        title = QLabel("Cross-Session Fault Pattern Analysis")
+        title.setStyleSheet(f"color:{ISC_GREEN}; font-size:13px; font-weight:bold;")
+        hdr_row.addWidget(title)
+        hdr_row.addStretch()
+        self._lbl_scanned = QLabel("Scanning logs…")
+        self._lbl_scanned.setStyleSheet("color:#666; font-size:10px;")
+        hdr_row.addWidget(self._lbl_scanned)
+        v.addLayout(hdr_row)
+
+        # Main fault frequency table
+        cols = ["DEM Code", "Fault Name", "Sessions", "Total Rows", "Est. Duration", "First Seen", "Last Seen"]
+        self._tbl = QTableWidget(0, len(cols))
+        self._tbl.setHorizontalHeaderLabels(cols)
+        self._tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        self._tbl.horizontalHeader().setStretchLastSection(True)
+        self._tbl.setStyleSheet(f"""
+            QTableWidget {{ background:{F1_MID_BG}; color:{F1_TEXT};
+                            gridline-color:#333; border:none; font-size:10px; }}
+            QHeaderView::section {{ background:{F1_PANEL_BG}; color:{ISC_GREEN};
+                                    font-size:10px; font-weight:bold; border:none; padding:4px; }}
+            QTableWidget::item:selected {{ background:{ISC_GREEN}; color:{F1_DARK_BG}; }}
+        """)
+        v.addWidget(self._tbl)
+
+        # Session detail sub-table
+        detail_lbl = QLabel("Session breakdown (click a fault row above)")
+        detail_lbl.setStyleSheet("color:#888; font-size:10px; margin-top:6px;")
+        v.addWidget(detail_lbl)
+        dcols = ["Session File", "Rows with Fault", "Est. Duration", "First at (s)", "Last at (s)"]
+        self._dtbl = QTableWidget(0, len(dcols))
+        self._dtbl.setHorizontalHeaderLabels(dcols)
+        self._dtbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._dtbl.horizontalHeader().setStretchLastSection(True)
+        self._dtbl.setMaximumHeight(160)
+        self._dtbl.setStyleSheet(self._tbl.styleSheet())
+        v.addWidget(self._dtbl)
+
+        btn_row = QHBoxLayout()
+        btn_refresh = QPushButton("Rescan Logs")
+        btn_refresh.setStyleSheet(
+            f"QPushButton{{background:{ISC_GREEN};color:{F1_DARK_BG};border:none;border-radius:3px;"
+            f"padding:5px 14px;font-weight:bold;font-size:10px;}}QPushButton:hover{{background:#00a000;}}")
+        btn_refresh.clicked.connect(self._scan)
+        btn_row.addWidget(btn_refresh)
+        btn_row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(
+            f"QPushButton{{background:{F1_PANEL_BG};color:{F1_TEXT};border:1px solid #444;"
+            f"border-radius:3px;padding:5px 14px;font-size:10px;}}QPushButton:hover{{border-color:{ISC_GREEN};}}")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        v.addLayout(btn_row)
+
+        self._tbl.cellClicked.connect(self._on_row_click)
+        self._fault_data = {}  # dem_code -> {sessions: [...], total_rows, first_seen, last_seen}
+        self._scan()
+
+    def _scan(self):
+        import csv as _csv
+        from PyQt5.QtGui import QColor
+
+        logs_dir = self.LOGS_DIR
+        self._fault_data = {}   # dem_code -> {sessions:[{file,rows,dur_s,first_t,last_t}], total_rows, first_seen, last_seen}
+        n_scanned = 0
+
+        if logs_dir.exists():
+            for path in sorted(logs_dir.glob("ISC_*.csv")):
+                try:
+                    with open(path, newline='', encoding='utf-8-sig') as f:
+                        rd = _csv.DictReader(f)
+                        if 'dem_code' not in (rd.fieldnames or []):
+                            continue
+                        rows_by_code: dict = {}
+                        for row in rd:
+                            try: code = int(row.get('dem_code', 0) or 0)
+                            except: code = 0
+                            if code == 0:
+                                continue
+                            try: t = float(row.get('time_elapsed_s', 0) or 0)
+                            except: t = 0.0
+                            rows_by_code.setdefault(code, []).append(t)
+
+                    fname = path.name
+                    for code, times in rows_by_code.items():
+                        # Estimate duration: count × avg sample interval (assume 100ms)
+                        est_dur_s = len(times) * 0.1
+                        first_t = min(times)
+                        last_t  = max(times)
+                        entry = self._fault_data.setdefault(code, {
+                            'sessions': [], 'total_rows': 0,
+                            'first_seen': fname, 'last_seen': fname,
+                        })
+                        entry['sessions'].append({
+                            'file': fname, 'rows': len(times),
+                            'dur_s': est_dur_s, 'first_t': first_t, 'last_t': last_t,
+                        })
+                        entry['total_rows'] += len(times)
+                        entry['last_seen'] = fname
+                    n_scanned += 1
+                except Exception:
+                    continue
+
+        self._lbl_scanned.setText(f"Scanned {n_scanned} log files from {logs_dir}")
+
+        # Sort by total_rows descending (most common faults first)
+        sorted_codes = sorted(self._fault_data.keys(),
+                              key=lambda c: self._fault_data[c]['total_rows'], reverse=True)
+
+        self._tbl.setRowCount(len(sorted_codes))
+        for row_i, code in enumerate(sorted_codes):
+            d = self._fault_data[code]
+            n_sess = len(d['sessions'])
+            total_dur = sum(s['dur_s'] for s in d['sessions'])
+            dur_str = f"{total_dur:.0f}s" if total_dur < 120 else f"{total_dur/60:.1f}min"
+            vals = [
+                str(code),
+                self.DEM_NAMES.get(code, f"Unknown ({code})"),
+                str(n_sess),
+                str(d['total_rows']),
+                dur_str,
+                d['first_seen'],
+                d['last_seen'],
+            ]
+            for col, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                if code in (5, 10, 11, 29, 32):    # critical faults
+                    item.setForeground(QColor(F1_ERROR))
+                elif code in (16, 22, 3, 8):        # warning faults
+                    item.setForeground(QColor(F1_WARNING))
+                self._tbl.setItem(row_i, col, item)
+        self._tbl.resizeColumnsToContents()
+        self._sorted_codes = sorted_codes
+
+        if not sorted_codes:
+            self._tbl.setRowCount(1)
+            self._tbl.setItem(0, 0, QTableWidgetItem("No faults found in scanned logs."))
+
+    def _on_row_click(self, row, _col):
+        if not hasattr(self, '_sorted_codes') or row >= len(self._sorted_codes):
+            return
+        code = self._sorted_codes[row]
+        sessions = self._fault_data[code]['sessions']
+        self._dtbl.setRowCount(len(sessions))
+        for r, s in enumerate(sessions):
+            dur_str = f"{s['dur_s']:.1f}s"
+            for c, val in enumerate([
+                s['file'], str(s['rows']), dur_str,
+                f"{s['first_t']:.1f}", f"{s['last_t']:.1f}"
+            ]):
+                self._dtbl.setItem(r, c, QTableWidgetItem(val))
+        self._dtbl.resizeColumnsToContents()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  BRAKE & APPS CALIBRATION WIZARD
 # ══════════════════════════════════════════════════════════════════════════════
 class BrakeCalibrationWizard(QDialog):
+
     """
     3-step guided wizard to calibrate APPS1, APPS2 and Brake ADC ranges.
     Hardcoded defaults remain the fallback if the wizard is never run.
@@ -1827,16 +2054,19 @@ def _sd_get_settings(self) -> dict:
     except: volt_v = self._p.settings.get("alert_volt_v", 380.0)
     try:    cell_mv = float(self.input_alert_cell.text())
     except: cell_mv = self._p.settings.get("alert_cell_mv", 3400.0)
+    try:    cell_imb_mv = float(self.input_alert_imb.text())
+    except: cell_imb_mv = self._p.settings.get("alert_cell_imb_mv", 100.0)
     return {
-        "port":          self.combo_port.currentData(),
-        "baud":          baud,
-        "use_influx":    self.chk_marple.isChecked(),
-        "debug":         self.chk_debug.isChecked(),
-        "demo_mode":     self.chk_demo.isChecked(),
-        "enable_tts":    self.chk_tts.isChecked(),
-        "alert_temp_c":  temp_c,
-        "alert_volt_v":  volt_v,
-        "alert_cell_mv": cell_mv,
+        "port":             self.combo_port.currentData(),
+        "baud":             baud,
+        "use_influx":       self.chk_marple.isChecked(),
+        "debug":            self.chk_debug.isChecked(),
+        "demo_mode":        self.chk_demo.isChecked(),
+        "enable_tts":       self.chk_tts.isChecked(),
+        "alert_temp_c":     temp_c,
+        "alert_volt_v":     volt_v,
+        "alert_cell_mv":    cell_mv,
+        "alert_cell_imb_mv": cell_imb_mv,
     }
 
 # Bind the orphaned methods back onto SettingsDialog
@@ -2863,14 +3093,17 @@ class MainWindow(QMainWindow):
         # Predictive analytics & endurance strategy
         psb = QGroupBox("PREDICTIVE ANALYTICS & STRATEGY")
         psg = QGridLayout(psb)
-        self._pt_eff      = MetricCard("Consumption Rate", "Wh/min", ISC_GREEN)
-        self._pt_heat     = MetricCard("Heating Rate",     "ºC/min", F1_WARNING)
-        self._pt_overtemp = MetricCard("Est. Overtemp",    "min",    F1_ERROR)
-        self._pt_rint     = MetricCard("Pack Internal R",  "mΩ",     F1_PURPLE)
-        self._pt_rec_tq   = MetricCard("Rec. Torque %",    "%",      ISC_GREEN)
+        self._pt_eff        = MetricCard("Consumption Rate",  "Wh/min", ISC_GREEN)
+        self._pt_heat       = MetricCard("Heating Rate",      "ºC/min", F1_WARNING)
+        self._pt_overtemp   = MetricCard("Est. Overtemp",     "min",    F1_ERROR)
+        self._pt_rint       = MetricCard("Pack Internal R",   "mΩ",     F1_PURPLE)
+        self._pt_rec_tq     = MetricCard("Rec. Torque %",     "%",      ISC_GREEN)
+        self._pt_wh_used    = MetricCard("Session Energy",    "Wh",     F1_BLUE)
+        self._pt_cell_imb   = MetricCard("Cell Imbalance",    "mV",     F1_WARNING)
         psg.addWidget(self._pt_eff,      0, 0); psg.addWidget(self._pt_heat,     0, 1)
         psg.addWidget(self._pt_overtemp, 1, 0); psg.addWidget(self._pt_rint,     1, 1)
-        psg.addWidget(self._pt_rec_tq,   2, 0, 1, 2)
+        psg.addWidget(self._pt_rec_tq,   2, 0); psg.addWidget(self._pt_wh_used,  2, 1)
+        psg.addWidget(self._pt_cell_imb, 3, 0, 1, 2)
         top.addWidget(psb, stretch=2)
 
         v.addLayout(top, stretch=3)
@@ -3001,6 +3234,13 @@ class MainWindow(QMainWindow):
         self._btn_fault_hist.clicked.connect(self._open_fault_history)
         nh.addWidget(self._btn_fault_hist)
 
+        self._btn_fault_db = QPushButton("Fault Pattern DB")
+        self._btn_fault_db.setStyleSheet(self.get_button_style())
+        self._btn_fault_db.setFixedWidth(140)
+        self._btn_fault_db.setToolTip("Analyse fault patterns across ALL historical CSV logs")
+        self._btn_fault_db.clicked.connect(self._open_fault_pattern_db)
+        nh.addWidget(self._btn_fault_db)
+
         
         v.addLayout(nh)
         return box
@@ -3043,6 +3283,11 @@ class MainWindow(QMainWindow):
     def _open_fault_history(self) -> None:
         """Open the FaultHistoryDialog to show all recorded fault events."""
         dlg = FaultHistoryDialog(self)
+        dlg.exec_()
+
+    def _open_fault_pattern_db(self) -> None:
+        """Scan all historical CSV logs and show a cross-session fault pattern analysis."""
+        dlg = FaultPatternDialog(self)
         dlg.exec_()
 
     def _check_alerts(self, s: dict) -> None:
@@ -3331,7 +3576,7 @@ class MainWindow(QMainWindow):
         a1_norm = max(0.0, min(1.0, (a1 - APPS1_MIN) / (APPS1_MAX - APPS1_MIN))) if APPS1_MAX > APPS1_MIN else 0.0
         a2_norm = max(0.0, min(1.0, (a2 - APPS2_MIN) / (APPS2_MAX - APPS2_MIN))) if APPS2_MAX > APPS2_MIN else 0.0
         thr_pct = max(a1_norm, a2_norm) * 100.0
-        brk_pct = brk / ADC_MAX * 100.0
+        brk_pct = max(0.0, min(100.0, (brk - BRK_MIN) / max(BRK_MAX - BRK_MIN, 1) * 100.0))
         self._ov_thr_hist.append(thr_pct)
         self._ov_brk_hist.append(brk_pct)
         xt  = list(range(HISTORY_LEN))
@@ -3433,7 +3678,16 @@ class MainWindow(QMainWindow):
             self._pt_overtemp.set_value(f"{t_ov:.1f}" if t_ov < 900 else "SAFE")
             self._pt_rint.set_value(f"{s.get('batt_r_int', 285.0):.0f}")
             self._pt_rec_tq.set_value(f"{s.get('strategy_rec_torque', 100)} %")
-        
+            # Session energy counter
+            wh_used = s.get('session_wh_used', 0.0)
+            self._pt_wh_used.set_value(f"{wh_used:.1f}")
+            # Cell imbalance — alert threshold from settings (default 100 mV)
+            imb = s.get('cell_imbalance_mV', 0.0)
+            self._pt_cell_imb.set_value(f"{imb:.0f}")
+            alert_imb = self.settings.get('alert_cell_imb_mv', ALERT_CELL_IMB_MV)
+            self._pt_cell_imb.set_alert(imb > alert_imb)
+
+
         # Est. cut-off duration metric
         i_hist = getattr(self, '_i_rolling_hist', None)
         i_avg_pt = (sum(i_hist) / len(i_hist)) if i_hist else 0.0
@@ -3467,7 +3721,8 @@ class MainWindow(QMainWindow):
         thr_pct = max(a1_norm, a2_norm)
         
         self._ped_thr.set_value(thr_pct, int(max(a1, a2)))
-        self._ped_brk.set_value(brake / ADC_MAX, int(brake))
+        brk_norm = max(0.0, min(1.0, (brake - BRK_MIN) / max(BRK_MAX - BRK_MIN, 1)))
+        self._ped_brk.set_value(brk_norm, int(brake))
 
         self._dyn_apps1.set_value(str(a1))
         self._dyn_apps2.set_value(str(a2))
@@ -3621,7 +3876,8 @@ class MainWindow(QMainWindow):
                 "demo_mode":    self.settings.get("demo_mode"),
                 "alert_temp_c": self.settings.get("alert_temp_c"),
                 "alert_volt_v": self.settings.get("alert_volt_v"),
-                "alert_cell_mv":self.settings.get("alert_cell_mv"),
+                "alert_cell_mv":     self.settings.get("alert_cell_mv"),
+                "alert_cell_imb_mv": self.settings.get("alert_cell_imb_mv", ALERT_CELL_IMB_MV),
                 # Pedal calibration (written by BrakeCalibrationWizard)
                 "apps1_min":    self.settings.get("apps1_min", APPS1_MIN),
                 "apps1_max":    self.settings.get("apps1_max", APPS1_MAX),
@@ -3637,7 +3893,7 @@ class MainWindow(QMainWindow):
 
     def _apply_pedal_calibration(self, cal: dict, save_to_file: bool = True) -> None:
         """Apply wizard or loaded calibration values to the live module-level globals."""
-        global APPS1_MIN, APPS1_MAX, APPS2_MIN, APPS2_MAX
+        global APPS1_MIN, APPS1_MAX, APPS2_MIN, APPS2_MAX, BRK_MIN, BRK_MAX
         if cal.get('apps1_min') is not None:
             APPS1_MIN = int(cal['apps1_min'])
         if cal.get('apps1_max') is not None:
@@ -3646,12 +3902,15 @@ class MainWindow(QMainWindow):
             APPS2_MIN = int(cal['apps2_min'])
         if cal.get('apps2_max') is not None:
             APPS2_MAX = int(cal['apps2_max'])
+        if cal.get('brk_min') is not None:
+            BRK_MIN = int(cal['brk_min'])
+        if cal.get('brk_max') is not None:
+            BRK_MAX = int(cal['brk_max'])
         # Store in settings for persistence on next save
         self.settings.update({
             'apps1_min': APPS1_MIN, 'apps1_max': APPS1_MAX,
             'apps2_min': APPS2_MIN, 'apps2_max': APPS2_MAX,
-            'brk_min':   cal.get('brk_min', self.settings.get('brk_min', 0)),
-            'brk_max':   cal.get('brk_max', self.settings.get('brk_max', ADC_MAX)),
+            'brk_min':   BRK_MIN,   'brk_max':   BRK_MAX,
         })
         if save_to_file:
             self._save_settings_to_file()
@@ -3659,7 +3918,8 @@ class MainWindow(QMainWindow):
             f"[CAL] Pedal calibration applied: "
             f"APPS1={APPS1_MIN}->{APPS1_MAX}  "
             f"APPS2={APPS2_MIN}->{APPS2_MAX}  "
-            f"BRK={self.settings.get('brk_min',0)}->{self.settings.get('brk_max',ADC_MAX)}")
+            f"BRK={BRK_MIN}->{BRK_MAX}")
+
 
 
     def _update_widget_thresholds(self):
