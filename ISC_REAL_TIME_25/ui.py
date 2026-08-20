@@ -103,6 +103,28 @@ _STATE_SHORT_MAP = {
    12: "DISCHG",13:"SLEEP",14: "LV OFF",
 }
 
+# ── ECU Control FSM States (ecu::CtrlState from control.hpp in IFS08-CE-ECU) ──
+ECU_CTRL_STATE_MAP = {
+    0: "WAIT_VDC",      # WaitInvVdcConfig (0x466)
+    1: "PRECHARGE",     # Precharge (stream 0x100, wait for 0x020)
+    2: "WAIT_START",    # WaitStartBrake (wait start button + brake)
+    3: "R2D_BUZZER",    # R2dDelay (RTDS buzzer sounding)
+    4: "WAIT_STANDBY",  # WaitInvStandby (command ready, wait for inverter)
+    5: "ACTIVE",        # Active (runtime torque)
+    6: "AMS_ERROR",     # AmsError (inhibited)
+}
+
+# ── AMS FSM States (IFS08-CE-AMS) ─────────────────────────────────────────────
+AMS_FSM_STATE_MAP = {
+    0: "STANDBY",
+    1: "PRECHARGE",
+    2: "ARMED",
+    3: "R2D",
+    4: "CHARGE",
+    5: "ERROR",
+}
+
+
 # ── NxTech DEM Diagnostic Codes (L3 — DEM_Code) ─────────────────────────────
 # Source: NxTech Portal — Diagnostics section, L3 table
 # inv_error = DEM_Code from EMC_TX_STATE_2 (0x461).
@@ -3590,7 +3612,9 @@ class MainWindow(QMainWindow):
             lbl.setStyleSheet(f"color:{'#00c853' if on else '#333'}; font-size:10px; font-weight:bold;")
         _ind(self._ind_precharge, "PRECHARGE OK", bool(pre))
         _ind(self._ind_inv_ok,    f"INV {decode_inverter_state(istate)}", istate in _INV_ACTIVE_STATES)
-        _ind(self._ind_ams,       f"AMS {ams}",   ams > 0)
+        ams_name = f" ({AMS_FSM_STATE_MAP.get(ams, '')})" if ams in AMS_FSM_STATE_MAP else ""
+        _ind(self._ind_ams,       f"AMS {ams}{ams_name}",   ams > 0)
+
 
         # Inverter fault decoder — pass istate for soft-fault substate awareness
         if ierr > 0:
@@ -3625,8 +3649,9 @@ class MainWindow(QMainWindow):
             gps_lat  = s.get('gps_lat_deg',   0.0)
             gps_lon  = s.get('gps_lon_deg',   0.0)
             gps_spd  = s.get('gps_speed_kmh', 0.0)
+            gps_crs  = s.get('gps_course_deg', 0.0)
             self._lbl_gps.setText(
-                f"GPS ✓  {gps_lat:+.5f}° {gps_lon:+.5f}°  {gps_spd:.1f} km/h  [{gps_sats} sats]"
+                f"GPS ✓  {gps_lat:+.5f}° {gps_lon:+.5f}°  {gps_spd:.1f} km/h  hdg:{gps_crs:.0f}°  [{gps_sats} sats]"
             )
             self._lbl_gps.setStyleSheet(
                 "color:#00c853; font-size:9px; font-family:'Courier New'; font-weight:bold;"
@@ -3636,6 +3661,7 @@ class MainWindow(QMainWindow):
             self._lbl_gps.setStyleSheet(
                 "color:#555; font-size:9px; font-family:'Courier New'; font-weight:bold;"
             )
+
 
     def _update_powertrain(self, s: dict):
         self._rpm_gauge.set_rpm(s.get('inv_rpm', 0))
@@ -3669,9 +3695,12 @@ class MainWindow(QMainWindow):
         self._pt_iaccu.set_value(f"{s.get('corriente_accu', 0):.1f} A")
         self._pt_idcdc.set_value(f"{s.get('corriente_dcdc', 0):.1f} A")
         self._pt_vcell.set_value(f"{vcell_pt} mV")
-        self._pt_ams.set_value(f"{s.get('ams_fsm_state', 0)}")
+        ams_val = s.get('ams_fsm_state', 0)
+        ams_name = f" {AMS_FSM_STATE_MAP.get(ams_val, '')}" if ams_val in AMS_FSM_STATE_MAP else ""
+        self._pt_ams.set_value(f"{ams_val}{ams_name}")
 
         if hasattr(self, '_pt_eff'):
+
             self._pt_eff.set_value(f"{s.get('eff_wh_min', 0.0):.1f}")
             self._pt_heat.set_value(f"{s.get('thermal_dt_dt', 0.0):+.1f}")
             t_ov = s.get('thermal_t_overtemp', 999.0)
@@ -3731,7 +3760,10 @@ class MainWindow(QMainWindow):
         self._dyn_start.set_value("ON" if s.get('start_button', 0) else "OFF")
         self._dyn_ev23.set_value(str(s.get('ev_2_3', 0)))
         self._dyn_t11.set_value(str(s.get('t11_8_9', 0)))
-        self._dyn_state.set_value(str(s.get('state', 0)))
+        st_val = s.get('state', s.get('ctrl_state', 0))
+        st_name = f" {ECU_CTRL_STATE_MAP.get(st_val, '')}" if st_val in ECU_CTRL_STATE_MAP else ""
+        self._dyn_state.set_value(f"{st_val}{st_name}")
+
 
         # IMU updates
         ax = s.get('imu_ax_g', 0.0)

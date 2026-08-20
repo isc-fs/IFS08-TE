@@ -50,15 +50,17 @@ import serial.tools.list_ports
 import isc_marple
 
 # ================== CONFIG RF ==================
+# Must match Core/Src/nrf24.c and docs/RADIO_SNAPSHOT_MAP.md in IFS08-CE-ECU
 RF_EXPECTED = {
-    "PIPE_ADDR": "0xE7E7E7E7E7",
-    "CHANNEL":   76,
-    "PAYLOAD":   32,
+    "PIPE_ADDR": "0x4543553031",  # ASCII 'ECU01' {0x45, 0x43, 0x55, 0x30, 0x31}
+    "CHANNEL":   76,              # 2.476 GHz (0x4C)
+    "PAYLOAD":   32,              # 32 bytes fixed nRF24 payload
     "DATA_RATE": "1Mbps",
     "AUTO_ACK":  False,
-    "CRC":       "CRC_8",   # TX CONFIG=EN_CRC|PWR_UP -> 8-bit
-    "PA":        "PA_LOW",  # TX RF_SETUP=0x06 -> 0 dBm
+    "CRC":       "CRC_8",         # TX CONFIG=EN_CRC|PWR_UP -> 8-bit CRC (no CRCO)
+    "PA":        "PA_MAX",        # TX RF_SETUP=0x06 -> 0 dBm (PA_MAX on nRF24)
 }
+
 
 # ================== FRAGMENT PROTOCOL CONSTANTS ==================
 # Must mirror the STM32 TX (telemetry_task.cpp on feat/telemetry-port)
@@ -608,7 +610,8 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'torque_pct':         unpacked[6],
         'ev_2_3':             unpacked[7],
         't11_8_9':            unpacked[8],
-        'ctrl_state':         unpacked[9], # mapping ctrl.state to ctrl_state
+        'state':              unpacked[9], # ECU CtrlState FSM (0=WAIT_VDC, 1=PRECHARGE, 2=WAIT_START, 3=R2D_DELAY, 4=WAIT_STANDBY, 5=ACTIVE, 6=AMS_ERROR)
+        'ctrl_state':         unpacked[9], # Alias for backward compatibility
         'ok_precharge':       unpacked[10],
         'ams_fsm_state':      unpacked[11],
         'v_cell_min_mV':      unpacked[12],
@@ -631,9 +634,10 @@ def _decode_flat_snapshot(data: bytes, seq: int) -> dict:
         'inv_temp_motor2':    unpacked[37] - 50,  # EMachine_Temp_2_degC (Sensor 2, Motor Winding NTC)
         'inv_temp_pwrstg':    unpacked[37] - 50,  # Backward-compat alias for Sensor 2
         'inv_temp_board':     unpacked[38] - 50,  # Board_Temp_degC
-        'inv_rpm':            int(round(unpacked[39] / 10.0)),
-        'inv_speed_actual':   round((unpacked[39] / 10.0) * (11.0 / 32.0) * (2.0 * math.pi / 60.0) * 0.2032 * 3.6, 1),
+        'inv_rpm':            int(unpacked[39]),  # eRPM directly (electrical RPM from 0x463)
+        'inv_speed_actual':   round((abs(unpacked[39]) / 10.0) * (11.0 / 32.0) * (2.0 * math.pi / 60.0) * 0.2032 * 3.6, 1) if unpacked[39] != 0 else 0.0,
         'inv_current_actual': -unpacked[41],
+
         # ── GPS [bytes 82..95] ───────────────────────────────────────────────
         # Scaled human-readable values (always present; gate display on gps_has_fix)
         'gps_lat_deg':    round(_gps_lat_raw / 1e7, 7),

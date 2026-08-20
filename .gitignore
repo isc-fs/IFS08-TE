@@ -47,6 +47,10 @@
 *.cmd
 .tmp_versions/
 modules.order
-Module.symvers
-Mkfile.old
 dkms.conf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
